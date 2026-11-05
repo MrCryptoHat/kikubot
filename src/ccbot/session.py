@@ -228,7 +228,7 @@ class SessionManager:
     # Not persisted: tmux windows a topic was unbound from because they LOOKED
     # gone (unbind_lost_window), as window_id -> (user_id, thread_id, window
     # name, monotonic time). If such a window turns up alive, the orphan
-    # janitor hands it back to its topic (reclaim_lost_window) instead of
+    # janitor hands it back to its topic (take_lost_window) instead of
     # killing it — an unbind is otherwise half a kill.
     lost_windows: dict[str, tuple[int, int, str, float]] = field(default_factory=dict)
     # Topics whose agent ccbot created as an EXTRA beside an existing one —
@@ -2306,14 +2306,15 @@ class SessionManager:
             )
         return window_id
 
-    def reclaim_lost_window(
+    def take_lost_window(
         self, window_id: str, window_name: str
     ) -> tuple[int, int] | None:
-        """Bind a lost window that turned out alive back to its topic.
+        """The topic a live window was unbound from as gone, if it can go back.
 
         Only within LOST_WINDOW_TTL, only under the same window name (tmux
         reuses ids after a server restart), and only while the topic is still
-        unbound. Returns the (user_id, thread_id) it went back to, or None.
+        unbound. One-shot: the record is dropped either way. Binding is the
+        caller's (the orphan janitor checks the topic still exists first).
         """
         now = time.monotonic()
         for wid, (*_, lost_at) in list(self.lost_windows.items()):
@@ -2325,8 +2326,32 @@ class SessionManager:
         user_id, thread_id, name, _ = lost
         if name != window_name or self.get_window_for_thread(user_id, thread_id):
             return None
-        self.bind_thread(user_id, thread_id, window_id)
         return user_id, thread_id
+
+    def topic_remembering_window(
+        self, window_id: str, cwd: str
+    ) -> tuple[int, int] | None:
+        """The one unbound topic that remembers running this window's agent.
+
+        For a live window no binding points at and no lost_windows record
+        covers — its binding vanished without a trace (a restart between the
+        unbind and the record, a lost state write). A topic keeps its folder
+        and CLI memory on every involuntary unbind; a deliberate end drops the
+        CLI (forget_thread_runtime) and kills the window itself. None unless
+        exactly one unbound topic matches both.
+        """
+        ws = self.window_states.get(window_id)
+        directory = ws.cwd if ws and ws.cwd else cwd
+        runtime = self.window_runtime(window_id)
+        matches = [
+            (user_id, thread_id)
+            for user_id, dirs in self.thread_directory_memory.items()
+            for thread_id, remembered in dirs.items()
+            if same_dir(remembered, directory)
+            and self.get_remembered_runtime(user_id, thread_id) == runtime
+            and self.get_window_for_thread(user_id, thread_id) is None
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def get_window_for_thread(self, user_id: int, thread_id: int) -> str | None:
         """Look up the window_id bound to a thread."""

@@ -35,18 +35,19 @@ import logging
 import time
 
 from telegram import Bot
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 from ..config import config
 from ..i18n import tr
 from ..rate_limiter import background_context
 from ..session import session_manager
+from ..utils import same_dir
 from ..terminal_parser import (
     detect_model_switch,
     extract_interactive_content,
     is_interactive_ui,
 )
-from ..tmux_manager import TmuxReadError, tmux_manager
+from ..tmux_manager import TmuxReadError, TmuxWindow, tmux_manager
 from . import quiet_turn
 from .agent_restart import (
     ReviveError,
@@ -549,11 +550,46 @@ async def _check_runtime_versions(bot: Bot) -> None:
             logger.debug("Runtime version check failed for %s: %s", rt.name, e)
 
 
+async def _give_window_back(
+    bot: Bot, window: TmuxWindow, user_id: int, thread_id: int
+) -> bool | None:
+    """Bind a live unbound window back to the topic it was lost from.
+
+    Says so in the topic first, and that send doubles as the check that the
+    topic still exists: a deleted one gets nothing bound to it. True = bound,
+    False = the topic is gone, None = Telegram is rate-limiting, try later.
+    """
+    try:
+        await safe_send(
+            bot,
+            session_manager.resolve_chat_id(user_id, thread_id),
+            tr("spoll.window_reclaimed", name=window.window_name),
+            message_thread_id=thread_id,
+        )
+    except RetryAfter:
+        return None
+    except BadRequest as e:
+        if is_topic_gone_error(e):
+            return False
+        raise
+    session_manager.bind_thread(user_id, thread_id, window.window_id)
+    logger.warning(
+        "Window %s (%s) had lost its topic but is alive — rebound to thread %d",
+        window.window_id,
+        window.window_name,
+        thread_id,
+    )
+    return True
+
+
 async def _orphan_janitor(bot: Bot) -> None:
     """One pass of the orphan-window janitor (see the module docstring).
 
-    Also hands a window unbound as gone, but alive after all, back to its
-    topic (SessionManager.reclaim_lost_window) — before anything is reaped.
+    Before anything is reaped, a live window that lost its topic goes back to
+    it (_give_window_back): at once when the unbind left a record
+    (SessionManager.take_lost_window), and as the last check before a kill
+    when the topic still remembers running this agent in this folder
+    (SessionManager.topic_remembering_window).
     """
     global _zero_bindings_since, _zero_bindings_warned
     # Orphan window janitor — any non-__main__ tmux window with no thread
@@ -571,25 +607,10 @@ async def _orphan_janitor(bot: Bot) -> None:
         for w in all_windows:
             if w.window_id in bound_wids:
                 continue
-            reclaimed = session_manager.reclaim_lost_window(w.window_id, w.window_name)
-            if reclaimed is None:
-                continue
-            uid, tid = reclaimed
-            bound_wids.add(w.window_id)
-            _orphan_since.pop(w.window_id, None)
-            logger.warning(
-                "Window %s (%s) was unbound as gone but is alive — "
-                "rebound to thread %d",
-                w.window_id,
-                w.window_name,
-                tid,
-            )
-            await safe_send(
-                bot,
-                session_manager.resolve_chat_id(uid, tid),
-                tr("spoll.window_reclaimed", name=w.window_name),
-                message_thread_id=tid,
-            )
+            owner = session_manager.take_lost_window(w.window_id, w.window_name)
+            if owner and await _give_window_back(bot, w, *owner):
+                bound_wids.add(w.window_id)
+                _orphan_since.pop(w.window_id, None)
         now = time.monotonic()
         agent_windows = [w for w in all_windows if w.window_name != "__main__"]
         if agent_windows and not bound_wids:
@@ -623,6 +644,27 @@ async def _orphan_janitor(bot: Bot) -> None:
             first_seen = _orphan_since.setdefault(w.window_id, now)
             elapsed = now - first_seen
             if elapsed >= ORPHAN_WINDOW_GRACE:
+                # Last check before the kill: a topic that remembers running
+                # this agent here. Not when another unbound window shares the
+                # folder — which of them was the topic's can't be told.
+                shared = any(
+                    o is not w
+                    and o.window_id not in bound_wids
+                    and same_dir(o.cwd, w.cwd)
+                    for o in agent_windows
+                )
+                owner = (
+                    None
+                    if shared
+                    else session_manager.topic_remembering_window(w.window_id, w.cwd)
+                )
+                if owner:
+                    given = await _give_window_back(bot, w, *owner)
+                    if given:
+                        bound_wids.add(w.window_id)
+                        _orphan_since.pop(w.window_id, None)
+                    if given is not False:
+                        continue  # bound, or rate-limited: try again next pass
                 display = w.window_name
                 # If this is a worktree window, flag its meta orphaned
                 # before reaping — never destroy the worktree/branch here

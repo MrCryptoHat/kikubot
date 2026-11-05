@@ -587,40 +587,70 @@ class TestLostWindows:
         mgr.bind_thread(100, 1, "@4", window_name="proj")
         assert mgr.unbind_lost_window(100, 1) == "@4"
         assert mgr.get_window_for_thread(100, 1) is None
-        assert mgr.reclaim_lost_window("@4", "proj") == (100, 1)
-        assert mgr.get_window_for_thread(100, 1) == "@4"
-        assert mgr.reclaim_lost_window("@4", "proj") is None  # one-shot
+        assert mgr.take_lost_window("@4", "proj") == (100, 1)
+        assert mgr.take_lost_window("@4", "proj") is None  # one-shot
 
-    def test_not_reclaimed_when_it_is_another_window(self, mgr: SessionManager) -> None:
+    def test_not_taken_when_it_is_another_window(self, mgr: SessionManager) -> None:
         # tmux reuses window ids after a server restart.
         mgr.bind_thread(100, 1, "@4", window_name="proj")
         mgr.unbind_lost_window(100, 1)
-        assert mgr.reclaim_lost_window("@4", "other") is None
-        assert mgr.get_window_for_thread(100, 1) is None
+        assert mgr.take_lost_window("@4", "other") is None
 
-    def test_not_reclaimed_when_the_topic_moved_on(self, mgr: SessionManager) -> None:
+    def test_not_taken_when_the_topic_moved_on(self, mgr: SessionManager) -> None:
         mgr.bind_thread(100, 1, "@4", window_name="proj")
         mgr.unbind_lost_window(100, 1)
         mgr.bind_thread(100, 1, "@9", window_name="proj-2")
-        assert mgr.reclaim_lost_window("@4", "proj") is None
-        assert mgr.get_window_for_thread(100, 1) == "@9"
+        assert mgr.take_lost_window("@4", "proj") is None
 
-    def test_not_reclaimed_after_the_ttl(
-        self, mgr: SessionManager, monkeypatch
-    ) -> None:
+    def test_not_taken_after_the_ttl(self, mgr: SessionManager, monkeypatch) -> None:
         from ccbot import session as session_mod
 
         mgr.bind_thread(100, 1, "@4", window_name="proj")
         mgr.unbind_lost_window(100, 1)
         later = time.monotonic() + session_mod.LOST_WINDOW_TTL + 1
         monkeypatch.setattr(session_mod.time, "monotonic", lambda: later)
-        assert mgr.reclaim_lost_window("@4", "proj") is None
+        assert mgr.take_lost_window("@4", "proj") is None
         assert mgr.lost_windows == {}
 
     def test_docker_bindings_are_not_recorded(self, mgr: SessionManager) -> None:
         mgr.bind_thread(100, 1, "docker:assistant")
         mgr.unbind_lost_window(100, 1)
         assert mgr.lost_windows == {}
+
+
+class TestTopicRememberingWindow:
+    """The janitor's last check before killing an unbound window: a topic that
+    lost its binding without a trace still remembers its folder and CLI."""
+
+    @staticmethod
+    def _lost_topic(mgr: SessionManager, thread_id: int, path: str, runtime: str):
+        mgr.record_thread_directory(100, thread_id, path, runtime=runtime)
+
+    def test_the_one_matching_topic(self, mgr: SessionManager, tmp_path) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "claude")
+        self._lost_topic(mgr, 2, str(tmp_path / "elsewhere"), "claude")
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) == (100, 1)
+
+    def test_none_when_two_topics_remember_the_folder(
+        self, mgr: SessionManager, tmp_path
+    ) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "claude")
+        self._lost_topic(mgr, 2, str(tmp_path), "claude")
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) is None
+
+    def test_none_for_another_cli(self, mgr: SessionManager, tmp_path) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "codex")
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) is None
+
+    def test_none_after_a_deliberate_end(self, mgr: SessionManager, tmp_path) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "claude")
+        mgr.forget_thread_runtime(100, 1)  # /kill, «End session», topic closed
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) is None
+
+    def test_none_for_a_bound_topic(self, mgr: SessionManager, tmp_path) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "claude")
+        mgr.bind_thread(100, 1, "@9")
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) is None
 
 
 class TestBootOrphans:

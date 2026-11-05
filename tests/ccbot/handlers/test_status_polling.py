@@ -398,38 +398,83 @@ class TestStaleBindingNeedsSustainedAbsence:
         sm.unbind_lost_window.assert_not_called()
 
 
-class TestOrphanJanitorReclaims:
-    async def test_lost_window_alive_goes_back_instead_of_dying(self, monkeypatch):
+class TestOrphanJanitorGivesWindowsBack:
+    """A live window that lost its topic goes back to it instead of being
+    killed — at once with a lost-window record, at the grace's end by memory."""
+
+    @staticmethod
+    def _janitor(monkeypatch, windows, bound=(("x", "@99"),)):
         from ccbot.handlers import status_polling as sp
-        from ccbot.tmux_manager import TmuxWindow
 
         sm = MagicMock()
-        sm.iter_thread_bindings.return_value = []  # its topic was the only one
-        sm.reclaim_lost_window.side_effect = lambda wid, name: (
-            (1, 42) if wid == "@40" else None
-        )
+        sm.iter_thread_bindings.return_value = [(1, 7, wid) for _, wid in bound]
+        sm.take_lost_window.return_value = None
+        sm.topic_remembering_window.return_value = None
         sm.resolve_chat_id.return_value = -100
+        sm.get_window_state.return_value = None
         monkeypatch.setattr(sp, "session_manager", sm)
         monkeypatch.setattr(
-            sp.tmux_manager,
-            "list_windows",
-            AsyncMock(
-                return_value=[
-                    TmuxWindow("@40", "proj", "/p"),
-                    TmuxWindow("@41", "x", "/p"),
-                ]
-            ),
+            sp.tmux_manager, "list_windows", AsyncMock(return_value=windows)
         )
         kill = AsyncMock()
         monkeypatch.setattr(sp.tmux_manager, "kill_window", kill)
         send = AsyncMock()
         monkeypatch.setattr(sp, "safe_send", send)
         monkeypatch.setattr(sp, "_orphan_since", {})
+        return sp, sm, kill, send
 
+    async def test_lost_window_goes_back_at_once(self, monkeypatch):
+        from ccbot.tmux_manager import TmuxWindow
+
+        sp, sm, kill, send = self._janitor(
+            monkeypatch,
+            [TmuxWindow("@40", "proj", "/p"), TmuxWindow("@41", "x", "/q")],
+            bound=(),  # its topic was the only one
+        )
+        sm.take_lost_window.side_effect = lambda wid, name: (
+            (1, 42) if wid == "@40" else None
+        )
         await sp._orphan_janitor(MagicMock())
-
-        sm.reclaim_lost_window.assert_any_call("@40", "proj")
+        sm.bind_thread.assert_called_once_with(1, 42, "@40")
         assert send.await_args.kwargs["message_thread_id"] == 42
         assert "@40" not in sp._orphan_since
-        assert "@41" in sp._orphan_since  # an ordinary orphan: grace starts
         kill.assert_not_called()
+
+    async def test_remembering_topic_gets_it_instead_of_the_kill(self, monkeypatch):
+        from ccbot.tmux_manager import TmuxWindow
+
+        sp, sm, kill, _ = self._janitor(monkeypatch, [TmuxWindow("@39", "proj", "/p")])
+        sm.topic_remembering_window.return_value = (1, 42)
+        sp._orphan_since["@39"] = -1e9  # grace long over
+        await sp._orphan_janitor(MagicMock())
+        sm.bind_thread.assert_called_once_with(1, 42, "@39")
+        kill.assert_not_called()
+
+    async def test_deleted_topic_gets_nothing_and_the_window_dies(self, monkeypatch):
+        from telegram.error import BadRequest
+
+        from ccbot.tmux_manager import TmuxWindow
+
+        sp, sm, kill, send = self._janitor(
+            monkeypatch, [TmuxWindow("@39", "proj", "/p")]
+        )
+        sm.topic_remembering_window.return_value = (1, 42)
+        send.side_effect = BadRequest("Message thread not found")
+        sp._orphan_since["@39"] = -1e9
+        await sp._orphan_janitor(MagicMock())
+        sm.bind_thread.assert_not_called()
+        kill.assert_awaited_once_with("@39")
+
+    async def test_shared_folder_is_not_guessed(self, monkeypatch):
+        from ccbot.tmux_manager import TmuxWindow
+
+        sp, sm, kill, _ = self._janitor(
+            monkeypatch,
+            [TmuxWindow("@39", "proj", "/p"), TmuxWindow("@43", "proj-2", "/p")],
+        )
+        sm.topic_remembering_window.return_value = (1, 42)
+        sp._orphan_since.update({"@39": -1e9, "@43": -1e9})
+        await sp._orphan_janitor(MagicMock())
+        sm.topic_remembering_window.assert_not_called()
+        sm.bind_thread.assert_not_called()
+        assert kill.await_count == 2
