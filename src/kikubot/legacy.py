@@ -73,14 +73,30 @@ def unmigrated_dir(home: Path | None = None) -> Path | None:
     return None
 
 
-def adopt_env(environ: MutableMapping[str, str]) -> list[str]:
+def _names_old_default(value: str, home: Path | None = None) -> bool:
+    """Is this CCBOT_DIR value just ~/.ccbot, the old default?
+
+    The old bot exported its resolved data dir into its tmux session, so a
+    window created there afterwards (scripts/restart.sh makes __main__ when
+    it's missing) hands CCBOT_DIR=~/.ccbot to the new bot. That is no
+    operator's choice: read as one, the dir would never move.
+    """
+    old = (home or Path.home()) / OLD_DIR
+    path = Path(value).expanduser()
+    return path == old or os.path.realpath(path) == os.path.realpath(old)
+
+
+def adopt_env(environ: MutableMapping[str, str], home: Path | None = None) -> list[str]:
     """Rename CCBOT_* variables to KIKUBOT_* in place; return the adopted names.
 
-    A new name already set wins. The old names are removed either way.
+    A new name already set wins. The old names are removed either way, and
+    CCBOT_DIR naming the old default is dropped, not adopted.
     """
     adopted = []
     for name in [n for n in environ if n.startswith(OLD_PREFIX)]:
         value = environ.pop(name)
+        if name == OLD_PREFIX + "DIR" and _names_old_default(value, home):
+            continue
         new = NEW_PREFIX + name[len(OLD_PREFIX) :]
         if new not in environ:
             environ[new] = value
@@ -296,9 +312,12 @@ def migrate(home: Path, cwd: Path) -> list[str]:
     local_env = _dotenv(cwd / ".env")
 
     # 1. The data dir — only the default one moves; an explicit dir stays put.
+    env_dir = os.environ.get(OLD_PREFIX + "DIR", "")
+    if env_dir and _names_old_default(env_dir, home):
+        env_dir = ""  # exported by the old bot, not set by anyone
     explicit = (
         os.environ.get(NEW_PREFIX + "DIR")
-        or os.environ.get(OLD_PREFIX + "DIR")
+        or env_dir
         or local_env.get(NEW_PREFIX + "DIR")
         or local_env.get(OLD_PREFIX + "DIR")
     )

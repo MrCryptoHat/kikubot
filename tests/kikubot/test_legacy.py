@@ -93,6 +93,17 @@ class TestDataDir:
         assert not (home / ".kikubot").exists()
         assert not (home / ".ccbot").is_symlink()
 
+    def test_ccbot_dir_naming_the_old_default_still_moves(
+        self, install, tmux, monkeypatch
+    ) -> None:
+        # The old bot exported CCBOT_DIR=~/.ccbot into its tmux session; a
+        # window made there afterwards passes it on to the new bot.
+        home, repo = install
+        monkeypatch.setenv("CCBOT_DIR", str(home / ".ccbot"))
+        legacy.migrate(home, repo)
+        assert (home / ".kikubot" / "state.json").read_text() == "{}"
+        assert (home / ".ccbot").is_symlink()
+
     def test_logs_are_renamed(self, install, tmux) -> None:
         home, repo = install
         legacy.migrate(home, repo)
@@ -295,6 +306,11 @@ class TestEnvironment:
         assert legacy.adopt_env(env) == ["CCBOT_PLUGINS"]
         # The new name wins; the old ones leave either way (no leak to agents).
         assert env == {"KIKUBOT_PLUGINS": "drive", "KIKUBOT_DIR": "/new"}
+
+    def test_adopt_env_drops_the_old_default_dir(self, tmp_path) -> None:
+        env = {"CCBOT_DIR": str(tmp_path / ".ccbot"), "CCBOT_PLUGINS": "drive"}
+        assert legacy.adopt_env(env, home=tmp_path) == ["CCBOT_PLUGINS"]
+        assert env == {"KIKUBOT_PLUGINS": "drive"}  # no warning, no KIKUBOT_DIR
 
     def test_old_hook_command(self) -> None:
         assert legacy.is_hook_command("/v/bin/ccbot hook")

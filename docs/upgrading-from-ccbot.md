@@ -24,7 +24,8 @@ configuration, and logs every step as `Moved from ccbot: …`:
 | `session_map.json` keys `ccbot:@N` | `kikubot:@N` |
 | `ccbot hook` in `~/.claude/settings.json` | `kikubot hook` |
 
-A data dir you set explicitly (`CCBOT_DIR` / `KIKUBOT_DIR`) stays where it is,
+A data dir you set explicitly (`CCBOT_DIR` / `KIKUBOT_DIR`) stays where it is
+(`CCBOT_DIR=~/.ccbot` is the default, not a choice: it moves),
 and so does a tmux session name you set with `TMUX_SESSION_NAME`.
 
 The bot refuses to start, saying why, if both the old and the new data dir or
