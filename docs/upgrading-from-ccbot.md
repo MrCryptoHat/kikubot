@@ -17,6 +17,7 @@ configuration, and logs every step as `Moved from ccbot: …`:
 | Before | After |
 |---|---|
 | `~/.ccbot/` | `~/.kikubot/` — a symlink stays at `~/.ccbot` |
+| what names a path in `~/.ccbot/worktrees/`: git's worktree registrations, Claude Code's transcript dirs, paths in `state.json` | the same under `~/.kikubot/worktrees/` — an agent in a worktree resumes its conversation after a restart |
 | `CCBOT_*` lines in `.env` (repo root and data dir) | `KIKUBOT_*` |
 | `logs/ccbot.log*` | `logs/kikubot.log*` |
 | tmux session `ccbot` | `kikubot` — renamed live, agents keep running |

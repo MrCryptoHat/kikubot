@@ -25,7 +25,14 @@ TMUX = shutil.which("tmux")
 @pytest.fixture
 def install(tmp_path, monkeypatch):
     """An install from before the rename: ~/.ccbot with state, a repo checkout."""
-    for name in ("KIKUBOT_DIR", "CCBOT_DIR", "TMUX_SESSION_NAME"):
+    for name in (
+        "KIKUBOT_DIR",
+        "CCBOT_DIR",
+        "TMUX_SESSION_NAME",
+        "CLAUDE_CONFIG_DIR",
+        "KIKUBOT_CLAUDE_PROJECTS_PATH",
+        "CCBOT_CLAUDE_PROJECTS_PATH",
+    ):
         monkeypatch.delenv(name, raising=False)
     home, repo = tmp_path / "home", tmp_path / "repo"
     old = home / ".ccbot"
@@ -95,6 +102,110 @@ class TestDataDir:
             "kikubot.log.1",
         ]
         assert (logs / "kikubot.log").read_text() == "old log\n"
+
+
+class TestWorktreePaths:
+    """Agent worktrees live in the data dir: moving it moved them."""
+
+    def test_state_paths_follow_the_dir(self, install, tmux) -> None:
+        home, repo = install
+        old, new = home / ".ccbot", home / ".kikubot"
+        wt = f"{old}/worktrees/app/fix"
+        (old / "state.json").write_text(
+            json.dumps(
+                {
+                    "thread_directory_memory": {"1": {"75": wt, "76": "/srv/app"}},
+                    "worktree_meta": {"1": {"75": {"path": wt, "repo": "/srv/app"}}},
+                    "names": [f"{old}x/not-ours", "ccbot"],
+                }
+            )
+        )
+        (old / "session_map.json").write_text(json.dumps({"other:@1": {"cwd": wt}}))
+        legacy.migrate(home, repo)
+        state = json.loads((new / "state.json").read_text())
+        moved = f"{new}/worktrees/app/fix"
+        assert state["thread_directory_memory"] == {
+            "1": {"75": moved, "76": "/srv/app"}
+        }
+        assert state["worktree_meta"]["1"]["75"] == {"path": moved, "repo": "/srv/app"}
+        assert state["names"] == [f"{old}x/not-ours", "ccbot"]
+        entries = json.loads((new / "session_map.json").read_text())
+        assert entries == {"other:@1": {"cwd": moved}}
+
+    def test_an_install_moved_earlier_is_finished_on_the_next_start(
+        self, install, tmux
+    ) -> None:
+        home, repo = install
+        legacy.migrate(home, repo)  # moved by a version without this step
+        wt = f"{home / '.ccbot'}/worktrees/app/fix"
+        (home / ".kikubot" / "state.json").write_text(json.dumps({"dir": wt}))
+        legacy.migrate(home, repo)
+        state = json.loads((home / ".kikubot" / "state.json").read_text())
+        assert state == {"dir": f"{home / '.kikubot'}/worktrees/app/fix"}
+
+    def test_transcripts_move_to_the_name_of_the_new_path(self, install, tmux) -> None:
+        home, repo = install
+        projects = home / ".claude" / "projects"
+        name = legacy._project_dir_name
+        real_home = os.path.realpath(home)
+        old = projects / name(f"{real_home}/.ccbot/worktrees/app/fix")
+        other = projects / name(f"{real_home}/dev/app")
+        old.mkdir(parents=True)
+        other.mkdir()
+        (old / "sid.jsonl").write_text("{}\n")
+        legacy.migrate(home, repo)
+        new = projects / name(f"{real_home}/.kikubot/worktrees/app/fix")
+        assert (new / "sid.jsonl").read_text() == "{}\n"
+        assert not new.is_symlink()
+        assert old.is_symlink() and old.resolve() == new.resolve()
+        assert other.is_dir() and not other.is_symlink()
+        assert legacy.migrate(home, repo) == []  # done once
+
+    def test_transcripts_under_both_names_are_left_alone(self, install, tmux) -> None:
+        home, repo = install
+        projects = home / ".claude" / "projects"
+        real_home = os.path.realpath(home)
+        old = projects / legacy._project_dir_name(f"{real_home}/.ccbot/worktrees/a/b")
+        new = projects / legacy._project_dir_name(f"{real_home}/.kikubot/worktrees/a/b")
+        old.mkdir(parents=True)
+        new.mkdir()
+        done = legacy.migrate(home, repo)
+        assert old.is_dir() and not old.is_symlink()
+        assert any("both names" in step for step in done)
+
+    @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+    def test_git_registers_the_worktree_at_its_new_path(self, install, tmux) -> None:
+        home, repo = install
+
+        def git(*args: str, cwd: Path = repo) -> str:
+            return subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    *args,
+                ],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            ).stdout
+
+        git("init", "-q", "-b", "main")
+        git("commit", "-q", "--allow-empty", "-m", "init")
+        old_wt = home / ".ccbot" / "worktrees" / "app" / "fix"
+        git("worktree", "add", "-q", "-b", "wt/fix", str(old_wt))
+        legacy.migrate(home, repo)
+        new_wt = Path(os.path.realpath(home / ".kikubot" / "worktrees" / "app" / "fix"))
+        listed = git("worktree", "list", "--porcelain")
+        assert f"worktree {new_wt}\n" in listed
+        assert ".ccbot" not in listed
+        assert git("rev-parse", "--abbrev-ref", "HEAD", cwd=new_wt) == "wt/fix\n"
 
 
 class TestEnvFiles:
