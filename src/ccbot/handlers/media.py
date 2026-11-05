@@ -29,7 +29,7 @@ from ..i18n import tr
 from ..runtimes import get_runtime
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import TmuxReadError, tmux_manager
 from ..transcribe import transcribe_voice
 from ..utils import ccbot_dir
 from .. import video
@@ -169,8 +169,11 @@ async def _validate_media_context(
     # docker bindings we let send_to_window do its own container-alive
     # check inline.
     if not session_manager._is_docker_binding(wid):
-        w = await tmux_manager.find_window_by_id(wid)
-        if not w:
+        try:
+            gone = await tmux_manager.find_window_by_id(wid) is None
+        except TmuxReadError:
+            gone = False  # unknown: deliver anyway, the send reports a failure
+        if gone:
             display = session_manager.get_display_name(wid)
             session_manager.unbind_thread(user_id, thread_id)
             if update.message:

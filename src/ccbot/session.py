@@ -44,7 +44,7 @@ from .docker_driver import (
     sub_tmux_session,
 )
 from .runtimes import get_runtime
-from .tmux_manager import tmux_manager
+from .tmux_manager import TmuxReadError, tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import (
     atomic_write_json,
@@ -68,6 +68,9 @@ UNSENT_IN_COMPOSER = (
     "The message was typed but the agent did not accept it — it is still "
     "in the input box. The agent may be stuck; try restarting it."
 )
+# Sent back when tmux couldn't be read: the window may well be alive, so this
+# must not read as "the agent is gone".
+TMUX_UNREADABLE = "Couldn't reach the agent's terminal just now. Please try again."
 
 # Binding-value grammar for containers: "docker:<agent>" (the agent's own
 # long-lived session) and "docker:<agent>/<slug>" (a ccbot-created sub-agent
@@ -690,7 +693,13 @@ class SessionManager:
 
         Builds {window_name: window_id} from live windows, then remaps or drops entries.
         """
-        windows = await tmux_manager.list_windows()
+        try:
+            windows = await tmux_manager.list_windows()
+        except TmuxReadError:
+            # Every binding would read as stale and be dropped. Keep them; the
+            # status poll unbinds the really dead ones once tmux answers.
+            logger.warning("Startup: tmux unreadable, stale-id resolution skipped")
+            return
         live_by_name: dict[str, str] = {}  # window_name -> window_id
         live_ids: set[str] = set()
         for w in windows:
@@ -2381,7 +2390,10 @@ class SessionManager:
                 if not success:
                     return False, "Failed to send keys (docker)"
             else:
-                window = await tmux_manager.find_window_by_id(window_id)
+                try:
+                    window = await tmux_manager.find_window_by_id(window_id)
+                except TmuxReadError:
+                    return False, TMUX_UNREADABLE
                 if not window:
                     return False, "Window not found (may have been closed)"
                 if not await tmux_manager.send_keys(window.window_id, text):
@@ -2435,7 +2447,10 @@ class SessionManager:
                 literal=literal,
                 session=target.tmux_session,
             )
-        window = await tmux_manager.find_window_by_id(binding_value)
+        try:
+            window = await tmux_manager.find_window_by_id(binding_value)
+        except TmuxReadError:
+            return False
         if not window:
             return False
         return await tmux_manager.send_keys(
@@ -2507,7 +2522,10 @@ class SessionManager:
             or "[Image #"
         )
         async with self.send_lock(binding_value):
-            window = await tmux_manager.find_window_by_id(binding_value)
+            try:
+                window = await tmux_manager.find_window_by_id(binding_value)
+            except TmuxReadError:
+                return False
             if not window:
                 return False
             wid = window.window_id
@@ -2564,7 +2582,10 @@ class SessionManager:
                 scrollback_lines=scrollback_lines,
                 session=target.tmux_session,
             )
-        window = await tmux_manager.find_window_by_id(binding_value)
+        try:
+            window = await tmux_manager.find_window_by_id(binding_value)
+        except TmuxReadError:
+            return None
         if not window:
             return None
         return await tmux_manager.capture_pane(
@@ -2593,7 +2614,10 @@ class SessionManager:
             return await docker_driver.kill_session(
                 target.agent.container, session=target.tmux_session
             )
-        window = await tmux_manager.find_window_by_id(binding_value)
+        try:
+            window = await tmux_manager.find_window_by_id(binding_value)
+        except TmuxReadError:
+            return False  # unknown, so not "already gone"
         if not window:
             return True
         return await tmux_manager.kill_window(window.window_id)

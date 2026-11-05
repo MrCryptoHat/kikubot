@@ -341,3 +341,58 @@ class TestReviveDeadWindow:
         sm.iter_thread_bindings.return_value = [(1, 42, "@8")]
         monkeypatch.setattr(sp, "session_manager", sm)
         assert await sp._revive_dead_window(MagicMock(), "@7", "x") is False
+
+
+class TestStaleBindingNeedsSustainedAbsence:
+    """Unbinding a topic is the first half of a kill: the orphan janitor reaps
+    the unbound window 90 s later. One failed tmux read used to unbind live
+    windows that way (21 working agents, 2026-10-20 to 11-05)."""
+
+    @staticmethod
+    def _poller(monkeypatch, find: AsyncMock, clock: list[float]):
+        from ccbot.handlers import status_polling as sp
+
+        sm = MagicMock()
+        sm._is_docker_binding.return_value = False
+        monkeypatch.setattr(sp, "session_manager", sm)
+        monkeypatch.setattr(sp.tmux_manager, "find_window_by_id", find)
+        monkeypatch.setattr(sp, "clear_topic_state", AsyncMock())
+        monkeypatch.setattr(sp, "update_status_message", AsyncMock())
+        monkeypatch.setattr(sp.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(sp, "_window_absent_since", {})
+        return sp, sm
+
+    async def test_unreadable_tmux_never_unbinds(self, monkeypatch):
+        from ccbot.tmux_manager import TmuxReadError
+
+        clock = [100.0]
+        find = AsyncMock(side_effect=TmuxReadError("boom"))
+        sp, sm = self._poller(monkeypatch, find, clock)
+        for _ in range(3):
+            await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+            clock[0] += sp.STALE_BINDING_GRACE
+        sm.unbind_thread.assert_not_called()
+
+    async def test_unbinds_only_after_the_grace(self, monkeypatch):
+        clock = [100.0]
+        sp, sm = self._poller(monkeypatch, AsyncMock(return_value=None), clock)
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        clock[0] += sp.STALE_BINDING_GRACE - 0.1
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        sm.unbind_thread.assert_not_called()
+        clock[0] += 0.1
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        sm.unbind_thread.assert_called_once_with(1, 42)
+
+    async def test_a_sighting_restarts_the_grace(self, monkeypatch):
+        clock = [100.0]
+        find = AsyncMock(return_value=None)
+        sp, sm = self._poller(monkeypatch, find, clock)
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        clock[0] += sp.STALE_BINDING_GRACE - 1
+        find.return_value = MagicMock(window_id="@40")
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        find.return_value = None
+        clock[0] += 2
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        sm.unbind_thread.assert_not_called()

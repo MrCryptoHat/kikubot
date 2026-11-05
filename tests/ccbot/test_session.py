@@ -557,6 +557,27 @@ class TestResolveStaleIdsPreservesDocker:
         assert mgr.window_states["docker:assistant"].session_id == "sid-1"
 
 
+class TestResolveStaleIdsOnUnreadableTmux:
+    async def test_bindings_survive_a_failed_read(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        # A failed read is not "every window is gone": dropping every binding
+        # at boot on it would orphan every live agent for the janitor.
+        from ccbot import tmux_manager as tm_mod
+
+        monkeypatch.setattr(
+            tm_mod.tmux_manager,
+            "list_windows",
+            AsyncMock(side_effect=tm_mod.TmuxReadError("boom")),
+        )
+        mgr.bind_thread(100, 1, "@4")
+        mgr.get_window_state("@4").session_id = "sid-4"
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 1) == "@4"
+        assert "@4" in mgr.window_states
+        assert mgr.boot_orphans == []
+
+
 class TestBootOrphans:
     """A tmux binding whose window died with tmux is remembered, with the
     session it ran, for CCBOT_AUTO_RESUME_AGENTS."""

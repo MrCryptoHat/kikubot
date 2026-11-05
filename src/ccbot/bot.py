@@ -140,7 +140,7 @@ from .markdown_v2 import convert_markdown
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
-from .tmux_manager import tmux_manager
+from .tmux_manager import TmuxReadError, tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .voice import (
     check_runtime_dependencies as check_voice_dependencies,
@@ -466,8 +466,11 @@ async def _forward_text_to_agent(
             )
             return
     else:
-        w = await tmux_manager.find_window_by_id(wid)
-        if not w:
+        try:
+            gone = await tmux_manager.find_window_by_id(wid) is None
+        except TmuxReadError:
+            gone = False  # unknown: deliver anyway, the send reports a failure
+        if gone:
             display = session_manager.get_display_name(wid)
             logger.info(
                 "Stale binding: window %s gone, unbinding (user=%d, thread=%d)",

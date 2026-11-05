@@ -24,6 +24,8 @@ Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (1 second)
   - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (60 seconds)
   - ORPHAN_WINDOW_GRACE: Delay before killing an unbound window (90 seconds)
+  - STALE_BINDING_GRACE: How long a bound window must be missing from tmux
+    before its topic is unbound (5 seconds; never on a failed read)
   - status_poll_loop: Background polling task
   - update_status_message: Poll and enqueue status updates
 """
@@ -44,7 +46,7 @@ from ..terminal_parser import (
     extract_interactive_content,
     is_interactive_ui,
 )
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import TmuxReadError, tmux_manager
 from . import quiet_turn
 from .agent_restart import (
     ReviveError,
@@ -105,6 +107,15 @@ DEAD_WINDOW_GRACE = 30.0  # seconds
 # topic gets bound.
 _orphan_since: dict[str, float] = {}
 ORPHAN_WINDOW_GRACE = 90.0  # seconds
+
+# Stale-binding cleanup: window_id -> monotonic time tmux first answered
+# without the bound window. The topic is unbound only after the window has been
+# missing from every listing for STALE_BINDING_GRACE. An unbind is the first
+# half of a kill: ORPHAN_WINDOW_GRACE later the janitor reaps the now-unbound
+# window. When one bad read unbound a live window, that killed 21 working
+# agents (2026-10-20 to 11-05).
+_window_absent_since: dict[str, float] = {}
+STALE_BINDING_GRACE = 5.0  # seconds
 
 # Zero-bindings guard episode: monotonic time when "agent windows alive but no
 # thread bindings" was first seen (None = condition absent), plus whether the
@@ -415,8 +426,18 @@ async def _poll_one_binding(bot: Bot, user_id: int, thread_id: int, wid: str) ->
         # photo — without this poll the JSONL records nothing until the
         # user has already answered.
         if not session_manager._is_docker_binding(wid):
-            w = await tmux_manager.find_window_by_id(wid)
-            if not w:
+            try:
+                w = await tmux_manager.find_window_by_id(wid)
+            except TmuxReadError:
+                return  # presence unknown; tmux_manager logged why
+            if w:
+                _window_absent_since.pop(wid, None)
+            else:
+                now = time.monotonic()
+                first_absent = _window_absent_since.setdefault(wid, now)
+                if now - first_absent < STALE_BINDING_GRACE:
+                    return
+                _window_absent_since.pop(wid, None)
                 session_manager.unbind_thread(user_id, thread_id)
                 await clear_topic_state(user_id, thread_id, bot)
                 logger.info(
@@ -581,15 +602,18 @@ async def status_poll_loop(bot: Bot) -> None:
             # tmux_manager); gathering them means N topics no longer serialise
             # behind each other's capture+edit latency, so the poll loop
             # stays close to its 1s cadence even with many open topics.
+            poll_bindings = list(session_manager.iter_thread_bindings())
             await asyncio.gather(
                 *(
                     _poll_one_binding(bot, user_id, thread_id, wid)
-                    for user_id, thread_id, wid in list(
-                        session_manager.iter_thread_bindings()
-                    )
+                    for user_id, thread_id, wid in poll_bindings
                 ),
                 return_exceptions=True,
             )
+            # A binding that went away some other way mid-grace.
+            bound = {wid for _, _, wid in poll_bindings}
+            for wid in [w for w in _window_absent_since if w not in bound]:
+                _window_absent_since.pop(wid, None)
         except Exception as e:
             logger.exception(f"Status poll loop error: {e}")
 

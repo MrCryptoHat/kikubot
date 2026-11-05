@@ -1,7 +1,8 @@
 """Tmux session/window management via libtmux.
 
 Wraps libtmux to provide async-friendly operations on a single tmux session:
-  - list_windows / find_window_by_name: discover Claude Code windows.
+  - list_windows / find_window_by_name: discover Claude Code windows. A read
+    that fails raises TmuxReadError — never an empty answer (see there).
   - agent_running_ids / is_agent_running: does a window's agent still hold its
     terminal — the dead-window check; the rule is pane_agent_running.
   - capture_pane: read terminal content (plain or with ANSI colors).
@@ -18,11 +19,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import libtmux
+from libtmux._internal.query_list import ObjectDoesNotExist
 
 from .config import config
 from .procinfo import foreground_process_groups
@@ -49,6 +52,108 @@ class TmuxWindow:
     window_name: str
     cwd: str  # Current working directory of the active pane
     panes: list[PaneState] = field(default_factory=list)
+
+
+class TmuxReadError(Exception):
+    """tmux could not be read, so whether a window exists is UNKNOWN.
+
+    Kept apart from an empty listing on purpose. libtmux turned every failed
+    read into "no session", so list_windows answered [] while the windows were
+    alive: status polling unbound a working agent's topic on that one answer,
+    and 90 s later the orphan janitor killed the window as unbound. Nothing
+    destructive may follow from this error; callers skip the step or report a
+    failure instead.
+    """
+
+
+# list_windows reads one ``list-panes -a`` with its own short row instead of
+# libtmux's 136-field one. Fixed-shape fields come first, free text last, and
+# every record ends with _RECORD_END, so a value with a newline in it stays
+# inside its record. A record is accepted only whole: the right field count and
+# a window id in front. Anything else is a read error, never a missing window.
+# The session is matched here, by exact name, not with ``-t``: tmux 3.7b's
+# ``list-panes -s -t =<name>`` for a session that doesn't exist answers with
+# another session's panes, which the orphan janitor would then reap as ours.
+_LIST_FIELDS = (
+    "window_id",
+    "pane_active",
+    "pane_pid",
+    "pane_dead",
+    "session_name",
+    "window_name",
+    "pane_current_path",
+    "pane_start_command",
+)
+_FIELD_SEP = "\u241f"  # ␟
+_RECORD_END = "\u241e"  # ␞
+_LIST_FORMAT = _FIELD_SEP.join(f"#{{{f}}}" for f in _LIST_FIELDS) + _RECORD_END
+_WINDOW_ID_RE = re.compile(r"@\d+")
+# No server answered. On macOS a connection refused for a full accept backlog
+# reads exactly like a dead server ("no server running"), so this one is
+# trusted only after every attempt says it.
+_SERVER_ABSENT = ("no server running", "No such file or directory")
+LIST_READ_ATTEMPTS = 3
+LIST_RETRY_DELAY = 0.2  # seconds between attempts
+_READ_WARN_INTERVAL = 30.0  # one WARNING per this many seconds; the rest DEBUG
+_last_read_warning = 0.0
+
+
+def _parse_pane_records(raw: str, session_name: str) -> list[TmuxWindow]:
+    """Group the session's ``list-panes`` records into windows.
+
+    Raises TmuxReadError on a malformed record, whichever session it is in.
+    """
+    if raw.endswith(_RECORD_END):
+        raw = raw[: -len(_RECORD_END)]
+    if not raw:
+        return []
+    windows: dict[str, TmuxWindow] = {}
+    for record in raw.split(_RECORD_END + "\n"):
+        values = record.split(_FIELD_SEP)
+        if len(values) != len(_LIST_FIELDS) or not _WINDOW_ID_RE.fullmatch(values[0]):
+            raise TmuxReadError(f"malformed list-panes record: {record[:300]!r}")
+        row = dict(zip(_LIST_FIELDS, values, strict=True))
+        if row["session_name"] != session_name:
+            continue
+        window_id = row["window_id"]
+        name = row["window_name"]
+        # Skip the main window (placeholder window)
+        if name == config.tmux_main_window_name:
+            continue
+        try:
+            pid = int(row["pane_pid"]) if row["pane_pid"] else None
+        except ValueError:
+            pid = None
+        pane = PaneState(
+            pid=pid,
+            dead=row["pane_dead"] == "1",  # "0" is a truthy string
+            start_command=row["pane_start_command"],
+        )
+        window = windows.get(window_id)
+        if window is None:
+            window = windows[window_id] = TmuxWindow(
+                window_id=window_id,
+                window_name=name,
+                cwd=row["pane_current_path"],
+            )
+        elif row["pane_active"] == "1":
+            window.cwd = row["pane_current_path"]
+        window.panes.append(pane)
+    return list(windows.values())
+
+
+def _log_read_failure(err: TmuxReadError) -> None:
+    """WARNING for the first failure in a while, DEBUG for the rest.
+
+    Every bound topic polls at once, so one bad moment fails a dozen reads.
+    """
+    global _last_read_warning
+    now = time.monotonic()
+    if now - _last_read_warning >= _READ_WARN_INTERVAL:
+        _last_read_warning = now
+        logger.warning("tmux window listing failed: %s", err)
+    else:
+        logger.debug("tmux window listing failed: %s", err)
 
 
 # tmux renders a pane's start command in its own quoting (args_escape): wrapped
@@ -129,19 +234,6 @@ def pane_agent_running(
     return tpgid != pane.pid
 
 
-def _pane_state(pane: libtmux.Pane) -> PaneState:
-    """PaneState from a libtmux pane row — every field arrives as a string."""
-    try:
-        pid = int(pane.pane_pid) if pane.pane_pid else None
-    except ValueError:
-        pid = None
-    return PaneState(
-        pid=pid,
-        dead=pane.pane_dead == "1",  # "0" is a truthy string
-        start_command=pane.pane_start_command or "",
-    )
-
-
 class TmuxManager:
     """Manages tmux windows for Claude Code sessions."""
 
@@ -162,10 +254,18 @@ class TmuxManager:
         return self._server
 
     def get_session(self) -> libtmux.Session | None:
-        """Get the tmux session if it exists."""
+        """Get the tmux session if it exists.
+
+        None also when tmux couldn't be read (libtmux hands back an empty
+        session list then), so a None here must never be taken to mean the
+        windows are gone. list_windows doesn't go through here for that reason.
+        """
         try:
             return self.server.sessions.get(session_name=self.session_name)
-        except Exception:
+        except ObjectDoesNotExist:
+            return None
+        except Exception as e:
+            logger.warning("tmux session lookup failed: %s: %s", type(e).__name__, e)
             return None
 
     def get_or_create_session(self) -> libtmux.Session:
@@ -218,43 +318,53 @@ class TmuxManager:
         except Exception:
             logger.warning("Failed to export CCBOT_DIR into tmux session env")
 
+    def _list_windows_once(self) -> list[TmuxWindow] | None:
+        """One ``list-panes -a`` read. None = no server answered.
+
+        Raises TmuxReadError when tmux answered with anything but a clean
+        listing.
+        """
+        try:
+            proc = self.server.cmd("list-panes", "-a", "-F", _LIST_FORMAT)
+        except Exception as e:
+            raise TmuxReadError(f"list-panes did not run: {e}") from e
+        stderr = "\n".join(proc.stderr).strip()
+        if proc.returncode == 0 and not stderr:
+            return _parse_pane_records("\n".join(proc.stdout), self.session_name)
+        if any(marker in stderr for marker in _SERVER_ABSENT):
+            return None
+        raise TmuxReadError(f"list-panes rc={proc.returncode}: {stderr[:300]!r}")
+
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
 
-        One ``list-panes -s`` for the whole session — every row already names
-        its window. (``window.active_pane`` cost a tmux call per window, on a
-        poll loop that lists twice a second.)
+        One ``list-panes -a`` for the whole server — every row already names
+        its session and window. (``window.active_pane`` cost a tmux call per
+        window, on a poll loop that lists twice a second.)
+
+        An empty list means tmux said so: a live server without the session,
+        or no server on every attempt. A read that fails on every attempt
+        raises TmuxReadError instead (see there).
 
         Returns:
             List of TmuxWindow with window info, active-pane cwd and pane states
         """
-
-        def _sync_list_windows() -> list[TmuxWindow]:
-            session = self.get_session()
-            if not session:
-                return []
-
-            windows: dict[str, TmuxWindow] = {}
-            for pane in session.panes:
-                window_id = pane.window_id or ""
-                name = pane.window_name or ""
-                # Skip the main window (placeholder window)
-                if not window_id or name == config.tmux_main_window_name:
-                    continue
-                window = windows.get(window_id)
-                if window is None:
-                    window = windows[window_id] = TmuxWindow(
-                        window_id=window_id,
-                        window_name=name,
-                        cwd=pane.pane_current_path or "",
-                    )
-                elif pane.pane_active == "1":
-                    window.cwd = pane.pane_current_path or ""
-                window.panes.append(_pane_state(pane))
-
-            return list(windows.values())
-
-        return await asyncio.to_thread(_sync_list_windows)
+        for attempt in range(1, LIST_READ_ATTEMPTS + 1):
+            last = attempt == LIST_READ_ATTEMPTS
+            try:
+                windows = await asyncio.to_thread(self._list_windows_once)
+            except TmuxReadError as e:
+                if last:
+                    _log_read_failure(e)
+                    raise
+                logger.debug("tmux listing attempt %d failed: %s", attempt, e)
+            else:
+                if windows is not None:
+                    return windows
+                if last:
+                    return []
+            await asyncio.sleep(LIST_RETRY_DELAY)
+        raise AssertionError("unreachable")  # the last attempt returns or raises
 
     async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
         """Find a window by its name.
@@ -263,7 +373,10 @@ class TmuxManager:
             window_name: The window name to match
 
         Returns:
-            TmuxWindow if found, None otherwise
+            TmuxWindow if found, None if tmux answered without it.
+
+        Raises:
+            TmuxReadError: tmux couldn't be read, presence unknown.
         """
         windows = await self.list_windows()
         for window in windows:
@@ -279,7 +392,11 @@ class TmuxManager:
             window_id: The tmux window ID to match
 
         Returns:
-            TmuxWindow if found, None otherwise
+            TmuxWindow if found, None if tmux answered without it.
+
+        Raises:
+            TmuxReadError: tmux couldn't be read, presence unknown. Anything
+                that unbinds or kills on a missing window must let it stop it.
         """
         windows = await self.list_windows()
         for window in windows:
