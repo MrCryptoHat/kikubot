@@ -1,0 +1,480 @@
+"""Tests for status_polling — Settings UI detection via the poller path.
+
+Simulates the user workflow: /model is sent to Claude Code, the Settings
+model picker renders in the terminal, and the status poller detects it
+on its next 1s tick.
+"""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from kikubot.handlers.status_polling import update_status_message
+
+
+@pytest.fixture
+def mock_bot():
+    bot = AsyncMock()
+    sent_msg = MagicMock()
+    sent_msg.message_id = 999
+    bot.send_message.return_value = sent_msg
+    return bot
+
+
+@pytest.fixture
+def _clear_interactive_state():
+    """Ensure interactive state is clean before and after each test.
+
+    Also resets the 3-second "already sent recently" dedup timestamp,
+    otherwise a test that triggers handle_interactive_ui can make the
+    next test's call return True without actually rendering anything.
+    """
+    from kikubot.handlers.interactive_ui import (
+        _interactive_last_sent,
+        _interactive_mode,
+        _interactive_msgs,
+        _interactive_widget_name,
+    )
+
+    for d in (
+        _interactive_mode,
+        _interactive_msgs,
+        _interactive_last_sent,
+        _interactive_widget_name,
+    ):
+        d.clear()
+    yield
+    for d in (
+        _interactive_mode,
+        _interactive_msgs,
+        _interactive_last_sent,
+        _interactive_widget_name,
+    ):
+        d.clear()
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestStatusPollerSettingsDetection:
+    """Simulate the status poller detecting a Settings UI in the terminal.
+
+    This is the actual code path for /model: no JSONL tool_use entry exists,
+    so the status poller (update_status_message) is the only detector.
+    """
+
+    @pytest.mark.asyncio
+    async def test_settings_ui_detected_and_keyboard_sent(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """Poller captures Settings pane → handle_interactive_ui sends keyboard."""
+        window_id = "@5"
+
+        with (
+            patch(
+                "kikubot.handlers.status_polling.session_manager.capture_pane",
+                new=AsyncMock(return_value=sample_pane_settings),
+            ),
+            patch(
+                "kikubot.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+        ):
+            mock_handle_ui.return_value = True
+
+            await update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
+
+    @pytest.mark.asyncio
+    async def test_normal_pane_no_interactive_ui(self, mock_bot: AsyncMock):
+        """Normal pane text → no handle_interactive_ui call, just status check."""
+        window_id = "@5"
+        normal_pane = (
+            "some output\n"
+            "✻ Reading file\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  [Opus 4.6] Context: 50%\n"
+        )
+
+        with (
+            patch(
+                "kikubot.handlers.status_polling.session_manager.capture_pane",
+                new=AsyncMock(return_value=normal_pane),
+            ),
+            patch(
+                "kikubot.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+        ):
+            await update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_handle_ui.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_login_success_screen_keeps_keyboard_and_repaints(
+        self, mock_bot: AsyncMock
+    ):
+        """After the sign-in code is accepted, Claude Code swaps the URL screen
+        for "Login successful. Press Enter to continue…" with no keypress from
+        us. The poll must keep the interactive photo (that Enter is the last
+        step of the login) and repaint it, not tear it down."""
+        from kikubot.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_widget_name,
+        )
+
+        window_id = "@5"
+        _interactive_mode[(1, 42)] = window_id
+        _interactive_widget_name[(1, 42)] = "LoginPrompt"
+        pane = (
+            "  Login\n"
+            "\n"
+            "  Logged in as user@example.com\n"
+            "  Login successful. Press Enter to continue…\n"
+        )
+
+        with (
+            patch(
+                "kikubot.handlers.status_polling.session_manager.capture_pane",
+                new=AsyncMock(return_value=pane),
+            ),
+            patch(
+                "kikubot.handlers.status_polling.clear_interactive_msg",
+                new_callable=AsyncMock,
+            ) as mock_clear,
+            patch(
+                "kikubot.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+        ):
+            await update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_clear.assert_not_called()
+            mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
+
+    @pytest.mark.asyncio
+    async def test_same_widget_is_not_repainted_every_tick(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """A widget that merely redraws (cursor moves, spinner) must be left
+        alone — repainting per tick would be a photo upload per second."""
+        from kikubot.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_widget_name,
+        )
+
+        window_id = "@5"
+        _interactive_mode[(1, 42)] = window_id
+        _interactive_widget_name[(1, 42)] = "Settings"
+
+        with (
+            patch(
+                "kikubot.handlers.status_polling.session_manager.capture_pane",
+                new=AsyncMock(return_value=sample_pane_settings),
+            ),
+            patch(
+                "kikubot.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+        ):
+            await update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_handle_ui.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_settings_ui_end_to_end_sends_telegram_photo(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """Full end-to-end: poller → is_interactive_ui → handle_interactive_ui
+        → bot.send_photo with the compact nav keyboard attached.
+
+        Uses real handle_interactive_ui (not mocked) to verify the full path.
+        The text-based send_message path was replaced by a photo + nav-key
+        keyboard — the pane screenshot carries all context so Claude Code's
+        UI changes don't break us at the prompt-parsing layer.
+        """
+        window_id = "@5"
+        # Both update_status_message and handle_interactive_ui capture the
+        # pane via the shared session_manager singleton (it branches by
+        # binding type), so patch the methods on that one instance — that's
+        # what both modules' `session_manager` name resolves to.
+        from kikubot.session import session_manager
+
+        with (
+            patch.object(
+                session_manager,
+                "capture_pane",
+                AsyncMock(return_value=sample_pane_settings),
+            ),
+            patch.object(session_manager, "is_generating", return_value=False),
+            patch.object(session_manager, "mark_idle"),
+            patch.object(session_manager, "resolve_chat_id", return_value=100),
+            patch(
+                "kikubot.handlers.interactive_ui.text_to_image",
+                return_value=b"fake-png",
+            ),
+        ):
+            await update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            # Photo + keyboard, never plain text.
+            mock_bot.send_photo.assert_called_once()
+            mock_bot.send_message.assert_not_called()
+            call_kwargs = mock_bot.send_photo.call_args.kwargs
+            assert call_kwargs["chat_id"] == 100
+            assert call_kwargs["message_thread_id"] == 42
+            assert call_kwargs["reply_markup"] is not None
+
+
+class TestDeadSiblingIsQuiet:
+    """A container restart should look like nothing happened: a sibling that
+    died with its container comes back silently; one the user stopped stays
+    down without a notice after every bot restart."""
+
+    WID = "docker:agent/side"
+
+    def _patch(self, monkeypatch, *, stopped=False, container_up=True, last="s1"):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kikubot.handlers import status_polling as sp
+
+        sm = MagicMock()
+        sm.is_docker_sub_agent.return_value = True
+        sm.docker_agent_running = AsyncMock(return_value=False)
+        sm.stopped_docker_agents = {self.WID} if stopped else set()
+        sm.resolve_docker_target.return_value = SimpleNamespace(
+            agent=SimpleNamespace(container="ctn")
+        )
+        monkeypatch.setattr(sp, "session_manager", sm)
+        monkeypatch.setattr(sp.config, "auto_resume_agents", True)
+        import kikubot.docker_driver as dd
+
+        monkeypatch.setattr(
+            dd.docker_driver, "is_container_alive", AsyncMock(return_value=container_up)
+        )
+        options = (SimpleNamespace(session_id=last) if last else None, [])
+        monkeypatch.setattr(
+            sp, "docker_revive_options", AsyncMock(return_value=options)
+        )
+        revive = AsyncMock()
+        offer = AsyncMock()
+        monkeypatch.setattr(sp, "revive_docker_agent", revive)
+        monkeypatch.setattr(sp, "offer_docker_revive", offer)
+        sp._sibling_down_seen.pop(self.WID, None)
+        sp._auto_revive_tried.pop(self.WID, None)
+        return sp, revive, offer
+
+    async def test_died_with_container_is_revived_silently(self, monkeypatch):
+        sp, revive, offer = self._patch(monkeypatch)
+        await sp._notify_dead_sibling(MagicMock(), self.WID, 7, 1)
+        revive.assert_awaited_once_with(self.WID, session_id="s1")
+        offer.assert_not_awaited()
+
+    async def test_user_stopped_stays_down_and_quiet(self, monkeypatch):
+        sp, revive, offer = self._patch(monkeypatch, stopped=True)
+        await sp._notify_dead_sibling(MagicMock(), self.WID, 7, 1)
+        revive.assert_not_awaited()
+        offer.assert_not_awaited()
+
+    async def test_container_still_restarting_says_nothing(self, monkeypatch):
+        sp, revive, offer = self._patch(monkeypatch, container_up=False)
+        await sp._notify_dead_sibling(MagicMock(), self.WID, 7, 1)
+        revive.assert_not_awaited()
+        offer.assert_not_awaited()
+
+    async def test_no_known_session_falls_back_to_offer(self, monkeypatch):
+        sp, revive, offer = self._patch(monkeypatch, last=None)
+        await sp._notify_dead_sibling(MagicMock(), self.WID, 7, 1)
+        revive.assert_not_awaited()
+        offer.assert_awaited_once()
+
+
+class TestReviveDeadWindow:
+    """KIKUBOT_AUTO_RESUME_AGENTS: a topic agent whose claude exited comes back
+    on its own session instead of the topic being closed."""
+
+    async def test_bound_window_is_revived(self, monkeypatch):
+        from kikubot.handlers import agent_restart
+        from kikubot.handlers import status_polling as sp
+
+        sm = MagicMock()
+        sm.iter_thread_bindings.return_value = [(1, 42, "@7")]
+        monkeypatch.setattr(sp, "session_manager", sm)
+        revive = AsyncMock(return_value=("@9", "proj-x"))
+        monkeypatch.setattr(agent_restart, "revive_topic_agent", revive)
+        assert await sp._revive_dead_window(MagicMock(), "@7", "x") is True
+        revive.assert_awaited_once_with(1, 42)
+
+    async def test_failure_alerts_operator_and_falls_back(self, monkeypatch):
+        from kikubot.handlers import agent_restart
+        from kikubot.handlers import status_polling as sp
+
+        sm = MagicMock()
+        sm.iter_thread_bindings.return_value = [(1, 42, "@7")]
+        monkeypatch.setattr(sp, "session_manager", sm)
+        monkeypatch.setattr(
+            agent_restart,
+            "revive_topic_agent",
+            AsyncMock(side_effect=agent_restart.ReviveError("restart.window_failed")),
+        )
+        monkeypatch.setattr(sp.config, "notifications_chat_id", -500)
+        send = AsyncMock()
+        monkeypatch.setattr(sp, "safe_send", send)
+        assert await sp._revive_dead_window(MagicMock(), "@7", "x") is False
+        assert send.await_args.args[1] == -500
+
+    async def test_unbound_window_is_not_revived(self, monkeypatch):
+        from kikubot.handlers import status_polling as sp
+
+        sm = MagicMock()
+        sm.iter_thread_bindings.return_value = [(1, 42, "@8")]
+        monkeypatch.setattr(sp, "session_manager", sm)
+        assert await sp._revive_dead_window(MagicMock(), "@7", "x") is False
+
+
+class TestStaleBindingNeedsSustainedAbsence:
+    """Unbinding a topic is the first half of a kill: the orphan janitor reaps
+    the unbound window 90 s later. One failed tmux read used to unbind live
+    windows that way (21 working agents, 2026-10-20 to 11-05)."""
+
+    @staticmethod
+    def _poller(monkeypatch, find: AsyncMock, clock: list[float]):
+        from kikubot.handlers import status_polling as sp
+
+        sm = MagicMock()
+        sm._is_docker_binding.return_value = False
+        monkeypatch.setattr(sp, "session_manager", sm)
+        monkeypatch.setattr(sp.tmux_manager, "find_window_by_id", find)
+        monkeypatch.setattr(sp, "clear_topic_state", AsyncMock())
+        monkeypatch.setattr(sp, "update_status_message", AsyncMock())
+        monkeypatch.setattr(sp.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(sp, "_window_absent_since", {})
+        return sp, sm
+
+    async def test_unreadable_tmux_never_unbinds(self, monkeypatch):
+        from kikubot.tmux_manager import TmuxReadError
+
+        clock = [100.0]
+        find = AsyncMock(side_effect=TmuxReadError("boom"))
+        sp, sm = self._poller(monkeypatch, find, clock)
+        for _ in range(3):
+            await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+            clock[0] += sp.STALE_BINDING_GRACE
+        sm.unbind_lost_window.assert_not_called()
+
+    async def test_unbinds_only_after_the_grace(self, monkeypatch):
+        clock = [100.0]
+        sp, sm = self._poller(monkeypatch, AsyncMock(return_value=None), clock)
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        clock[0] += sp.STALE_BINDING_GRACE - 0.1
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        sm.unbind_lost_window.assert_not_called()
+        clock[0] += 0.1
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        sm.unbind_lost_window.assert_called_once_with(1, 42)
+
+    async def test_a_sighting_restarts_the_grace(self, monkeypatch):
+        clock = [100.0]
+        find = AsyncMock(return_value=None)
+        sp, sm = self._poller(monkeypatch, find, clock)
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        clock[0] += sp.STALE_BINDING_GRACE - 1
+        find.return_value = MagicMock(window_id="@40")
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        find.return_value = None
+        clock[0] += 2
+        await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
+        sm.unbind_lost_window.assert_not_called()
+
+
+class TestOrphanJanitorGivesWindowsBack:
+    """A live window that lost its topic goes back to it instead of being
+    killed — at once with a lost-window record, at the grace's end by memory."""
+
+    @staticmethod
+    def _janitor(monkeypatch, windows, bound=(("x", "@99"),)):
+        from kikubot.handlers import status_polling as sp
+
+        sm = MagicMock()
+        sm.iter_thread_bindings.return_value = [(1, 7, wid) for _, wid in bound]
+        sm.take_lost_window.return_value = None
+        sm.topic_remembering_window.return_value = None
+        sm.resolve_chat_id.return_value = -100
+        sm.get_window_state.return_value = None
+        monkeypatch.setattr(sp, "session_manager", sm)
+        monkeypatch.setattr(
+            sp.tmux_manager, "list_windows", AsyncMock(return_value=windows)
+        )
+        kill = AsyncMock()
+        monkeypatch.setattr(sp.tmux_manager, "kill_window", kill)
+        send = AsyncMock()
+        monkeypatch.setattr(sp, "safe_send", send)
+        monkeypatch.setattr(sp, "_orphan_since", {})
+        return sp, sm, kill, send
+
+    async def test_lost_window_goes_back_at_once(self, monkeypatch):
+        from kikubot.tmux_manager import TmuxWindow
+
+        sp, sm, kill, send = self._janitor(
+            monkeypatch,
+            [TmuxWindow("@40", "proj", "/p"), TmuxWindow("@41", "x", "/q")],
+            bound=(),  # its topic was the only one
+        )
+        sm.take_lost_window.side_effect = lambda wid, name: (
+            (1, 42) if wid == "@40" else None
+        )
+        await sp._orphan_janitor(MagicMock())
+        sm.bind_thread.assert_called_once_with(1, 42, "@40")
+        assert send.await_args.kwargs["message_thread_id"] == 42
+        assert "@40" not in sp._orphan_since
+        kill.assert_not_called()
+
+    async def test_remembering_topic_gets_it_instead_of_the_kill(self, monkeypatch):
+        from kikubot.tmux_manager import TmuxWindow
+
+        sp, sm, kill, _ = self._janitor(monkeypatch, [TmuxWindow("@39", "proj", "/p")])
+        sm.topic_remembering_window.return_value = (1, 42)
+        sp._orphan_since["@39"] = -1e9  # grace long over
+        await sp._orphan_janitor(MagicMock())
+        sm.bind_thread.assert_called_once_with(1, 42, "@39")
+        kill.assert_not_called()
+
+    async def test_deleted_topic_gets_nothing_and_the_window_dies(self, monkeypatch):
+        from telegram.error import BadRequest
+
+        from kikubot.tmux_manager import TmuxWindow
+
+        sp, sm, kill, send = self._janitor(
+            monkeypatch, [TmuxWindow("@39", "proj", "/p")]
+        )
+        sm.topic_remembering_window.return_value = (1, 42)
+        send.side_effect = BadRequest("Message thread not found")
+        sp._orphan_since["@39"] = -1e9
+        await sp._orphan_janitor(MagicMock())
+        sm.bind_thread.assert_not_called()
+        kill.assert_awaited_once_with("@39")
+
+    async def test_shared_folder_is_not_guessed(self, monkeypatch):
+        from kikubot.tmux_manager import TmuxWindow
+
+        sp, sm, kill, _ = self._janitor(
+            monkeypatch,
+            [TmuxWindow("@39", "proj", "/p"), TmuxWindow("@43", "proj-2", "/p")],
+        )
+        sm.topic_remembering_window.return_value = (1, 42)
+        sp._orphan_since.update({"@39": -1e9, "@43": -1e9})
+        await sp._orphan_janitor(MagicMock())
+        sm.topic_remembering_window.assert_not_called()
+        sm.bind_thread.assert_not_called()
+        assert kill.await_count == 2

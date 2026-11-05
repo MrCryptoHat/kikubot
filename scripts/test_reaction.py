@@ -13,7 +13,7 @@ Example:
     uv run python scripts/test_reaction.py "https://t.me/c/1234567890/8/1517" 👀
 
 Steps:
-    1. Send a message in any ccbot topic from YOUR account.
+    1. Send a message in any kikubot topic from YOUR account.
     2. Long-press it → "Copy Link" → paste as the first argument.
     3. Run this. The bot reacts with the emoji (default 👀).
     4. Watch your phone: did the reaction produce a banner / unread bump?
@@ -25,7 +25,7 @@ Steps:
 
 Note: allowed reaction emoji are a fixed Telegram set — 👀 👍 👌 🫡 🔥 💯 work,
 ✅ does NOT (raises REACTION_INVALID). The bot must be an admin of the chat
-(ccbot already is). This is a plain API call; it does not touch the running bot.
+(kikubot already is). This is a plain API call; it does not touch the running bot.
 """
 
 from __future__ import annotations
@@ -42,12 +42,12 @@ from telegram import Bot, ReactionTypeEmoji
 
 def _load_token() -> str:
     """Read TELEGRAM_BOT_TOKEN the same way config.py does (local .env wins)."""
-    for env_path in (Path.cwd() / ".env", Path.home() / ".ccbot" / ".env"):
+    for env_path in (Path.cwd() / ".env", Path.home() / ".kikubot" / ".env"):
         if env_path.exists():
             load_dotenv(env_path)
     token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
     if not token:
-        sys.exit("TELEGRAM_BOT_TOKEN not found in .env or ~/.ccbot/.env")
+        sys.exit("TELEGRAM_BOT_TOKEN not found in .env or ~/.kikubot/.env")
     return token
 
 

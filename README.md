@@ -1,9 +1,9 @@
-<h1 align="center">ccbot — “Charlie-Charlie” 📻</h1>
+<h1 align="center">Kiku Bot 📻</h1>
 
 <p align="center"><b>Your whole fleet of terminal AI agents, on the radio in one Telegram group.</b></p>
 
 <p align="center">
-  <a href="https://github.com/MrCryptoHat/ccbot/actions/workflows/tests.yml"><img src="https://github.com/MrCryptoHat/ccbot/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://github.com/MrCryptoHat/kikubot/actions/workflows/tests.yml"><img src="https://github.com/MrCryptoHat/kikubot/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+"></a>
   <img src="https://img.shields.io/badge/agents-Claude_Code_%2B_Codex-8A2BE2" alt="Agents: Claude Code + Codex">
@@ -13,13 +13,13 @@
 <tr>
 <td width="345" valign="top">
   <a href="docs/images/hero.mp4">
-    <img src="docs/images/hero.gif" width="335" alt="ccbot demo: create a Telegram topic, an agent auto-binds, runs a task, streams live edit diffs, and reports all tests pass — controlled from a phone.">
+    <img src="docs/images/hero.gif" width="335" alt="Kiku Bot demo: create a Telegram topic, an agent auto-binds, runs a task, streams live edit diffs, and reports all tests pass — controlled from a phone.">
   </a>
   <p align="center"><sub>▶︎ 30-second demo — <a href="docs/images/hero.mp4">HD video</a></sub></p>
 </td>
 <td valign="top">
 
-ccbot is a **self-hosted Telegram bot** that remote-controls terminal AI
+Kiku Bot is a **self-hosted Telegram bot** that remote-controls terminal AI
 coding agents — **Claude Code** first-class, **OpenAI Codex** built-in,
 [others pluggable](docs/adding-a-runtime.md) — running in **tmux** on your
 own machine or server.
@@ -43,7 +43,7 @@ per-token costs, no third-party relay. Sessions outlive the bot:
 
 <table>
 <tr>
-<td width="42%"><img src="docs/images/agent-panel.webp" alt="ccbot agent panel with a live terminal screenshot and three tabs — Keys, Actions, Session."></td>
+<td width="42%"><img src="docs/images/agent-panel.webp" alt="Kiku Bot agent panel with a live terminal screenshot and three tabs — Keys, Actions, Session."></td>
 <td>
 
 ### Control the real terminal
@@ -89,7 +89,7 @@ the terminal shows arrives as a screenshot with an <code>↑ ↓ ⏎ Esc</code> 
 <td width="42%"><img src="docs/images/permission-commit.webp" alt="Claude Code git-commit permission prompt in Telegram — approving an agent commit from a phone."></td>
 </tr>
 <tr>
-<td width="42%"><img src="docs/images/hero-convo.webp" alt="ccbot chat: a Claude Code agent working a rate-limiter task, with an eyes read-ack reaction on the user's message."></td>
+<td width="42%"><img src="docs/images/hero-convo.webp" alt="Kiku Bot chat: a Claude Code agent working a rate-limiter task, with an eyes read-ack reaction on the user's message."></td>
 <td>
 
 ### Always know what your agent is doing
@@ -112,7 +112,7 @@ third agent CLI is [one subclass away](docs/adding-a-runtime.md).
 <td width="42%"><img src="docs/images/resume-picker.webp" alt="Session resume picker with per-runtime tabs (Claude Code / Codex) listing saved resumable sessions."></td>
 </tr>
 <tr>
-<td width="42%"><img src="docs/images/voice-loop.webp" alt="Two-way voice in ccbot: a voice message, its transcript, and a spoken agent reply."></td>
+<td width="42%"><img src="docs/images/voice-loop.webp" alt="Two-way voice in Kiku Bot: a voice message, its transcript, and a spoken agent reply."></td>
 <td>
 
 ### Talk to your agents
@@ -153,21 +153,21 @@ you **any file from the server** straight into the chat.
 ## Why drive tmux instead of an API?
 
 Your coding agent runs in your terminal. When you step away, the session
-keeps working — but you lose visibility and control. ccbot's key design
+keeps working — but you lose visibility and control. Kiku Bot's key design
 choice is that it drives **tmux**, not an agent SDK: the agent process stays
-exactly where it is; ccbot reads its transcript and sends keystrokes to the
+exactly where it is; Kiku Bot reads its transcript and sends keystrokes to the
 pane. So:
 
 - **Switch desktop → phone mid-conversation** — the session was never interrupted.
 - **Switch back anytime** — `tmux attach` and you're in the terminal with full scrollback.
-- **Nothing is lost if the bot dies** — sessions live in tmux, not in ccbot; every topic remembers its project and can resume any session.
+- **Nothing is lost if the bot dies** — sessions live in tmux, not in Kiku Bot; every topic remembers its project and can resume any session.
 - **It survives agent-CLI updates gracefully** — the TUI patterns are pinned per version, and a built-in canary alerts you when a CLI silently self-updates.
 
-The terminal stays the source of truth; ccbot is a thin control layer over it.
+The terminal stays the source of truth; Kiku Bot is a thin control layer over it.
 
 ## How it compares
 
-| | **ccbot** | Claude Code remote (official) | Happy | Omnara | API-based Telegram bots |
+| | **Kiku Bot** | Claude Code remote (official) | Happy | Omnara | API-based Telegram bots |
 |---|---|---|---|---|---|
 | Client | Telegram — nothing to install | Claude app / web | dedicated mobile app | dedicated app + web | Telegram |
 | Where the agent runs | your machine, in tmux | your machine, via Anthropic's cloud relay (or Anthropic-hosted on the web) | your machine, via relay | via relay / cloud | the bot re-runs an LLM via API |
@@ -196,11 +196,11 @@ First time with Telegram bots? Get a token from
 **[SETUP.md](SETUP.md)** step by step.
 
 ```bash
-git clone https://github.com/MrCryptoHat/ccbot.git
-cd ccbot
+git clone https://github.com/MrCryptoHat/kikubot.git
+cd kikubot
 uv sync
 cp .env.example .env         # set TELEGRAM_BOT_TOKEN + ALLOWED_USERS
-uv run ccbot hook --install  # required — without it replies never reach the chat
+uv run kikubot hook --install  # required — without it replies never reach the chat
 ./scripts/restart.sh         # first start too: creates the tmux session and launches
 ```
 
@@ -213,7 +213,7 @@ Only two variables are required:
 | -------------------- | -------------------------------------------------- |
 | `TELEGRAM_BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) |
 | `ALLOWED_USERS`      | Your numeric Telegram user ID (get it from [@userinfobot](https://t.me/userinfobot)); comma-separated for several |
-| `CCBOT_USER_ALIASES` | Optional `alias:canonical` id pairs — extra ids that act as the *same* user (a second account, or `1087968824` = @GroupAnonymousBot so posting as an anonymous admin still reaches your own topics) |
+| `KIKUBOT_USER_ALIASES` | Optional `alias:canonical` id pairs — extra ids that act as the *same* user (a second account, or `1087968824` = @GroupAnonymousBot so posting as an anonymous admin still reaches your own topics) |
 
 Everything else is optional with a sane default — see
 [`.env.example`](.env.example) for the full annotated list.
@@ -227,35 +227,35 @@ Everything else is optional with a sane default — see
 <details>
 <summary><b>Core vs optional</b> — what runs out of the box vs what you switch on</summary>
 
-ccbot runs as a **minimal tmux↔agent bridge** out of the box and grows extra
+Kiku Bot runs as a **minimal tmux↔agent bridge** out of the box and grows extra
 capabilities as you set env vars. Nothing optional runs unless you turn it on.
 
 | Feature                    | Enabled by                                   |
 | -------------------------- | -------------------------------------------- |
 | Core tmux bridge           | always on (the two required vars)            |
 | Codex runtime (2nd CLI)    | `codex` on PATH (auto-detected; `CODEX_*` vars tune it) |
-| GLM runtime (z.ai)         | a Claude Code settings file with your z.ai key (`CCBOT_GLM_SETTINGS`, see `.env.example`) |
+| GLM runtime (z.ai)         | a Claude Code settings file with your z.ai key (`KIKUBOT_GLM_SETTINGS`, see `.env.example`) |
 | Voice transcription / TTS  | a provider key (`DEEPGRAM_/OPENAI_/GEMINI_/ELEVENLABS_…`) |
 | Docker agents              | `DOCKER_AGENTS_ENABLED=true` + `DOCKER_AGENTS` ([docs](docs/docker-agents.md)) |
 | 👍-to-confirm reactions     | `REACTION_CONFIRM_ENABLED` (on by default)   |
-| 👀 read-ack reactions       | `CCBOT_REACTION_ACK` (on by default)         |
-| Task pinning               | `CCBOT_PIN_DEFAULT` (on by default)          |
+| 👀 read-ack reactions       | `KIKUBOT_REACTION_ACK` (on by default)         |
+| Task pinning               | `KIKUBOT_PIN_DEFAULT` (on by default)          |
 | Edit-diff screenshots      | `/diff` per topic                             |
-| Task-injection socket      | `CCBOT_INJECT_TOKEN`                          |
+| Task-injection socket      | `KIKUBOT_INJECT_TOKEN`                          |
 
 </details>
 
 <details>
 <summary><b>Plugins</b> — deployment-specific extensions without touching core</summary>
 
-Heavier integrations live as separate `ccbot.<name>` packages, loaded only
-when named in `CCBOT_PLUGINS` (comma-separated); the public tree ships none
+Heavier integrations live as separate `kikubot.<name>` packages, loaded only
+when named in `KIKUBOT_PLUGINS` (comma-separated); the public tree ships none
 and always runs standalone. A plugin can contribute i18n strings, bot
 commands, handlers, startup/shutdown hooks, `/status` sections and buttons,
-and its own inline-keyboard callbacks. Drop `src/ccbot/<name>/` into your
-checkout, list `<name>` in `CCBOT_PLUGINS`, done — core never references
+and its own inline-keyboard callbacks. Drop `src/kikubot/<name>/` into your
+checkout, list `<name>` in `KIKUBOT_PLUGINS`, done — core never references
 specific plugins. Full contract with docstrings:
-[`src/ccbot/plugins.py`](src/ccbot/plugins.py).
+[`src/kikubot/plugins.py`](src/kikubot/plugins.py).
 
 </details>
 
@@ -267,15 +267,15 @@ in [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/) —
 `architecture.md` is the orientation map. Every `.py` file carries a module
 docstring describing its responsibilities.
 
-Session tracking is hook-based: `uv run ccbot hook --install` registers a
+Session tracking is hook-based: `uv run kikubot hook --install` registers a
 `SessionStart` hook that maps tmux windows to agent sessions (uninstall with
-`--uninstall` **before** deleting the checkout). Want ccbot to drive another
+`--uninstall` **before** deleting the checkout). Want Kiku Bot to drive another
 agent CLI (Gemini CLI, Aider, …)? That's one runtime subclass —
 see **[docs/adding-a-runtime.md](docs/adding-a-runtime.md)**.
 
 Tech stack: Python, [python-telegram-bot](https://python-telegram-bot.org/),
 tmux, [uv](https://docs.astral.sh/uv/). Dev checks: `uv run ruff check`,
-`uv run pyright src/ccbot/`, `uv run pytest -q`.
+`uv run pyright src/kikubot/`, `uv run pytest -q`.
 
 </details>
 
@@ -298,7 +298,7 @@ Short version: treat the bot like SSH access, because that's what it is.
 - **The automation socket is off by default** and, when enabled, binds a
   local unix socket (not TCP) gated by a token — unreachable from outside
   the host.
-- **Agent CLIs self-update silently**; ccbot pins its terminal-parsing
+- **Agent CLIs self-update silently**; Kiku Bot pins its terminal-parsing
   patterns per version and a built-in canary warns you when a CLI version
   changes, instead of quietly misbehaving.
 
@@ -307,14 +307,14 @@ Vulnerability reports: see [SECURITY.md](SECURITY.md).
 ## FAQ
 
 **How do I control Claude Code from my phone?**
-Run ccbot on the machine where Claude Code runs and add its bot to a Telegram
+Run Kiku Bot on the machine where Claude Code runs and add its bot to a Telegram
 group with Topics enabled. Each topic becomes a remote for one session —
 replies stream in, you press keys, approve prompts, and see the live terminal.
 
-**Does ccbot use the Claude API or my Claude subscription?**
+**Does Kiku Bot use the Claude API or my Claude subscription?**
 Your subscription. It drives the real `claude` CLI in tmux, so your plan,
 config, memory and MCP servers apply unchanged and there is **no extra token
-cost** — ccbot never calls an LLM API for the conversation. (The optional
+cost** — Kiku Bot never calls an LLM API for the conversation. (The optional
 voice features are the one exception: transcription and TTS use their own
 provider keys.)
 
@@ -337,19 +337,20 @@ subclass away ([guide](docs/adding-a-runtime.md)).
 
 **What happens if the bot or the server restarts?**
 The conversation isn't lost. Sessions live in tmux/Claude Code, not in the
-bot: if only ccbot restarts, agents don't even notice; after a full server
+bot: if only Kiku Bot restarts, agents don't even notice; after a full server
 reboot a running turn is interrupted, but each topic remembers its project
 and resumes its session from the picker.
 
 **How is this different from Happy, Omnara, or Claude Code's own remote control?**
-Those run through a hosted app or cloud relay. ccbot is self-hosted, uses a
+Those run through a hosted app or cloud relay. Kiku Bot is self-hosted, uses a
 chat app you already have, gives raw keypress control of the real terminal —
 and you can always `tmux attach` back. See [How it compares](#how-it-compares).
 
-**Why "ccbot" — what does "cc" mean?**
-On the radio, "cc" reads *Charlie-Charlie* — fitting for a bot whose job is
-keeping your agent fleet on the air. Historically it meant *Claude Code*.
-And yes, it can also literally press `Ctrl-C` — from your phone.
+**Why "Kiku"?**
+聞く (*kiku*) is Japanese for "to listen": the bot keeps an ear on every agent
+in your fleet and relays what it says — and you can talk back, by voice too.
+It was called *ccbot* until November 2026; an old install moves over by itself
+on its first start — see [Upgrading from ccbot](docs/upgrading-from-ccbot.md).
 
 **Is my code exposed to a third party?**
 No middleman: traffic flows between your server and Telegram's Bot API under

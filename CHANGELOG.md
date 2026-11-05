@@ -1,8 +1,27 @@
 # Changelog
 
-Notable changes to ccbot. Format loosely follows
+Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [SemVer](https://semver.org/) (0.x: minor = features, patch = fixes).
+
+## [Unreleased]
+
+### Changed
+
+- **Renamed: ccbot is now Kiku Bot** — package and command `kikubot`, data dir
+  `~/.kikubot`, variables `KIKUBOT_*`, tmux session `kikubot`, plugins
+  `kikubot.<name>`, repository `MrCryptoHat/kikubot`. An existing install moves
+  over by itself on its first start, agents keep running; until 2027-01-31 the
+  old command, data path and variable names keep working. See
+  [docs/upgrading-from-ccbot.md](docs/upgrading-from-ccbot.md).
+
+### Fixed
+
+- A failed tmux read no longer reads as "every window is gone": the bot used
+  to unbind a working agent's topic on one such read and kill its window 90 s
+  later. tmux is driven through its CLI with short formats accepted only
+  whole (libtmux dropped), and a live window that lost its topic goes back to
+  it instead of being killed.
 
 ## [0.1.0] — 2026-07-16
 

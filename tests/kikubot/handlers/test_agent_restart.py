@@ -1,0 +1,485 @@
+"""🔄 brings the agent back even after its window is gone.
+
+An agent that crashes (Claude's trust gate, a killed pane) is reaped as a dead
+window 30 s later, taking the topic's binding with it. Restart used to answer
+«window gone», and since auto-bind no longer starts sessions the only way back
+was the picker. revive_topic_agent rebuilds the window from what the topic
+remembers — same folder, same CLI, same session.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from kikubot.handlers import agent_restart as ar
+
+NEWEST = "11111111-2222-3333-4444-555555555555"
+PINNED = "99999999-8888-7777-6666-555555555555"
+
+
+def _mocks(tmp_path, *, sessions=None, window_state=None):
+    sm = MagicMock()
+    sm.get_remembered_directory.return_value = str(tmp_path)
+    sm.get_remembered_runtime.return_value = "claude"
+    sm.get_window_for_thread.return_value = None
+    sm.window_states = {}
+    sm.has_live_agent_on_cwd = AsyncMock(return_value=False)
+    sm.live_window_for_session = AsyncMock(return_value=None)
+    sm.docker_agent_for_dir.return_value = None
+    sm.wait_for_session_map_entry = AsyncMock(return_value=True)
+    sm.get_window_state.return_value = window_state or SimpleNamespace(
+        session_id="", cwd="", window_name=""
+    )
+    tm = MagicMock()
+    tm.create_window = AsyncMock(return_value=(True, "ok", "proj", "@9"))
+    rt = MagicMock()
+    rt.name = "claude"
+    rt.is_available.return_value = True
+    rt.uses_session_map = True
+    rt.list_sessions = AsyncMock(
+        return_value=[SimpleNamespace(session_id=s) for s in (sessions or [])]
+    )
+    return sm, tm, rt
+
+
+@pytest.mark.asyncio
+async def test_resumes_the_newest_session_of_the_folder(tmp_path):
+    sm, tm, rt = _mocks(tmp_path, sessions=[NEWEST])
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        wid, display = await ar.revive_topic_agent(1, 42)
+
+    assert (wid, display) == ("@9", "proj")
+    assert tm.create_window.await_args.kwargs["resume_session_id"] == NEWEST
+    assert tm.create_window.await_args.kwargs["runtime"] == "claude"
+    sm.bind_thread.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_live_window_state_wins_over_the_folder_listing(tmp_path):
+    sm, tm, rt = _mocks(tmp_path, sessions=[NEWEST])
+    sm.get_window_for_thread.return_value = "@7"
+    sm.window_states = {"@7": SimpleNamespace(session_id=PINNED)}
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        await ar.revive_topic_agent(1, 42)
+
+    assert tm.create_window.await_args.kwargs["resume_session_id"] == PINNED
+
+
+@pytest.mark.asyncio
+async def test_fresh_skips_the_resume(tmp_path):
+    sm, tm, rt = _mocks(tmp_path, sessions=[NEWEST])
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        await ar.revive_topic_agent(1, 42, fresh=True)
+
+    assert tm.create_window.await_args.kwargs["resume_session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_nothing_remembered_is_a_typed_error(tmp_path):
+    sm, tm, rt = _mocks(tmp_path)
+    sm.get_remembered_directory.return_value = None
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        with pytest.raises(ar.ReviveError) as e:
+            await ar.revive_topic_agent(1, 42)
+
+    assert e.value.key == "restart.nothing_to_revive"
+    tm.create_window.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hook_timeout_pins_the_resumed_session(tmp_path):
+    # The monitor tracks the ORIGINAL JSONL: --resume makes the hook report a
+    # new id, and a timed-out hook reports nothing at all.
+    ws = SimpleNamespace(session_id="", cwd="", window_name="")
+    sm, tm, rt = _mocks(tmp_path, sessions=[NEWEST], window_state=ws)
+    sm.wait_for_session_map_entry = AsyncMock(return_value=False)
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        await ar.revive_topic_agent(1, 42)
+
+    assert ws.session_id == NEWEST
+    assert ws.cwd == str(tmp_path)
+    assert ws.window_name == "proj"
+
+
+@pytest.mark.asyncio
+async def test_hookless_runtime_refuses_a_second_window_on_the_cwd(tmp_path):
+    sm, tm, rt = _mocks(tmp_path)
+    rt.uses_session_map = False
+    rt.display_name = "Codex"
+    sm.has_live_agent_on_cwd = AsyncMock(return_value=True)
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        with pytest.raises(ar.ReviveError) as e:
+            await ar.revive_topic_agent(1, 42)
+
+    assert e.value.key == "bot.same_dir_conflict"
+    tm.create_window.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refuses_to_resume_a_session_a_live_window_runs(tmp_path):
+    # Two processes on one session = one JSONL written twice, replies twice.
+    sm, tm, rt = _mocks(tmp_path, sessions=[NEWEST])
+    sm.live_window_for_session = AsyncMock(return_value="@4")
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        with pytest.raises(ar.ReviveError) as e:
+            await ar.revive_topic_agent(1, 42)
+
+    assert e.value.key == "bot.session_already_open"
+    tm.create_window.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refuses_a_container_agents_workspace(tmp_path):
+    # A host agent there would edit the container agent's files behind it.
+    sm, tm, rt = _mocks(tmp_path, sessions=[NEWEST])
+    sm.docker_agent_for_dir.return_value = "agent"
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        with pytest.raises(ar.ReviveError) as e:
+            await ar.revive_topic_agent(1, 42)
+
+    assert e.value.key == "bot.docker_agent_dir"
+    tm.create_window.assert_not_awaited()
+
+
+class TestReviveDockerAgent:
+    """A container agent dies with its container's tmux server — the topic,
+    its files and its transcripts all survive, so recovery is just starting
+    that session again (never re-creating the topic)."""
+
+    def _docker_mocks(self, *, alive: bool = True, started: bool = True):
+        sm = MagicMock()
+        sm.resolve_docker_target.return_value = SimpleNamespace(
+            agent=SimpleNamespace(container="ctn", name="assistant"),
+            tmux_session="claude-notes",
+            sub="notes",
+        )
+        sm.get_window_state.return_value = SimpleNamespace(
+            session_id="old", cwd="/workspace"
+        )
+        sm.start_docker_agent = AsyncMock(return_value=started)
+        sm.send_lock = MagicMock(return_value=_NullLock())
+        sm._save_state = MagicMock()
+        drv = MagicMock()
+        drv.is_container_alive = AsyncMock(return_value=alive)
+        drv.kill_session = AsyncMock(return_value=True)
+        return sm, drv
+
+    @pytest.mark.asyncio
+    async def test_resume_pins_the_chosen_transcript(self):
+        sm, drv = self._docker_mocks()
+        state = SimpleNamespace(session_id="whatever-the-hook-said", cwd="/workspace")
+        sm.get_window_state.return_value = state
+        with (
+            patch.object(ar, "session_manager", sm),
+            patch("kikubot.docker_driver.docker_driver", drv),
+            patch("kikubot.handlers.agent_restart.asyncio.sleep", AsyncMock()),
+        ):
+            await ar.revive_docker_agent("docker:assistant/notes", session_id=PINNED)
+
+        kwargs = sm.start_docker_agent.await_args.kwargs
+        assert kwargs["resume_session_id"] == PINNED
+        assert kwargs["new_session_id"] is None
+        assert kwargs["cwd"] == "/workspace"
+        # The monitor must read the conversation the user picked, not whatever
+        # id the container's hook reports for a --resume.
+        assert state.session_id == PINNED
+
+    @pytest.mark.asyncio
+    async def test_fresh_start_pins_a_new_id(self):
+        sm, drv = self._docker_mocks()
+        with (
+            patch.object(ar, "session_manager", sm),
+            patch("kikubot.docker_driver.docker_driver", drv),
+            patch("kikubot.handlers.agent_restart.asyncio.sleep", AsyncMock()),
+        ):
+            await ar.revive_docker_agent("docker:assistant/notes", session_id=None)
+
+        kwargs = sm.start_docker_agent.await_args.kwargs
+        assert kwargs["resume_session_id"] is None
+        assert kwargs["new_session_id"]  # kikubot picks the id up front
+
+    @pytest.mark.asyncio
+    async def test_dead_container_is_refused_not_started(self):
+        sm, drv = self._docker_mocks(alive=False)
+        with (
+            patch.object(ar, "session_manager", sm),
+            patch("kikubot.docker_driver.docker_driver", drv),
+        ):
+            with pytest.raises(ar.ReviveError) as e:
+                await ar.revive_docker_agent("docker:assistant/notes", session_id=None)
+        assert e.value.key == "revive.container_down"
+        sm.start_docker_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_crafted_session_id_never_reaches_the_command_line(self):
+        sm, drv = self._docker_mocks()
+        with (
+            patch.object(ar, "session_manager", sm),
+            patch("kikubot.docker_driver.docker_driver", drv),
+        ):
+            with pytest.raises(ar.ReviveError) as e:
+                await ar.revive_docker_agent(
+                    "docker:assistant/notes", session_id="x; rm -rf /"
+                )
+        assert e.value.key == "revive.bad_session"
+        sm.start_docker_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_start_raises(self):
+        sm, drv = self._docker_mocks(started=False)
+        with (
+            patch.object(ar, "session_manager", sm),
+            patch("kikubot.docker_driver.docker_driver", drv),
+            patch("kikubot.handlers.agent_restart.asyncio.sleep", AsyncMock()),
+        ):
+            with pytest.raises(ar.ReviveError) as e:
+                await ar.revive_docker_agent("docker:assistant/notes", session_id=None)
+        assert e.value.key == "revive.start_failed"
+
+
+class TestReviveOptions:
+    @pytest.mark.asyncio
+    async def test_a_conversation_another_topic_holds_is_not_offered(self):
+        """One container = one claude-home, so the list is every agent's. Two
+        agents resuming one transcript would mirror it into two topics."""
+        sm = MagicMock()
+        sm.window_states = {"docker:a/one": SimpleNamespace(session_id="mine")}
+        sm.list_agent_sessions = AsyncMock(
+            return_value=[
+                SimpleNamespace(session_id="mine", summary="mine", file_path="/m"),
+                SimpleNamespace(session_id="busy", summary="parent", file_path="/b"),
+                SimpleNamespace(session_id="free", summary="older", file_path="/f"),
+            ]
+        )
+        sm.session_ids_of_other_bindings.return_value = {"busy"}
+        with patch.object(ar, "session_manager", sm):
+            last, others = await ar.docker_revive_options("docker:a/one")
+
+        assert last is not None and last.session_id == "mine"
+        assert [s.session_id for s in others] == ["free"]
+
+
+class _NullLock:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class TestReviveOffer:
+    @pytest.mark.asyncio
+    async def test_a_stopped_container_says_so_instead_of_offering_buttons(self):
+        sm = MagicMock()
+        sm.get_display_name.return_value = "assistant-notes"
+        sm.resolve_docker_target.return_value = SimpleNamespace(
+            agent=SimpleNamespace(container="ctn", name="assistant"),
+            tmux_session="claude-notes",
+            sub="notes",
+        )
+        drv = MagicMock()
+        drv.is_container_alive = AsyncMock(return_value=False)
+        send = AsyncMock()
+        with (
+            patch.object(ar, "session_manager", sm),
+            patch("kikubot.docker_driver.docker_driver", drv),
+            patch.object(ar, "safe_send", send),
+        ):
+            sent = await ar.offer_docker_revive(
+                MagicMock(), -100, 7, "docker:assistant/notes"
+            )
+
+        assert sent is True
+        assert send.await_args.kwargs.get("reply_markup") is None
+
+    @pytest.mark.asyncio
+    async def test_offer_carries_continue_fresh_and_earlier(self):
+        last = SimpleNamespace(session_id=PINNED, summary="ui work", file_path="/a")
+        others = [SimpleNamespace(session_id=NEWEST, summary="older", file_path="/b")]
+        kb = ar.build_revive_keyboard(last, others)
+        labels = [b.text for row in kb.inline_keyboard for b in row]
+        assert len(labels) == 3
+        assert any(PINNED in b.callback_data for row in kb.inline_keyboard for b in row)
+
+    def test_earlier_list_is_capped_and_ends_with_back(self):
+        many = [
+            SimpleNamespace(session_id=f"{i}" * 8, summary=f"s{i}", file_path="/x")
+            for i in range(10)
+        ]
+        kb = ar.build_revive_session_list(many)
+        assert len(kb.inline_keyboard) == ar.REVIVE_SESSION_ROWS + 1
+        assert kb.inline_keyboard[-1][0].callback_data.endswith("back")
+
+
+class TestResumeAgentsAfterBoot:
+    """KIKUBOT_AUTO_RESUME_AGENTS: every orphaned topic comes back on its own
+    session, once per session."""
+
+    async def _run(self, orphans, *, owner=None):
+        sm = MagicMock()
+        sm.boot_orphans = list(orphans)
+        sm.get_window_for_thread.return_value = None
+        sm.resolve_chat_id.return_value = -100
+        sm.topic_owner.return_value = owner
+        revive = AsyncMock(return_value=("@9", "proj"))
+        send = AsyncMock()
+        with (
+            patch.object(ar, "session_manager", sm),
+            patch.object(ar, "revive_topic_agent", revive),
+            patch.object(ar, "safe_send", send),
+        ):
+            await ar.resume_agents_after_boot()
+        return sm, revive, send
+
+    async def test_each_topic_resumes_its_own_session(self):
+        sm, revive, send = await self._run([(1, 10, NEWEST), (1, 11, PINNED)])
+        assert [c.kwargs["resume_session_id"] for c in revive.await_args_list] == [
+            NEWEST,
+            PINNED,
+        ]
+        send.assert_not_awaited()  # silent: a restart looks like nothing happened
+        assert sm.boot_orphans == []
+
+    async def test_one_session_two_bindings_launches_once(self):
+        # Two users' bindings on one topic (pre-fix state): one window.
+        _, revive, _ = await self._run([(1, 10, NEWEST), (2, 10, NEWEST)])
+        assert revive.await_count == 1
+
+    async def test_topic_already_served_is_skipped(self):
+        _, revive, send = await self._run([(2, 10, NEWEST)], owner=1)
+        revive.assert_not_awaited()
+        send.assert_not_awaited()
+
+    async def test_failure_of_one_topic_does_not_stop_the_rest(self):
+        sm = MagicMock()
+        sm.boot_orphans = [(1, 10, NEWEST), (1, 11, PINNED)]
+        sm.get_window_for_thread.return_value = None
+        sm.topic_owner.return_value = None
+        revive = AsyncMock(
+            side_effect=[ar.ReviveError("restart.nothing_to_revive"), ("@9", "x")]
+        )
+        with (
+            patch.object(ar, "session_manager", sm),
+            patch.object(ar, "revive_topic_agent", revive),
+            patch.object(ar, "safe_send", AsyncMock()),
+        ):
+            await ar.resume_agents_after_boot()
+        assert revive.await_count == 2
+
+
+class TestWakeDockerAgent:
+    """A message to a stopped / dead container agent wakes it on its own
+    conversation instead of drawing the "bring it back?" keyboard."""
+
+    WID = "docker:agent/side"
+
+    def _sm(self, *, running=False, pane="─" * 30):
+        sm = MagicMock()
+        sm._is_docker_binding.return_value = True
+        sm.docker_agent_running = AsyncMock(return_value=running)
+        sm.capture_pane = AsyncMock(return_value=pane)
+        return sm
+
+    async def _wake(self, sm, *, last=NEWEST, revive=None):
+        options = (SimpleNamespace(session_id=last) if last else None, [])
+        revive = revive or AsyncMock()
+        with (
+            patch.object(ar, "session_manager", sm),
+            patch.object(ar, "docker_revive_options", AsyncMock(return_value=options)),
+            patch.object(ar, "revive_docker_agent", revive),
+            patch.object(ar.asyncio, "sleep", AsyncMock()),
+        ):
+            return await ar.wake_docker_agent(self.WID), revive
+
+    async def test_resumes_last_session_and_waits_for_the_tui(self):
+        ok, revive = await self._wake(self._sm())
+        assert ok is True
+        revive.assert_awaited_once_with(self.WID, session_id=NEWEST)
+
+    async def test_running_agent_is_not_touched(self):
+        ok, revive = await self._wake(self._sm(running=True))
+        assert ok is False
+        revive.assert_not_awaited()
+
+    async def test_no_known_session_leaves_it_to_the_offer(self):
+        ok, revive = await self._wake(self._sm(), last=None)
+        assert ok is False
+        revive.assert_not_awaited()
+
+    async def test_failed_start_reports_false(self):
+        failing = AsyncMock(side_effect=ar.ReviveError("revive.container_down"))
+        ok, _ = await self._wake(self._sm(), revive=failing)
+        assert ok is False
+
+
+class TestOwnSessionOutsideTheShortlist:
+    """The session listing is a recency shortlist over the whole container; an
+    agent stopped long enough drops out of it and must still be recognised by
+    its own record — else nothing wakes it and the offer loses «continue»."""
+
+    WID = "docker:agent/side"
+
+    def _sm(self, *, own_id=NEWEST, busy=()):
+        sm = MagicMock()
+        sm.window_states = {self.WID: SimpleNamespace(session_id=own_id)}
+        sm.session_ids_of_other_bindings.return_value = set(busy)
+        sm.list_agent_sessions = AsyncMock(
+            return_value=[SimpleNamespace(session_id=PINNED)]
+        )
+        sm.resolve_session_for_window = AsyncMock(
+            return_value=SimpleNamespace(session_id=own_id)
+        )
+        return sm
+
+    async def test_own_session_found_by_its_record(self):
+        with patch.object(ar, "session_manager", self._sm()):
+            last, others = await ar.docker_revive_options(self.WID)
+        assert last is not None and last.session_id == NEWEST
+        assert [s.session_id for s in others] == [PINNED]
+
+    async def test_session_held_by_another_binding_is_not_offered(self):
+        with patch.object(ar, "session_manager", self._sm(busy={NEWEST})):
+            last, _ = await ar.docker_revive_options(self.WID)
+        assert last is None
+
+    async def test_missing_transcript_means_unknown(self):
+        sm = self._sm()
+        sm.resolve_session_for_window = AsyncMock(return_value=None)
+        with patch.object(ar, "session_manager", sm):
+            last, _ = await ar.docker_revive_options(self.WID)
+        assert last is None

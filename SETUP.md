@@ -45,8 +45,8 @@ own installer. Then read the macOS notes in step 8 before wiring autostart.
 ## 3. Install
 
 ```bash
-git clone https://github.com/MrCryptoHat/ccbot.git
-cd ccbot
+git clone https://github.com/MrCryptoHat/kikubot.git
+cd kikubot
 uv sync
 ```
 
@@ -71,7 +71,7 @@ key (Deepgram/OpenAI/Gemini/ElevenLabs) if you want speech; leave the whole
 **SERVER-SPECIFIC** section blank — it wires into one particular server's
 extra infra and does nothing unless configured.
 
-Set `CCBOT_DEFAULT_LANG=ru` if you'd rather the bot's own UI be in Russian
+Set `KIKUBOT_DEFAULT_LANG=ru` if you'd rather the bot's own UI be in Russian
 (default is English; a `/lang` switch is available at runtime either way).
 
 On a headless VPS with no terminal to approve tool permissions you may want
@@ -82,7 +82,7 @@ asking — only do this on a host where that's acceptable.
 ## 5. Install the session-tracking hook
 
 ```bash
-uv run ccbot hook --install
+uv run kikubot hook --install
 ```
 
 This adds a `SessionStart` hook to `~/.claude/settings.json` so the bot can map
@@ -90,10 +90,10 @@ each tmux window to its Claude session (survives `/clear` and restarts). Or add
 it manually to `~/.claude/settings.json`:
 
 ```json
-{ "hooks": { "SessionStart": [ { "hooks": [{ "type": "command", "command": "ccbot hook", "timeout": 5 }] } ] } }
+{ "hooks": { "SessionStart": [ { "hooks": [{ "type": "command", "command": "kikubot hook", "timeout": 5 }] } ] } }
 ```
 
-(If you later remove ccbot, run `uv run ccbot hook --uninstall` **before**
+(If you later remove kikubot, run `uv run kikubot hook --uninstall` **before**
 deleting the checkout, otherwise every future Claude Code session will keep
 invoking a hook whose binary no longer exists.)
 
@@ -104,8 +104,8 @@ invoking a hook whose binary no longer exists.)
 ```
 
 `restart.sh` is idempotent: it stops any running instance, (re)creates the
-`ccbot` tmux session/window, and starts the bot. Re-run it after code changes.
-To run in the foreground instead: `uv run ccbot`.
+`kikubot` tmux session/window, and starts the bot. Re-run it after code changes.
+To run in the foreground instead: `uv run kikubot`.
 
 ## 7. First session
 
@@ -128,7 +128,7 @@ To run in the foreground instead: `uv run ccbot`.
 autostart is a `@reboot` cron entry (run `crontab -e`):
 
 ```cron
-@reboot sleep 10 && /home/YOU/ccbot/scripts/restart.sh >> /tmp/ccbot-boot.log 2>&1
+@reboot sleep 10 && /home/YOU/kikubot/scripts/restart.sh >> /tmp/kikubot-boot.log 2>&1
 ```
 
 (The `sleep` gives the network a moment to come up.) Without this, the bot
@@ -136,12 +136,12 @@ stays down after a server reboot until you run `restart.sh` by hand.
 
 On **macOS** use launchd instead — cron there is a compatibility shim that
 additionally needs Full Disk Access to run reliably. A ready plist ships in
-`scripts/com.ccbot.bot.plist`:
+`scripts/com.kikubot.bot.plist`:
 
 ```bash
-sed "s|BOT_DIR_PLACEHOLDER|$PWD|g" scripts/com.ccbot.bot.plist \
-  > ~/Library/LaunchAgents/com.ccbot.bot.plist
-launchctl load ~/Library/LaunchAgents/com.ccbot.bot.plist
+sed "s|BOT_DIR_PLACEHOLDER|$PWD|g" scripts/com.kikubot.bot.plist \
+  > ~/Library/LaunchAgents/com.kikubot.bot.plist
+launchctl load ~/Library/LaunchAgents/com.kikubot.bot.plist
 ```
 
 It is a LaunchAgent, so it starts at **login**, not at boot, and runs as you
@@ -169,14 +169,14 @@ the bot starts but can't find `uv`, `tmux` or `claude`.
 ## Troubleshooting
 
 - **Bot doesn't respond** — confirm it's an admin in the group and your id is
-  in `ALLOWED_USERS`. Check the pane: `tmux attach -t ccbot`.
+  in `ALLOWED_USERS`. Check the pane: `tmux attach -t kikubot`.
 - **Messages go out, but no replies come back** — the `SessionStart` hook is
-  probably missing (step 5): run `uv run ccbot hook --install` and restart the
+  probably missing (step 5): run `uv run kikubot hook --install` and restart the
   agent's session. The bot also warns about this at startup (log) and in the
   topic when it detects the hook is absent.
 - **No directory browser / auto-bind** — the topic must be created while the
   bot is online; a topic renamed after creation falls back to the browser on
   first message.
 - **Voice not transcribed** — set `DEEPGRAM_API_KEY` or `OPENAI_API_KEY`.
-- **Logs** — `tmux capture-pane -t ccbot:__main__ -p | tail -50`, or raise
-  `CCBOT_LOG_LEVEL=DEBUG`.
+- **Logs** — `tmux capture-pane -t kikubot:__main__ -p | tail -50`, or raise
+  `KIKUBOT_LOG_LEVEL=DEBUG`.

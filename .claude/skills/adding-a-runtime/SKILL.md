@@ -1,9 +1,9 @@
 ---
 name: adding-a-runtime
-description: Procedure for adding a new terminal AI agent CLI (a "runtime") to ccbot as an AgentRuntime subclass — viability check, TUI pane capture, parser, detectors, wiring, verification gates. Use when the task is to make ccbot drive a CLI it doesn't support yet (Gemini CLI, Aider, Cursor CLI, Amp, a local agent…), when someone asks to "add support for <agent>", "make ccbot work with <CLI>", "register a new runtime", or when a runtime landed and its busy-detection / transcripts / picker tab need finishing. NOT for changing behaviour of an already-registered runtime (edit its subclass directly) and NOT for adding a transport (tmux vs docker is a different axis).
+description: Procedure for adding a new terminal AI agent CLI (a "runtime") to kikubot as an AgentRuntime subclass — viability check, TUI pane capture, parser, detectors, wiring, verification gates. Use when the task is to make kikubot drive a CLI it doesn't support yet (Gemini CLI, Aider, Cursor CLI, Amp, a local agent…), when someone asks to "add support for <agent>", "make kikubot work with <CLI>", "register a new runtime", or when a runtime landed and its busy-detection / transcripts / picker tab need finishing. NOT for changing behaviour of an already-registered runtime (edit its subclass directly) and NOT for adding a transport (tmux vs docker is a different axis).
 ---
 
-# Adding an agent runtime to ccbot
+# Adding an agent runtime to kikubot
 
 A *runtime* is the CLI a topic's window runs. It is orthogonal to the transport
 (tmux window vs docker container), and every runtime-specific behaviour lives in
@@ -23,7 +23,7 @@ copy of that table.
 
 ## Goal
 
-`$NAME` is selectable in ccbot's session picker, a topic bound to it delivers the
+`$NAME` is selectable in kikubot's session picker, a topic bound to it delivers the
 agent's replies to Telegram, and the panel's restart brings the same session
 back — with `ruff`, `pyright` and `pytest` green, and one live end-to-end pass
 done by hand.
@@ -32,7 +32,7 @@ done by hand.
 
 ### 1. Check viability before writing any code
 
-Two hard requirements: the CLI runs as an **interactive TUI inside tmux** (ccbot
+Two hard requirements: the CLI runs as an **interactive TUI inside tmux** (kikubot
 types into the pane and screenshots it), and it writes **session transcripts to
 files on disk** (the monitor is a file poller — memory-only or API-only history
 can't be tailed).
@@ -88,7 +88,7 @@ Interactive menus usually need no work: the generic `ChoiceMenu` pattern and the
 provider-agnostic login flow already catch most TUIs. Add a named pattern only
 when the generic one demonstrably misses.
 
-**Success criteria:** `uv run ruff check src/ tests/ && uv run pyright src/ccbot/ && uv run pytest` all green, with tests pinning the captured panes.
+**Success criteria:** `uv run ruff check src/ tests/ && uv run pyright src/kikubot/ && uv run pytest` all green, with tests pinning the captured panes.
 
 ### 5. Prove it live
 

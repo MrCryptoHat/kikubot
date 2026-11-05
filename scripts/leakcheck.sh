@@ -8,7 +8,7 @@
 #   2. names of the operator's agents/projects (~/agents/*, ~/projects/*),
 #      EXCEPT names already present in the public tree (an example name like
 #      "assistant" that the docs legitimately use auto-allowlists itself);
-#   2b. agent names ccbot minted itself (sibling slugs, window display
+#   2b. agent names kikubot minted itself (sibling slugs, window display
 #      names) — they live only in state.json, not on disk or in .env;
 #   3. secret/ID VALUES from local .env files (tokens, allowed users, chat
 #      ids) — matched by value, so new kinds of secrets are caught without
@@ -44,13 +44,13 @@ printf '/home/%s\n' "$(id -un)" >>"$patterns"
 
 # 2. Deployment agent/project names (word-ish, >=4 chars to avoid noise),
 #    minus this repo's own name and names the public tree already uses.
-#    Roots follow CCBOT_TOPIC_DIR_ROOTS — a deployment that keeps its clones
+#    Roots follow KIKUBOT_TOPIC_DIR_ROOTS — a deployment that keeps its clones
 #    in ~/dev is exactly as identifying as one using the default ~/projects.
 self="$(basename "$(git rev-parse --show-toplevel)")"
 roots="projects agents"
-for env in ./.env "$HOME/.ccbot/.env"; do
+for env in ./.env "$HOME/.kikubot/.env"; do
     [ -f "$env" ] || continue
-    extra="$(sed -n 's/^CCBOT_TOPIC_DIR_ROOTS[[:space:]]*=[[:space:]]*//p' "$env" |
+    extra="$(sed -n 's/^KIKUBOT_TOPIC_DIR_ROOTS[[:space:]]*=[[:space:]]*//p' "$env" |
         tr ',' ' ' | tr -d '"'\''')"
     [ -n "$extra" ] && roots="$roots $extra"
 done
@@ -70,7 +70,7 @@ done
 #     ~/agents (a mount, a custom DOCKER_AGENT_<N>_WORKSPACE), so the directory
 #     sweep above misses them — and an agent name is exactly as identifying as
 #     a project name. Same >=4 chars + already-public allowlist rules.
-for env in ./.env "$HOME/.ccbot/.env"; do
+for env in ./.env "$HOME/.kikubot/.env"; do
     [ -f "$env" ] || continue
     for n in $(sed -n 's/^DOCKER_AGENTS[[:space:]]*=[[:space:]]*//p' "$env" | tr ',' '\n' |
         sed 's/^["'\'' ]*//;s/["'\'' ]*$//'); do
@@ -80,11 +80,11 @@ for env in ./.env "$HOME/.ccbot/.env"; do
     done
 done
 
-# 2c. Agent names ccbot minted itself, which exist in NO directory and in NO
+# 2c. Agent names kikubot minted itself, which exist in NO directory and in NO
 #     .env: sibling slugs (`docker:<agent>/<slug>`) and window display names
 #     live only in state.json. A real one reached a test fixture (2026-09-13)
 #     with both sweeps above blind to it. Same >=4 chars + public-tree rules.
-state="${CCBOT_DIR:-$HOME/.ccbot}/state.json"
+state="${KIKUBOT_DIR:-$HOME/.kikubot}/state.json"
 if [ -f "$state" ] && command -v python3 >/dev/null 2>&1; then
     for n in $(python3 -c 'import json,sys
 data=json.load(open(sys.argv[1]))
@@ -104,7 +104,7 @@ fi
 #    prefix star to give characters BACK so the alternation can match, which
 #    GNU sed does and BSD sed does not. On macOS it matched nothing, so THE
 #    SECRET LEG OF THIS GATE SILENTLY CHECKED NOTHING while still exiting 0.
-for env in ./.env "$HOME/.ccbot/.env"; do
+for env in ./.env "$HOME/.kikubot/.env"; do
     [ -f "$env" ] || continue
     awk -F= '
         /^[A-Za-z_]+[[:space:]]*=/ {

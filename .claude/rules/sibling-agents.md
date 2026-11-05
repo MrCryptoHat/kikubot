@@ -1,9 +1,9 @@
 ---
 paths:
-  - "src/ccbot/handlers/siblings.py"
-  - "src/ccbot/handlers/agent_delete.py"
-  - "src/ccbot/handlers/agent_restart.py"
-  - "src/ccbot/docker_driver.py"
+  - "src/kikubot/handlers/siblings.py"
+  - "src/kikubot/handlers/agent_delete.py"
+  - "src/kikubot/handlers/agent_restart.py"
+  - "src/kikubot/docker_driver.py"
   - "tests/**siblings**"
 ---
 
@@ -22,7 +22,7 @@ binding `docker:<agent>/<slug>`, tmux session `claude-<slug>`, topic
   already running, so `docker exec -e` never reaches the new process; only
   tmux's per-session env does. A hook keying off `AGENT_NAME` then writes the
   sub's own session_map key.
-- **`claude --session-id <uuid>`** — ccbot picks the id up front and records it
+- **`claude --session-id <uuid>`** — kikubot picks the id up front and records it
   immediately, so a sibling is trackable from its first second. Both live in
   `session_manager.start_docker_agent`, the one launcher shared by provisioning
   and restart — don't re-issue `start_session` from a call site or the two
@@ -32,10 +32,10 @@ binding `docker:<agent>/<slug>`, tmux session `claude-<slug>`, topic
   carrying the sibling's pinned id ⇒ that hook reports every future session of
   the sibling (its first `/clear`!) as the parent's, so provisioning rolls back
   with an explanation. `_session_id_taken_by_other` only catches the *first*
-  such claim — a fresh id ccbot never pinned has nothing to be compared against,
+  such claim — a fresh id kikubot never pinned has nothing to be compared against,
   which is exactly why the refusal exists.
-- **Only keys ccbot already knows are ingested** (`_owns_map_key`): the agent's
-  own binding, plus sub-agents that exist in `window_states`/bindings. ccbot is
+- **Only keys kikubot already knows are ingested** (`_owns_map_key`): the agent's
+  own binding, plus sub-agents that exist in `window_states`/bindings. kikubot is
   the only thing that creates a sibling, so an unknown sub key is a container
   inventing rows — and since docker rows skip the stale sweep, they would
   accumulate, keep dead sessions in the monitor, and resurrect torn-down
@@ -62,7 +62,7 @@ recorded, not guessed: a deliberate stop (⏹, or `POST /stop` on the inject
 socket — both `session_manager.stop_docker_agent`) lands in the persisted
 `stopped_docker_agents` and stays down and silent until something starts it
 (`start_docker_agent` clears the mark). Anything else died with its container:
-with `CCBOT_AUTO_RESUME_AGENTS` it is relaunched silently on its own last
+with `KIKUBOT_AUTO_RESUME_AGENTS` it is relaunched silently on its own last
 session (one try per `AUTO_REVIVE_RETRY`; nothing is said while the container
 itself is still down), and a message to a not-running agent wakes it and is
 delivered (`agent_restart.wake_docker_agent`). **Never mark a stop by editing
@@ -94,10 +94,10 @@ and panes as `=name:` (a pane target rejects a bare `=name`).
 ## Lifecycle asymmetry — the thing to not "unify"
 
 A configured docker agent outlives its topic (its lifecycle is the
-container's); a sibling is ccbot-created and dies with its topic —
+container's); a sibling is kikubot-created and dies with its topic —
 `teardown_sibling` kills `claude-<slug>` on close/delete, since nothing else
 could ever reach that session again. `⏹ End session` still only kills, keeping
-the binding so 🔄 can revive it. Sub display names are ccbot's (the hook
+the binding so 🔄 can revive it. Sub display names are kikubot's (the hook
 reports the raw binding as `window_name`, a routing key, not a label).
 
 **➕ provisions a topic, not an agent** (tmux parent): the topic gets the parent's cwd in `thread_directory_memory` — without a runtime — plus the `sub_agent_topics` flag, and its first message opens the session picker. Inheriting the parent's CLI was the old behaviour and removed the point of a sibling: the same files under a different model (operator request 2026-09-04). A DOCKER parent keeps the immediate provision — the container runs one CLI, so there is nothing to pick.
@@ -111,7 +111,7 @@ offered **only for extras** — `session_manager.can_delete_agent`: a docker
 sub-agent (self-identifying from `docker:<agent>/<slug>`) or a tmux sibling,
 flagged at provision time in `sub_agent_topics` (`mark_sub_agent_topic`; a
 tmux sibling is otherwise an ordinary topic with nothing to tell it apart —
-the topic's ➕ name is not readable by ccbot). A **main topic gets no 🗑 at
+the topic's ➕ name is not readable by kikubot). A **main topic gets no 🗑 at
 all**: it holds the project's whole history, and one stray tap used to destroy
 both it and the session. Both taps in `agent_delete` re-check the predicate,
 because a panel scrolled back to from before the gate still carries the

@@ -14,7 +14,7 @@ The bot operates exclusively in Telegram Forum (topics) mode. There is **no** `a
      (state.json)        + <agent>.session_map_path (per docker agent)
 ```
 
-Two binding shapes share the same string slot; `session_manager._is_docker_binding(value)` distinguishes them, and `resolve_binding(user, thread) → ("tmux"|"docker", target) | None` is the typed API. Tmux window IDs (`@0`, `@12`) are unique within a tmux server session; `window_display_names` holds display names for them. Docker binding values embed the agent name directly — no separate display map needed (the agent's configured name is the display name), except for **sibling agents** (`docker:<agent>/<slug>`, a second Claude in the same container), whose display name ccbot owns.
+Two binding shapes share the same string slot; `session_manager._is_docker_binding(value)` distinguishes them, and `resolve_binding(user, thread) → ("tmux"|"docker", target) | None` is the typed API. Tmux window IDs (`@0`, `@12`) are unique within a tmux server session; `window_display_names` holds display names for them. Docker binding values embed the agent name directly — no separate display map needed (the agent's configured name is the display name), except for **sibling agents** (`docker:<agent>/<slug>`, a second Claude in the same container), whose display name kikubot owns.
 
 ## Mapping 1: Topic → Binding value (thread_bindings)
 
@@ -34,11 +34,11 @@ window_display_names: dict[str, str]        # binding_value → display name
 
 Two sources, merged on read into a single `binding_value → session_id` dict:
 
-**Host side — `~/.ccbot/session_map.json`** (tmux). Prefix stripped on read.
+**Host side — `~/.kikubot/session_map.json`** (tmux). Prefix stripped on read.
 ```json
 {
-  "ccbot:@0": {"session_id": "uuid-xxx", "cwd": "/path/to/project", "window_name": "project"},
-  "ccbot:@5": {"session_id": "uuid-yyy", "cwd": "/path/to/project", "window_name": "project-2"}
+  "kikubot:@0": {"session_id": "uuid-xxx", "cwd": "/path/to/project", "window_name": "project"},
+  "kikubot:@5": {"session_id": "uuid-yyy", "cwd": "/path/to/project", "window_name": "project-2"}
 }
 ```
 
@@ -75,7 +75,7 @@ claude_home/projects) → reads JSONL → finds new session_ids.
 
 **How a topic acquires its binding** — name-based auto-bind on `forum_topic_created`, the fallback first-message flow, and the session picker with its agent switcher: `.claude/rules/binding-flows.md` (loads with `handlers/commands.py`, `directory_browser.py`, `session.py`).
 
-**Topic lifecycle**: *Closing* a topic fires `FORUM_TOPIC_CLOSED` → auto-kills the associated tmux window (if tmux binding) and unbinds the thread. Hard-*deleting* a topic gives no event, so it's caught when a real send to it bounces with `Topic_id_invalid` — the queue worker runs `cleanup.purge_deleted_topic` (kill window + unbind + clear state); a backstop probe (`reopen_forum_topic` — `unpin_all_forum_topic_messages` and `send_chat_action` deceptively return **OK** on a hard-deleted topic, only `reopen` raises `Topic_id_invalid`; on a live *open* topic it's a no-op `Topic_not_modified`, and every bound topic is open since closing unbinds → no visible effect; round-robin one bound topic per `TOPIC_CHECK_INTERVAL`, **plus a faster round-robin over worktree topics, one per `WT_TOPIC_CHECK_INTERVAL`** so a deleted worktree agent reclaims in N×10 s (never all per tick — worktree-agents.md), all in `background_context()`) covers topics deleted while completely idle. Stale tmux bindings (window deleted externally) are cleaned up by the status polling loop. Conversely, **orphan tmux windows** (window alive, no thread binding points to it — e.g. topic deleted while ccbot was offline so neither path fired) are killed by the janitor in `status_polling.py` after a 90s grace. Invariant: every non-`__main__` tmux window must be bound to exactly one topic, otherwise it is reaped. This prevents `ccbot`, `ccbot-2`, `ccbot-3`… from accumulating in the same directory whenever a topic gets re-created. Docker bindings are skipped from both checks — their lifecycle is the container's lifecycle, not a tmux window's.
+**Topic lifecycle**: *Closing* a topic fires `FORUM_TOPIC_CLOSED` → auto-kills the associated tmux window (if tmux binding) and unbinds the thread. Hard-*deleting* a topic gives no event, so it's caught when a real send to it bounces with `Topic_id_invalid` — the queue worker runs `cleanup.purge_deleted_topic` (kill window + unbind + clear state); a backstop probe (`reopen_forum_topic` — `unpin_all_forum_topic_messages` and `send_chat_action` deceptively return **OK** on a hard-deleted topic, only `reopen` raises `Topic_id_invalid`; on a live *open* topic it's a no-op `Topic_not_modified`, and every bound topic is open since closing unbinds → no visible effect; round-robin one bound topic per `TOPIC_CHECK_INTERVAL`, **plus a faster round-robin over worktree topics, one per `WT_TOPIC_CHECK_INTERVAL`** so a deleted worktree agent reclaims in N×10 s (never all per tick — worktree-agents.md), all in `background_context()`) covers topics deleted while completely idle. Stale tmux bindings (window deleted externally) are cleaned up by the status polling loop. Conversely, **orphan tmux windows** (window alive, no thread binding points to it — e.g. topic deleted while kikubot was offline so neither path fired) are killed by the janitor in `status_polling.py` after a 90s grace. Invariant: every non-`__main__` tmux window must be bound to exactly one topic, otherwise it is reaped. This prevents `kikubot`, `kikubot-2`, `kikubot-3`… from accumulating in the same directory whenever a topic gets re-created. Docker bindings are skipped from both checks — their lifecycle is the container's lifecycle, not a tmux window's.
 
 ## Session Lifecycle
 

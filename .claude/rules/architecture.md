@@ -1,12 +1,12 @@
 ---
 paths:
-  - "src/ccbot/**"
+  - "src/kikubot/**"
   - "tests/**"
 ---
 
 # System Architecture
 
-The module inventory is the docstrings: every `src/ccbot/**/*.py` opens with a
+The module inventory is the docstrings: every `src/kikubot/**/*.py` opens with a
 one-line summary, so `ls` + first lines *is* the map. This file carries only what
 reading the code won't tell you — decisions that look arbitrary until you know
 why, and invariants that span two files and break silently.
@@ -52,22 +52,22 @@ Inbound images for a `native_image_input` runtime go through `session_manager.se
 
 ## Status polling — what the 1 s loop owns
 
-Interactive-UI detection, dead-window cleanup (30 s grace; liveness = the pane's shell no longer holds its terminal, `tmux_manager.pane_agent_running` — never a process-name match, which broke on codex, on version-named native installs and on every CLI self-update), the orphan-window janitor (90 s grace — reaps tmux windows no binding points at, which is what stops `ccbot-2`, `ccbot-3`… piling up on one directory), the typing heartbeat, the CLI self-update canary, and the backstop topic-existence probe. Why `reopen_forum_topic` is the only probe that works: topic-architecture.md. It publishes **no** chat status line — see message-handling.md «What reaches the chat».
+Interactive-UI detection, dead-window cleanup (30 s grace; liveness = the pane's shell no longer holds its terminal, `tmux_manager.pane_agent_running` — never a process-name match, which broke on codex, on version-named native installs and on every CLI self-update), the orphan-window janitor (90 s grace — reaps tmux windows no binding points at, which is what stops `kikubot-2`, `kikubot-3`… piling up on one directory), the typing heartbeat, the CLI self-update canary, and the backstop topic-existence probe. Why `reopen_forum_topic` is the only probe that works: topic-architecture.md. It publishes **no** chat status line — see message-handling.md «What reaches the chat».
 
-**An unbind is half a kill** — the janitor reaps the now-unbound window 90 s later. So the stale-binding check unbinds only after `STALE_BINDING_GRACE` of the window missing from every listing, never on `TmuxReadError` (tmux unreadable ≠ no windows), and via `unbind_lost_window`, so a window that turns up alive goes back to its topic instead of dying. Before any orphan kill the janitor also asks `topic_remembering_window` — a binding can vanish without that record (a restart between unbind and kill did it once) — and binds only after its notice reached the topic, so a deleted topic never gets a window. That chain killed 21 working agents (2026-10/11): tmux silently cuts a `-F` row that takes over 100 ms to expand (`FORMAT_TIME_LIMIT`), and libtmux read its cut 136-field rows as "no session". Hence `tmux_manager` runs the tmux CLI itself with short formats accepted only whole, and targets windows by `@id`, the session by `$id`, never by name (`-t ccbot` also matches `ccbot-x`).
+**An unbind is half a kill** — the janitor reaps the now-unbound window 90 s later. So the stale-binding check unbinds only after `STALE_BINDING_GRACE` of the window missing from every listing, never on `TmuxReadError` (tmux unreadable ≠ no windows), and via `unbind_lost_window`, so a window that turns up alive goes back to its topic instead of dying. Before any orphan kill the janitor also asks `topic_remembering_window` — a binding can vanish without that record (a restart between unbind and kill did it once) — and binds only after its notice reached the topic, so a deleted topic never gets a window. That chain killed 21 working agents (2026-10/11): tmux silently cuts a `-F` row that takes over 100 ms to expand (`FORMAT_TIME_LIMIT`), and libtmux read its cut 136-field rows as "no session". Hence `tmux_manager` runs the tmux CLI itself with short formats accepted only whole, and targets windows by `@id`, the session by `$id`, never by name (`-t kikubot` also matches `kikubot-x`).
 
 `task_pin`'s idle check runs on the **pre-send** pane: after the send the agent is busy with this very message. Pinning needs *Pin messages* + *Delete messages* admin rights and fails soft to a WARNING without them.
 
 ## Extension points
 
 - **Post-slash renderers** (`callbacks._POST_SLASH_HANDLERS`) — for TUI-only slash commands that leave no JSONL trace (`/context`, `/status`). The hook captures the pane, parses it, posts a message before the default photo refresh; a parse miss silently falls back to the photo. Another data renderer = one parser module + one dict entry.
-- **Plugins** (`plugins.py`) — the rclone mount stack (`drive`) and preview fleet + live dashboards (`fleet`) live in ccbot-plugins. Core keeps only the seams they consume: `notifications_chat_id`, `preview_bin`/`preview_registry_path`, `session.live_dashboard_message_ids`, per-agent `vnc_url`, and the hooks `status_sections`/`status_buttons`/`callback_dispatch`/`on_agent_retired` (a docker sub-agent torn down with its topic — fired from `teardown_sibling`, never for a stop it can come back from). Contract in the module docstring.
+- **Plugins** (`plugins.py`) — the rclone mount stack (`drive`) and preview fleet + live dashboards (`fleet`) live in kikubot-plugins. Core keeps only the seams they consume: `notifications_chat_id`, `preview_bin`/`preview_registry_path`, `session.live_dashboard_message_ids`, per-agent `vnc_url`, and the hooks `status_sections`/`status_buttons`/`callback_dispatch`/`on_agent_retired` (a docker sub-agent torn down with its topic — fired from `teardown_sibling`, never for a stop it can come back from). Contract in the module docstring.
 
 ## State files
 
-- `~/.ccbot/state.json` — thread bindings, window states, display names, read offsets, `voice_mode_topics`, `diff_mode_topics`, `live_dashboard_message_ids`.
-- `~/.ccbot/session_map.json` — host-side hook output, keyed `<tmux_session>:<window_id>`.
-- `~/.ccbot/monitor_state.json` — poll byte offset per JSONL file.
+- `~/.kikubot/state.json` — thread bindings, window states, display names, read offsets, `voice_mode_topics`, `diff_mode_topics`, `live_dashboard_message_ids`.
+- `~/.kikubot/session_map.json` — host-side hook output, keyed `<tmux_session>:<window_id>`.
+- `~/.kikubot/monitor_state.json` — poll byte offset per JSONL file.
 - Per docker agent (paths from `DOCKER_AGENT_<NAME>_*`): `workspace_host_path` (= `/workspace` in-container), `claude_home/projects` (extra JSONL root the monitor scans), `ipc_dir/{browser-live.json,current.png}` (daemon-owned), `session_map_path` (per-agent hook output keyed `docker:<agent>`, merged with the host map on read).
 
 ## Key Design Decisions

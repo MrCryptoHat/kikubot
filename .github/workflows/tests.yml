@@ -7,7 +7,7 @@ on:
 
 jobs:
   checks:
-    # Both, and not just for completeness: ccbot drives tmux and reads host
+    # Both, and not just for completeness: kikubot drives tmux and reads host
     # state, and every Linux-only assumption in that layer (/proc, systemd,
     # `free`, GNU flag spellings) is invisible until a macOS runner executes
     # it. A Linux-only matrix is what let a version-symlinked claude get its
@@ -35,7 +35,7 @@ jobs:
         run: uv run ruff format --check src/ tests/
 
       - name: Type check
-        run: uv run pyright src/ccbot/
+        run: uv run pyright src/kikubot/
 
       - name: Tests
         run: uv run pytest tests/ -q

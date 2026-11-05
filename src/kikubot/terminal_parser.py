@@ -1,0 +1,1228 @@
+"""Terminal output parser — detects Claude Code UI elements in pane text.
+
+Parses captured tmux pane content to detect:
+  - Interactive UIs (AskUserQuestion, ExitPlanMode, Permission Prompt,
+    RestoreCheckpoint) via regex-based UIPattern matching with top/bottom
+    delimiters.
+  - Whether a turn is actively running (``is_claude_working`` — inspects
+    *only* the status line above the chrome separator and tells the active
+    form, carrying ``esc to interrupt`` / a running ``(Ns · …`` counter,
+    from the lingering completed-turn marker ``✻ Cooked for 12s``; never a
+    blind scan of the whole pane).
+  - Status line (spinner characters + working text) by scanning from bottom up
+    — for display in chat; use ``is_claude_working`` to gate input.
+
+All Claude Code text patterns live here. To support a new UI type or
+a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
+
+Key functions: is_interactive_ui(), extract_interactive_content(),
+is_claude_working(), parse_status_line(), detect_model_switch(),
+strip_pane_chrome(), extract_bash_output().
+"""
+
+import logging
+import re
+import time
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class InteractiveUIContent:
+    """Content extracted from an interactive UI."""
+
+    content: str  # The extracted display content
+    name: str = ""  # Pattern name that matched (e.g. "AskUserQuestion")
+    is_login: bool = False  # matched a sign-in screen carrying an auth URL
+    confirm_keys: tuple[str, ...] = ("Enter",)  # blind-confirm keys (see UIPattern)
+    login_url_template: str | None = None  # URL from the code (see UIPattern)
+
+
+@dataclass(frozen=True)
+class UIPattern:
+    """A text-marker pair that delimits an interactive UI region.
+
+    Extraction scans lines top-down: the first line matching any `top` pattern
+    marks the start, the first subsequent line matching any `bottom` pattern
+    marks the end.  Both boundary lines are included in the extracted content.
+
+    ``top`` and ``bottom`` are tuples of compiled regexes — any single match
+    is sufficient.  This accommodates wording changes across Claude Code
+    versions (e.g. a reworded confirmation prompt).
+
+    ``tail_only`` flips extraction to bottom-up: the region must END on the
+    pane's last non-empty line (see :func:`_try_extract_tail`). Required for any
+    pattern whose markers are short enough to occur in ordinary prose — a live
+    modal owns the bottom of the screen, a quote of it never does.
+    ``tail_window`` caps how far above that line the top marker may sit
+    (default :data:`_TAIL_WINDOW`); a numbered menu needs a taller one than a
+    2-4 row prose widget.
+
+    ``is_login`` marks a sign-in screen that carries an auth URL to surface as
+    a clickable link. It is provider-agnostic: any CLI's login screen (Claude
+    Code's ``/login``, Codex's device/browser flow, …) sets this and reuses the
+    one URL-surfacing path in ``interactive_ui`` — no per-provider branch.
+    """
+
+    name: str  # Descriptive label (not used programmatically)
+    top: tuple[re.Pattern[str], ...]
+    bottom: tuple[re.Pattern[str], ...]
+    min_gap: int = 2  # minimum lines between top and bottom (inclusive)
+    is_login: bool = False  # sign-in screen with an auth URL (see above)
+    tail_only: bool = False  # region must end the pane (see above)
+    tail_window: int | None = None  # tail_only reach; None → _TAIL_WINDOW
+    #: Keys a BLIND confirm (👍-to-confirm) presses on this widget, in order.
+    #: Default = plain Enter (accept the highlighted option). A widget whose
+    #: preselected option is NOT the plain "yes" declares the safe route as
+    #: data — GrokApproval preselects «Yes, and don't ask again» (permanent
+    #: always-approve), so its blind confirm is Down (→ «Yes, proceed») then
+    #: Enter. Modeled here, not in reaction_confirm, so a new hazardous menu
+    #: is one field, not a new call-site branch. Empty = no blind confirm at
+    #: all: a 👍 leaves the widget for the user's explicit tap.
+    confirm_keys: tuple[str, ...] = ("Enter",)
+    #: ``is_login`` screens that print only a one-time CODE, keeping the URL
+    #: behind a mouse-only "click here": the sign-in URL built from that code
+    #: (``{code}`` placeholder), used when the pane yields no URL of its own.
+    login_url_template: str | None = None
+
+
+# How far above the pane's last line a ``tail_only`` widget's top marker may
+# sit. Such widgets are 2-4 rows; a generous-but-bounded window.
+_TAIL_WINDOW = 8
+
+# Same, for a numbered MENU: its top marker is the cursor row, which sits above
+# every remaining option plus the footer. Claude Code 2.1.235's `/model` picker
+# already spans 8 rows below the cursor (5 options + effort row + footer) —
+# i.e. the prose window is exactly at its limit — so menus get their own,
+# deliberately roomy one. The safety property is the bottom anchor, not this.
+_MENU_TAIL_WINDOW = 20
+
+
+# ── UI pattern definitions (order matters — first match wins) ────────────
+
+UI_PATTERNS: list[UIPattern] = [
+    UIPattern(
+        name="ExitPlanMode",
+        top=(
+            re.compile(r"^\s*Would you like to proceed\?"),
+            # v2.1.29+: longer prefix that may wrap across lines
+            re.compile(r"^\s*Claude has written up a plan"),
+        ),
+        bottom=(
+            # v2.1.3x renders "ctrl+g", older builds "ctrl-g" — accept both.
+            # (The drift silently demoted this widget to the generic
+            # PermissionPrompt match; plan-text surfacing keys on the name.)
+            re.compile(r"^\s*ctrl[-+]g to edit in "),
+            re.compile(r"^\s*Esc to (cancel|exit)"),
+        ),
+    ),
+    UIPattern(
+        name="AskUserQuestion",
+        top=(re.compile(r"^\s*←\s+[☐✔☒]"),),  # Multi-tab: no bottom needed
+        bottom=(),
+        min_gap=1,
+    ),
+    UIPattern(
+        name="AskUserQuestion",
+        top=(re.compile(r"^\s*[☐✔☒]"),),  # Single-tab: bottom required
+        bottom=(re.compile(r"^\s*Enter to select"),),
+        min_gap=1,
+    ),
+    UIPattern(
+        # New AskUserQuestion render (Claude Code ≥ early 2026): numbered list
+        # with ASCII `[ ]` / `[x]` instead of unicode `☐ / ✔`. The cursor `❯`
+        # may sit at column 0 on the focused row.
+        name="AskUserQuestion",
+        top=(re.compile(r"^[\s❯]*\d+\.\s+\[[\sxX✓✔]\]"),),
+        bottom=(re.compile(r"^\s*Enter to select"),),
+        min_gap=1,
+    ),
+    UIPattern(
+        name="PermissionPrompt",
+        top=(
+            re.compile(r"^\s*Do you want to proceed\?"),
+            re.compile(r"^\s*Do you want to make this edit"),
+            re.compile(r"^\s*Do you want to create \S"),
+            re.compile(r"^\s*Do you want to delete \S"),
+        ),
+        bottom=(re.compile(r"^\s*Esc to cancel"),),
+    ),
+    UIPattern(
+        # Permission menu with numbered choices, incl. the folder-trust prompt
+        # a fresh window opens on ("❯ 1. Yes, I trust this folder").
+        #
+        # Bounded below by the footer or a sibling option, and tail_only: the
+        # old form (no `bottom` at all → region ran to the pane's end) matched
+        # a mere QUOTE of "❯ 1. Yes …" anywhere in the transcript, and this
+        # repo's own answers quote permission menus constantly. Each such quote
+        # pinned the topic in interactive mode and bounced every message the
+        # user sent until it scrolled off (operator report 2026-08-19).
+        name="PermissionPrompt",
+        top=(re.compile(r"^\s*❯\s*1\.\s*Yes"),),
+        bottom=(
+            re.compile(r"Enter to confirm"),
+            re.compile(r"[Ee]sc to (cancel|exit)"),
+            re.compile(r"^\s*\d+\.\s"),  # a sibling option below the cursor row
+        ),
+        min_gap=1,
+        tail_only=True,
+        tail_window=_MENU_TAIL_WINDOW,
+    ),
+    UIPattern(
+        # The SAME folder-trust gate as the numbered PermissionPrompt above,
+        # but as 2.1.259 draws it: unnumbered rows, «No, exit» PRESELECTED.
+        # Order matters — this must stay BELOW that pattern, or it would also
+        # claim the numbered render, whose preselected row is «Yes» and whose
+        # blind confirm is therefore a plain Enter. Shown whenever
+        # ~/.claude.json has no accepted trust for the cwd, i.e. BEFORE any
+        # session exists — no hook has fired, so the pane is all kikubot sees.
+        # Unmatched, the screen killed the agent on sight: the pending first
+        # message was typed into it and its Enter took «No, exit» (2026-09-04).
+        name="ClaudeTrust",
+        top=(
+            re.compile(r"^\s*Quick safety check"),
+            re.compile(r"^\s*Accessing workspace"),
+        ),
+        bottom=(
+            re.compile(r"^\s*Yes, I trust this folder"),
+            re.compile(r"^\s*Enter to confirm"),
+        ),
+        min_gap=1,
+        # Preselected option is «No, exit» — a blind ⏎ would quit the agent.
+        # 👍 means "yes, I trust it": Down to the trust row, then Enter.
+        confirm_keys=("Down", "Enter"),
+    ),
+    UIPattern(
+        # Bash command approval
+        name="BashApproval",
+        top=(
+            re.compile(r"^\s*Bash command\s*$"),
+            re.compile(r"^\s*This command requires approval"),
+        ),
+        bottom=(re.compile(r"^\s*Esc to cancel"),),
+    ),
+    UIPattern(
+        name="RestoreCheckpoint",
+        top=(re.compile(r"^\s*Restore the code"),),
+        bottom=(re.compile(r"^\s*Enter to continue"),),
+    ),
+    UIPattern(
+        # Resume-cost dialog — `claude --resume <id>` on a session older than
+        # ~70 min AND above ~100k tokens opens on it INSTEAD of the prompt box
+        # (Claude Code 2.1.235, captured live):
+        #     This session is 3h 20m old and 120k tokens.
+        #     Resuming the full session will consume a substantial portion …
+        #     ❯ 1. Resume from summary (recommended)
+        #       2. Resume full session as-is
+        #       3. Don't ask me again
+        #     Enter to confirm · Esc to cancel
+        # The PRESELECTED option compacts the conversation, so any blind Enter
+        # throws away the very context the user asked to resume — which is what
+        # the pending first message's trailing Enter used to do on every resume
+        # (operator report, 2026-08-19). Named rather than left to the generic
+        # ChoiceMenu below so the guard is pinned by a test of the real render.
+        #
+        # Anchored on the option LABEL, not the `❯` cursor: the cursor moves
+        # when the user taps ↓, and a cursor-anchored top would flip the widget
+        # name mid-dialog (every flip repaints the photo). tail_only because
+        # both markers are plain prose — a transcript quoting this dialog (this
+        # repo's own tests do) must never pin a topic in interactive mode.
+        name="ResumePrompt",
+        top=(re.compile(r"^[\s❯›>]*\d+\.\s+Resume from summary"),),
+        bottom=(re.compile(r"Enter to confirm"),),
+        min_gap=1,
+        tail_only=True,
+    ),
+    UIPattern(
+        # Cross-session message gate (Claude Code 2.1.296): a message from
+        # another session whose permission mode differs is HELD until the user
+        # picks «Deny — drop it…» (preselected) or «Deliver this message to
+        # Claude». Unnumbered rows (hideIndexes), so ChoiceMenu can't see it;
+        # unmatched, the topic kept accepting text that piled up behind a
+        # dialog nobody in Telegram knew about. «Deliver» is always the last
+        # option row; the footer alternates cover a future footer line.
+        #
+        # tail_only: the title is plain prose, and an answer about this very
+        # widget quotes it. Roomy window — the message preview sits between
+        # title and options.
+        name="HeldPeerMessage",
+        top=(re.compile(r"^\s*Held message from another session"),),
+        bottom=(
+            re.compile(r"Deliver this message to Claude"),
+            re.compile(r"Enter to confirm"),
+            re.compile(r"[Ee]sc to cancel"),
+        ),
+        tail_only=True,
+        tail_window=30,
+        # Delivering lets an untrusted session's text into this one — the
+        # decision the gate exists for. A 👍 can land on ANY agent message in
+        # the topic, so it must not make it: buttons only.
+        confirm_keys=(),
+    ),
+    UIPattern(
+        name="Settings",
+        top=(
+            re.compile(r"^\s*Settings:.*tab to cycle"),
+            re.compile(r"^\s*Select model"),
+        ),
+        bottom=(
+            re.compile(r"Esc to cancel"),
+            re.compile(r"Esc to exit"),
+            re.compile(r"Enter to confirm"),
+            re.compile(r"^\s*Type to filter"),
+        ),
+    ),
+    UIPattern(
+        name="FeedbackSurvey",
+        top=(re.compile(r"How is Claude doing"),),
+        bottom=(re.compile(r"Dismiss"),),
+    ),
+    UIPattern(
+        # OAuth login screen (`/login`, or a fresh `claude` needing auth). The
+        # long sign-in URL is the payload — surfaced as a clickable link by
+        # interactive_ui via parse_login_url, the photo is just context.
+        # No-bottom mode (extends to last non-empty line): the previous bottom
+        # marker `^\s*Esc to cancel` matched Claude Code up to v2.1.196 but
+        # was removed from the login-URL screen in v2.1.197 — the classifier
+        # then silently returned None and the URL was never surfaced. Relying
+        # on the two top markers (both very specific to this exact screen) is
+        # robust enough on its own.
+        name="LoginPrompt",
+        top=(
+            re.compile(r"Use the url below to sign in"),
+            re.compile(r"Paste code here if prompted"),
+        ),
+        bottom=(),
+        min_gap=1,
+        is_login=True,
+    ),
+    UIPattern(
+        # Post-sign-in confirmation — the LAST keypress of Claude Code's OAuth
+        # flow: "Logged in as <email>" (dim, omitted when the account carries no
+        # e-mail) + "Login successful. Press Enter to continue…", and the same
+        # component's failure twin "OAuth error: …" + "Press Enter to retry.".
+        # No pattern matched it, so the moment the sign-in URL screen was
+        # replaced by this one the photo + ⏎ keyboard were torn down one
+        # keypress short of finishing the login, and the user had to reopen the
+        # agent panel by hand to press Enter.
+        #
+        # tail_only is LOAD-BEARING, not a nicety: these markers are plain
+        # prose, and an agent answer *about* this screen (this repo's own
+        # release note quoted it verbatim) put them straight into the pane —
+        # the topic then pinned itself in interactive mode and refused the
+        # user's messages as "agent waiting in a dialog". A live modal replaces
+        # the input box and so ends the pane; a quote always has the chrome
+        # rows below it. min_gap=0 so the one-line form (an account with no
+        # e-mail row) still matches, its own line closing the region.
+        name="LoginConfirm",
+        top=(
+            re.compile(r"^\s*Logged in as\b"),
+            re.compile(r"^\s*Login successful"),
+            re.compile(r"^\s*OAuth error:"),
+        ),
+        bottom=(re.compile(r"Press Enter to (continue|retry)"),),
+        min_gap=0,
+        tail_only=True,
+    ),
+    UIPattern(
+        # Codex sign-in URL screen (device-code or browser flow). Carries the
+        # auth.openai.com URL + one-time code — surfaced as a clickable link by
+        # the same is_login path Claude's LoginPrompt uses. The photo (with the
+        # code) is sent alongside as context. Distinct from the menu below by
+        # the "Finish signing in" / "Follow these steps" header.
+        name="CodexLogin",
+        top=(
+            re.compile(r"Finish signing in"),
+            re.compile(r"Follow these steps to sign in"),
+        ),
+        bottom=(
+            re.compile(r"Press esc to cancel"),
+            re.compile(r"Continue only if you started"),
+        ),
+        min_gap=1,
+        is_login=True,
+    ),
+    UIPattern(
+        # Codex initial sign-in MENU (ChatGPT / Device Code / API key). No URL
+        # yet — just a menu the user navigates with the standard ↑ ↓ ⏎ nav
+        # keyboard (is_login stays False; nothing to surface until a method is
+        # chosen and the CodexLogin screen above appears).
+        name="CodexSignIn",
+        top=(re.compile(r"Sign in with ChatGPT"),),
+        bottom=(
+            re.compile(r"Provide your own API key"),
+            re.compile(r"Press enter to continue"),
+        ),
+        min_gap=1,
+    ),
+    UIPattern(
+        # Codex first-run onboarding ("Before you start: … Press enter to
+        # continue"). One keypress step after sign-in — kept as an interactive
+        # UI so the photo + nav keyboard stays up through it.
+        name="CodexOnboard",
+        top=(re.compile(r"Before you start"),),
+        bottom=(re.compile(r"Press enter to continue"),),
+        min_gap=1,
+    ),
+    UIPattern(
+        # Codex per-directory trust prompt ("Do you trust the contents of this
+        # directory?" → 1. Yes / 2. No). Shown the first time codex opens a
+        # workspace; navigated with the standard ↑ ↓ ⏎ nav keyboard.
+        name="CodexTrust",
+        top=(re.compile(r"Do you trust the contents of this director"),),
+        bottom=(
+            re.compile(r"Press enter to continue"),
+            re.compile(r"No, quit"),
+        ),
+        min_gap=1,
+    ),
+    UIPattern(
+        # Grok tool-approval prompt — radio-style numbered options ("1 (●) Yes,
+        # and don't ask again…" / "2 (○) Yes, proceed" / "3 (○) No, reject…")
+        # with a "1/3:select" footer, drawn when grok's permission system asks
+        # about a tool call. NOT caught by the generic ChoiceMenu below: grok
+        # draws no cursor glyph (`› 1.` / `❯ 1.`) — the (●) radio marks the
+        # selection instead. ↑/↓ move the radio and Enter confirms (verified
+        # live on 0.2.111), so the standard photo + nav keyboard drives it.
+        name="GrokApproval",
+        top=(re.compile(r"^\s*┃?\s*\d+\s+\([●○]\)\s"),),
+        bottom=(re.compile(r"\d+/\d+:select"),),
+        min_gap=0,
+        # Preselect is «Yes, and don't ask again» = permanent always-approve;
+        # a blind ⏎ would flip YOLO on. 👍 means "yes, once" → Down to «Yes,
+        # proceed», then Enter (radio order pinned on 0.2.111).
+        confirm_keys=("Down", "Enter"),
+    ),
+    UIPattern(
+        # Grok sign-in screen (browser/device flow): "Approve in your browser
+        # to finish signing in." + a one-time code + "Waiting for approval…".
+        # The URL never reaches a tmux capture: it sits behind mouse-only
+        # "click here" links (no OSC 8 in tmux 3.4's capture-pane -e), and
+        # revealing it swaps this screen for a URL view this pattern no longer
+        # matches. So the link is rebuilt from the code (the device page
+        # takes it as user_code — observed on grok 1.0.41).
+        name="GrokLogin",
+        top=(re.compile(r"Approve in your browser to finish signing in"),),
+        bottom=(re.compile(r"Waiting for approval"),),
+        min_gap=1,
+        is_login=True,
+        login_url_template="https://accounts.x.ai/oauth2/device?user_code={code}",
+    ),
+    UIPattern(
+        # GENERIC numbered-choice menu — last resort so ANY agent CLI's
+        # "pick an option" prompt surfaces via the same photo + ↑↓⏎ keyboard
+        # as login / AskUserQuestion, with no per-menu pattern. Catches codex's
+        # command/patch APPROVAL prompt ("Would you like to run…?" → `› 1. Yes,
+        # proceed`), model pickers, and future agents' menus alike.
+        #
+        # The discriminating signal is a CURSOR sitting on a NUMBERED option:
+        # `› 1.` (codex, `›` = U+203A) or `❯ 1.` (Claude, U+276F). Codex also
+        # prefixes echoed user messages with `› `, so the match requires a digit
+        # after the cursor (`› \d+\.`) — never a bare `›` — which a user message
+        # (`› Как ты`) can't satisfy. Normal output bullets are `•` (U+2022),
+        # not a cursor, so plain numbered prose the agent writes ("1. foo") never
+        # fires (no cursor on the line). Bounded below by a confirm/cancel footer
+        # OR the next numbered option, so it only matches a LIVE menu (the footer
+        # / sibling option is redrawn away once answered), not lingering history.
+        #
+        # Placed LAST: specific named patterns (AskUserQuestion's text-surfacing
+        # path keys on its name) win first; this only fires when nothing else did.
+        name="ChoiceMenu",
+        top=(re.compile(r"^\s*[›❯▸▶]\s*\d+\.\s"),),
+        bottom=(
+            re.compile(r"Press enter to (confirm|continue|select)"),
+            re.compile(r"Enter to confirm"),
+            re.compile(r"[Ee]sc to (cancel|exit)"),
+            re.compile(r"^\s*\d+\.\s"),  # a sibling option below the cursor row
+        ),
+        min_gap=1,
+        # tail_only for the same reason as PermissionPrompt above: a cursor
+        # glyph on a numbered option is exactly what an answer QUOTING a menu
+        # contains, and without the bottom anchor every such quote pinned the
+        # topic in interactive mode. A live menu always ends the pane.
+        tail_only=True,
+        tail_window=_MENU_TAIL_WINDOW,
+    ),
+]
+
+
+# ── ANSI helpers ──────────────────────────────────────────────────────────
+
+# OSC (Operating System Command) sequences: `ESC ] ... ST` where ST is
+# either BEL (`\x07`) or ESC+`\\`. The most common case in a tmux
+# capture-pane -e dump is OSC 8 hyperlinks (`\x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\`)
+# emitted by Claude Code / shell programs that mark URLs as clickable.
+# Our SGR-only ANSI parser leaves these untouched, so the URL bytes leak
+# into rendered output and bloat visible line widths into ribbon-shaped
+# screenshots. Strip every OSC, keep the visible text outside the wrappers.
+_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def strip_osc(text: str) -> str:
+    """Remove OSC escape sequences (hyperlinks, titles, color queries).
+
+    Visible text between paired OSC 8 hyperlink wrappers survives; only
+    the wrapper bytes (including the URL) go away.
+    """
+    return _OSC_RE.sub("", text)
+
+
+# OSC 8 hyperlink with the URL captured: `ESC ] 8 ; <params> ; <URI> ST`.
+# The URI in the escape is the FULL target even when tmux wraps the visible
+# label across rows — so when Claude Code marks the login URL as a hyperlink
+# this recovers it whole, no reconstruction needed.
+_OSC8_URL_RE = re.compile(r"\x1b\]8;[^;]*;([^\x07\x1b]+)(?:\x07|\x1b\\)")
+
+# SGR (color) escapes — stripped before line-by-line text analysis.
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# A login screen carries one of these markers (used by the wrapped-plain-text
+# URL path when there's no OSC 8 hyperlink). Provider-agnostic: Claude Code's
+# `/login` wording plus Codex's device/browser flow (auth.openai.com + "one-time
+# code"). A wrap could push the URL row off-window, so header prose counts too.
+_LOGIN_SCREEN_RE = re.compile(
+    r"Use the url below to sign in|Paste code here if prompted|oauth/authorize"
+    r"|auth\.openai\.com|Finish signing in|one-time code",
+    re.IGNORECASE,
+)
+_URL_IN_LINE_RE = re.compile(r"https?://\S+")
+
+# One-time device-login code shown on a sign-in screen (e.g. Codex device flow:
+# "7FKY-MRFOQ"). Upper-alnum, 4-char group + dash + 4-6 group — distinctive
+# enough on a login pane not to collide with URL fragments (which carry
+# lowercase / no such grouping). Provider-agnostic: returns None when the
+# screen has no such code (Claude's paste-code-back flow has none in the pane).
+_LOGIN_CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b")
+
+
+# ── Post-processing ──────────────────────────────────────────────────────
+
+_RE_LONG_DASH = re.compile(r"^─{5,}$")
+
+
+def _shorten_separators(text: str) -> str:
+    """Replace lines of 5+ ─ characters with exactly ─────."""
+    return "\n".join(
+        "─────" if _RE_LONG_DASH.match(line) else line for line in text.split("\n")
+    )
+
+
+# ── Core extraction ──────────────────────────────────────────────────────
+
+
+# The agent CLI's empty input box — a lone cursor glyph on its own row
+# (Claude Code draws `❯\xa0` between two rules, codex `›`). NBSP counts as
+# whitespace for `\s`, so the row reads as "cursor, nothing typed".
+_COMPOSER_ROW_RE = re.compile(r"^\s*[>❯›]\s*$")
+
+
+def _live_region_start(lines: list[str]) -> int:
+    """Index of the first line that can belong to a LIVE widget.
+
+    A drawn input box means everything above it is transcript, not a live
+    modal: Claude Code REPLACES the composer with the modal (verified live on
+    2.1.235 — the folder-trust prompt and the `/model` picker each end the
+    pane, no prompt row and no status bar below them), and codex/grok do the
+    same. So a widget's markers found above the last composer row are a
+    transcript *quoting* a widget.
+
+    That quote is not hypothetical: an answer of ours quoting the resume
+    dialog (cursor glyph included) pinned the topic in interactive mode and
+    bounced every message the user sent afterwards (operator report
+    2026-08-19). Returns 0 when no composer is drawn — i.e. a live modal owns
+    the screen and every line is fair game.
+    """
+    for i in range(len(lines) - 1, -1, -1):
+        if _COMPOSER_ROW_RE.match(lines[i]):
+            return i + 1
+    return 0
+
+
+def _try_extract_tail(
+    lines: list[str], pattern: UIPattern, live_from: int = 0
+) -> InteractiveUIContent | None:
+    """Match a widget that OWNS the bottom of the screen.
+
+    Anchored on the pane's LAST non-empty line: the bottom marker must be it,
+    with a top marker within ``pattern.tail_window`` rows above (``min_gap=0``
+    lets one line be both, i.e. a single-row widget).
+
+    This is what makes short, prose-like wording usable as a marker. A live
+    modal replaces the input box, so it really is the pane's tail; transcript
+    text that merely *quotes* the wording always has the chrome / status rows
+    drawn below it and can never match. (Not hypothetical: an answer in this
+    very repo quoting "Login successful. Press Enter to continue…" pinned the
+    topic in interactive mode and started refusing the user's messages —
+    exactly the ``esc to interrupt`` trap CLAUDE.md warns about.)
+    """
+    end = next((i for i in reversed(range(len(lines))) if lines[i].strip()), None)
+    if end is None or not any(p.search(lines[end]) for p in pattern.bottom):
+        return None
+
+    window = _TAIL_WINDOW if pattern.tail_window is None else pattern.tail_window
+    for i in range(end - pattern.min_gap, max(live_from, end - window) - 1, -1):
+        if any(p.search(lines[i]) for p in pattern.top):
+            content = "\n".join(lines[i : end + 1]).rstrip()
+            return InteractiveUIContent(
+                content=_shorten_separators(content),
+                name=pattern.name,
+                is_login=pattern.is_login,
+                confirm_keys=pattern.confirm_keys,
+                login_url_template=pattern.login_url_template,
+            )
+    return None
+
+
+def _try_extract(
+    lines: list[str], pattern: UIPattern, live_from: int = 0
+) -> InteractiveUIContent | None:
+    """Try to extract content matching a single UI pattern.
+
+    When ``pattern.bottom`` is empty, the region extends from the top marker
+    to the last non-empty line (used for multi-tab AskUserQuestion where the
+    bottom delimiter varies by tab).
+
+    ``live_from`` (see :func:`_live_region_start`) excludes the transcript
+    above a drawn input box, so a quoted widget can't be mistaken for one.
+    """
+    if pattern.tail_only:
+        return _try_extract_tail(lines, pattern, live_from)
+
+    top_idx: int | None = None
+    bottom_idx: int | None = None
+
+    for i in range(live_from, len(lines)):
+        line = lines[i]
+        if top_idx is None:
+            if any(p.search(line) for p in pattern.top):
+                top_idx = i
+        elif pattern.bottom and any(p.search(line) for p in pattern.bottom):
+            bottom_idx = i
+            break
+
+    if top_idx is None:
+        return None
+
+    # No bottom patterns → use last non-empty line as boundary
+    if not pattern.bottom:
+        for i in range(len(lines) - 1, top_idx, -1):
+            if lines[i].strip():
+                bottom_idx = i
+                break
+
+    if bottom_idx is None or bottom_idx - top_idx < pattern.min_gap:
+        return None
+
+    content = "\n".join(lines[top_idx : bottom_idx + 1]).rstrip()
+    return InteractiveUIContent(
+        content=_shorten_separators(content),
+        name=pattern.name,
+        is_login=pattern.is_login,
+        confirm_keys=pattern.confirm_keys,
+        login_url_template=pattern.login_url_template,
+    )
+
+
+# ── Public API ───────────────────────────────────────────────────────────
+
+
+def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
+    """Extract content from an interactive UI in terminal output.
+
+    Tries each UI pattern in declaration order; first match wins.
+    Returns None if no recognizable interactive UI is found.
+    """
+    if not pane_text:
+        return None
+
+    lines = pane_text.strip().split("\n")
+    live_from = _live_region_start(lines)
+    for pattern in UI_PATTERNS:
+        result = _try_extract(lines, pattern, live_from)
+        if result:
+            return result
+    return None
+
+
+def is_login_widget(name: str | None) -> bool:
+    """True if ``name`` is a UI pattern marked ``is_login`` (a sign-in screen)."""
+    return any(p.is_login and p.name == name for p in UI_PATTERNS)
+
+
+def is_interactive_ui(pane_text: str) -> bool:
+    """Check if terminal currently shows an interactive UI."""
+    return extract_interactive_content(pane_text) is not None
+
+
+def _looks_like_login_url(url: str) -> bool:
+    """Guard against grabbing some unrelated OSC 8 link on the login screen.
+
+    Provider-agnostic allowlist: Claude Code's OAuth / claude.com host, and
+    Codex's OpenAI auth host (device-code + browser flows).
+    """
+    low = url.lower()
+    return (
+        "oauth" in low
+        or "claude.com/cai" in low
+        or "/login" in low
+        or "auth.openai.com" in low
+        or "accounts.x.ai" in low
+    )
+
+
+def parse_login_url(pane_ansi: str) -> str | None:
+    """Reconstruct the full Claude Code sign-in URL from a captured pane.
+
+    Two sources, tried in order:
+      1. **OSC 8 hyperlink** — if Claude Code marked the URL clickable, the
+         full target sits in the escape sequence regardless of how the visible
+         label wrapped. Most robust; used when present.
+      2. **Wrapped plain text** — the pane wraps a long URL across rows at the
+         column boundary with no spaces (capture-pane runs without ``-J``), so
+         we find the ``https://`` row and glue on the following no-space
+         fragments until a blank or a prose line ends it.
+
+    Returns the URL, or None when the pane isn't a login screen / no URL is
+    recoverable (caller falls back to the screenshot).
+    """
+    if not pane_ansi:
+        return None
+
+    # 1. OSC 8 hyperlink (full URL in the escape, immune to wrapping).
+    for m in _OSC8_URL_RE.finditer(pane_ansi):
+        url = m.group(1).strip()
+        if _looks_like_login_url(url):
+            return url
+
+    # 2. Wrapped plain text. Strip OSC wrappers then SGR colour so the URL
+    #    bytes (which strip_osc would otherwise delete along with the wrapper)
+    #    survive for the line scan — strip_osc removes the OSC *sequence*; the
+    #    visible plain URL on the login screen is real text, not an OSC label.
+    text = _SGR_RE.sub("", strip_osc(pane_ansi))
+    if not _LOGIN_SCREEN_RE.search(text):
+        return None
+
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        m = _URL_IN_LINE_RE.search(line)
+        if not m:
+            continue
+        url = m.group(0)
+        # Glue wrapped continuation rows: a wrapped URL row is full-width with
+        # no internal spaces; the first blank or space-bearing line ends it.
+        for cont in lines[i + 1 :]:
+            frag = cont.strip()
+            if not frag or " " in frag:
+                break
+            url += frag
+        return url.rstrip(").,;:!?'\"")
+    return None
+
+
+def parse_login_code(pane_text: str) -> str | None:
+    """Extract a one-time device-login code from a sign-in pane, if present.
+
+    Reusable across CLIs: Codex's device flow prints a code in the pane (which
+    the user enters on the sign-in page), so it's surfaced as copyable text;
+    Claude's flow has no pane code (the code comes from the browser) → None.
+    """
+    if not pane_text:
+        return None
+    text = _SGR_RE.sub("", strip_osc(pane_text))
+    m = _LOGIN_CODE_RE.search(text)
+    return m.group(1) if m else None
+
+
+# Option parsing and permission-context extraction used to live here but
+# were removed when the bot switched to a uniform photo+nav UI for every
+# interactive prompt. See git history if the old logic is needed.
+
+
+# ── Status line parsing ─────────────────────────────────────────────────
+
+# Spinner characters Claude Code uses in its status line
+STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
+
+# Tells the *active-turn* status line from the *completed-turn* marker.
+# Both sit on the line directly above the chrome separator and both start
+# with a spinner glyph, so the glyph alone is useless:
+#   active : "✶ Orbiting… (3m 13s · ↓ 13.9k tokens · esc to interrupt)"
+#            "✶ Orbiting… (3m 13s · ↓ tokens · thought for 34s)"   (ext. thinking)
+#   done   : "✻ Cooked for 12s" / "✻ Brewed for 2m 33s" / "✻ Sautéed for 53s"
+# After parse_status_line() strips the glyph we match the remaining text:
+#   • done form  — "<Verb>ed for <duration>" anchored at the start.
+#   • live form  — the running counter "(3m 13s · …" (paren, digits, optional
+#                  unit letters, "·") or the literal "esc to interrupt" hint.
+# A blind substring scan over the *whole* pane is wrong: "esc to interrupt"
+# legitimately appears in transcripts, tool output, mail bodies, and source
+# files (this very feature's discussion included).
+_DONE_FORM_RE = re.compile(r"^\s*\w+ for \d", re.UNICODE)
+# Running counter inside the active status line: "(3m 13s · …" / "(12s · …" —
+# a "(" followed by a digit, then any run of word/space chars, then the "·"
+# that separates the first counter segment from the rest. The leading digit
+# rules out plain parenthetical text; only the status line ever sits where
+# we look (directly above the chrome separator), so a false positive there
+# would be an unusual transient and skipping its wake is the safe direction.
+_LIVE_COUNTER_RE = re.compile(r"\(\d[\w\s]*·")
+_INTERRUPT_HINT_RE = re.compile(r"esc to interrupt", re.IGNORECASE)
+
+
+def _is_chrome_separator(stripped: str) -> bool:
+    """A Claude Code chrome separator: a run of box-drawing dashes, optionally
+    carrying a short label the TUI appends to the input-box top border
+    (``──── ultracode ─`` in fast/ultracode mode, ``──── /rc active ─``, …).
+
+    The old ``all(c == "─")`` test missed the labeled form, so for a busy
+    ultracode agent parse_status_line fell through to the *bottom* border, read
+    the ``❯`` prompt above it, and reported idle — silently breaking every
+    is_claude_working consumer (reaction_confirm, /inject). The label
+    is bounded (≤30 non-dash chars) so prose lines that merely contain dashes
+    aren't mistaken for chrome.
+    """
+    if stripped.count("─") < 20:
+        return False
+    return len(stripped.replace("─", "").strip()) <= 30
+
+
+# Claude Code collapses a long paste into this placeholder in its input box.
+_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+")
+# Characters of the sent text (whitespace removed) probed for in the box.
+_COMPOSER_PROBE_LEN = 24
+
+
+def claude_composer_text(pane_text: str) -> str | None:
+    """What Claude Code's input box currently shows (None = no box drawn).
+
+    The box is the region between the LAST two chrome separators at the bottom
+    of the pane: typed text sits there until Enter submits it, after which the
+    transcript echoes it ABOVE the top border and the box is empty again.
+    """
+    if not pane_text:
+        return None
+    lines = pane_text.split("\n")
+    seps = [
+        i
+        for i in range(max(0, len(lines) - 40), len(lines))
+        if _is_chrome_separator(lines[i].strip())
+    ]
+    if len(seps) < 2:
+        return None
+    return "\n".join(lines[seps[-2] + 1 : seps[-1]])
+
+
+def composer_holds_text(pane_text: str, sent: str) -> bool:
+    """True iff Claude Code's input box still holds ``sent`` (not submitted).
+
+    Matches OUR text, not "box non-empty": with prompt suggestions on, Claude
+    Code draws a dimmed suggested prompt into an empty box, which a plain
+    capture can't tell from typed text. Whitespace is dropped on both sides so
+    the box's soft wrapping doesn't matter; the head and the tail of the text
+    are probed (a tall message scrolls inside the box), and a long paste that
+    Claude collapsed to ``[Pasted text #N …]`` counts as held.
+    """
+    box = claude_composer_text(pane_text)
+    if box is None:
+        return False
+    if _PASTE_PLACEHOLDER_RE.search(box):
+        return True
+    want = re.sub(r"\s+", "", sent)
+    if not want:
+        return False
+    flat = re.sub(r"\s+", "", box)
+    return want[:_COMPOSER_PROBE_LEN] in flat or want[-_COMPOSER_PROBE_LEN:] in flat
+
+
+def parse_status_line(pane_text: str) -> str | None:
+    """Extract the Claude Code status line from terminal output.
+
+    The status line (spinner + working text) sits a few lines above the
+    input-box top border (a chrome separator). We locate the separator first,
+    then scan upward for the spinner — skipping blanks and ``⎿`` continuation
+    lines (a rotating Tip / tool-result child line can sit between the spinner
+    and the border). Anchoring on the separator avoids false positives from
+    ``·`` bullets in Claude's regular output.
+
+    Returns the text after the spinner, or None if no status line found.
+    """
+    if not pane_text:
+        return None
+
+    lines = pane_text.split("\n")
+
+    # Find the chrome separator: topmost one in the bottom of the pane (12 lines
+    # of headroom covers the input box plus a workflow/agent footer below it).
+    chrome_idx: int | None = None
+    search_start = max(0, len(lines) - 12)
+    for i in range(search_start, len(lines)):
+        if _is_chrome_separator(lines[i].strip()):
+            chrome_idx = i
+            break
+
+    if chrome_idx is None:
+        return None  # No chrome visible — can't determine status
+
+    # Scan up for the spinner, skipping blanks and ``⎿`` continuation lines
+    # (Tip / tool-result child lines) that sit between it and the border.
+    for i in range(chrome_idx - 1, max(chrome_idx - 7, -1), -1):
+        line = lines[i].strip()
+        if not line or line.startswith("⎿"):
+            continue
+        if line[0] in STATUS_SPINNERS:
+            return line[1:].strip()
+        # First real line above the separator isn't a spinner → no status
+        return None
+    return None
+
+
+def is_claude_working(pane_text: str) -> bool:
+    """True iff the pane shows Claude Code *mid-turn* (interruptible).
+
+    Looks **only** at the spinner/status line directly above the chrome
+    separator (via :func:`parse_status_line`) — never the whole pane —
+    and then distinguishes the active-turn form from the lingering
+    completed-turn marker:
+
+      - no status line above the separator (idle prompt, or no chrome) → False
+      - "<Verb>ed for <duration>" (done marker, "Cooked for 12s")       → False
+      - contains "esc to interrupt", or a running "(Ns · …" counter
+        (also covers extended-thinking turns that show the counter but
+        not the interrupt hint)                                          → True
+      - any other status-line text we don't recognise                    → False
+
+    Use this — not ``parse_status_line() is not None`` — to decide "is
+    the agent free to receive input"; ``parse_status_line`` also matches
+    the done marker, which is the bug this function exists to avoid.
+    """
+    status = parse_status_line(pane_text)
+    if status is None:
+        return False
+    if _DONE_FORM_RE.match(status):
+        return False
+    if _INTERRUPT_HINT_RE.search(status) or _LIVE_COUNTER_RE.search(status):
+        return True
+    _warn_unrecognized_status(status)
+    return False
+
+
+# Codex status line: "• Working (4s • esc to interrupt)" / "◦ Thinking (12s • esc
+# to interrupt)". Codex's TUI has NO ─ chrome separator (verified live), so
+# parse_status_line finds no anchor and is_claude_working returns False for a
+# busy codex pane — hence a runtime-specific detector. The stable, distinctive
+# signal is the running counter with the interrupt hint: "(Ns • esc to
+# interrupt)". Matching the whole "(\d+s … esc to interrupt)" group (not a bare
+# "esc to interrupt", which appears in prose / tool output — see is_claude_working)
+# keeps it from false-firing; the spinner glyph (• U+2022 / ◦ U+25E6, alternating
+# animation frames) and the verb vary, so neither is required. The counter
+# separator is a bullet "•" here, but "·"/"∙" are allowed for resilience.
+_CODEX_WORKING_RE = re.compile(r"\(\d+\s*s\s*[•·∙]\s*esc to interrupt\)", re.IGNORECASE)
+
+
+def is_codex_working(pane_text: str) -> bool:
+    """True iff a Codex pane shows a turn actively running (interruptible).
+
+    Codex has no ─ chrome separator to anchor on the way is_claude_working
+    does, so this matches the codex status line's distinctive running counter
+    ("(Ns • esc to interrupt)") — scanned only in the bottom rows, where the
+    status line is pinned just above the input box, so scrollback prose that
+    happens to contain the phrase can't false-fire.
+    """
+    if not pane_text:
+        return False
+    tail = "\n".join(pane_text.split("\n")[-15:])
+    return bool(_CODEX_WORKING_RE.search(tail))
+
+
+def is_tui_ready(pane_text: str) -> bool:
+    """True iff Claude Code's input box has rendered anywhere in the pane.
+
+    The input box is bounded by chrome separators (the same border
+    :func:`parse_status_line` anchors on). While Claude boots after a
+    kill+relaunch the pane is empty/black — no separator yet — so this
+    distinguishes "TUI is up and waiting for input" from "still loading".
+
+    Unlike :func:`parse_status_line`, the search spans the WHOLE visible
+    pane, not just the bottom rows: a fresh session (no transcript) draws
+    the input box near the *top* of a tall pane with blank padding below,
+    so a bottom-only scan would miss it. Used to gate the post-restart
+    screenshot so the panel photo shows the live prompt, not a boot frame.
+    """
+    if not pane_text:
+        return False
+    return any(_is_chrome_separator(line.strip()) for line in pane_text.split("\n"))
+
+
+# Claude Code buffers typed input while a turn is mid-flight and shows a hint in
+# the input chrome — "Press up to edit queued messages" / "esc to edit queued
+# messages". Its presence means the latest message has NOT yet entered the
+# agent's context (it's queued behind the running turn); its absence means the
+# queue drained — everything typed was taken up. Used to ack a user message
+# exactly when it lands in context, not merely when it was delivered to the pane.
+_QUEUED_MSG_RE = re.compile(r"queued messages?", re.IGNORECASE)
+
+
+def has_queued_messages(pane_text: str) -> bool:
+    """True if Claude Code is showing buffered (not-yet-ingested) input.
+
+    Scanned only in the bottom chrome (the input area, pinned to the pane
+    bottom) so the phrase appearing in transcript/tool output can't false-fire.
+    """
+    if not pane_text:
+        return False
+    tail = "\n".join(pane_text.split("\n")[-15:])
+    return bool(_QUEUED_MSG_RE.search(tail))
+
+
+# Codex's analog of Claude Code's queued-messages hint: a message typed mid-turn
+# is buffered and codex shows "• Messages to be submitted after next tool call
+# (press esc to interrupt and send immediately)". Presence means the latest input
+# is queued, NOT yet in the agent's context — same reaction-ack semantics as
+# has_queued_messages. (The transient "tab to queue message" shown while still
+# typing is deliberately NOT matched — the bot presses Enter on delivery, so the
+# poll only ever sees the settled queued state.)
+_CODEX_QUEUED_RE = re.compile(r"to be submitted after", re.IGNORECASE)
+
+
+def has_codex_queued_messages(pane_text: str) -> bool:
+    """True if Codex is showing buffered (not-yet-ingested) input.
+
+    Bottom-rows only, like has_queued_messages, so a scrollback occurrence of
+    the phrase can't false-fire.
+    """
+    if not pane_text:
+        return False
+    tail = "\n".join(pane_text.split("\n")[-15:])
+    return bool(_CODEX_QUEUED_RE.search(tail))
+
+
+# Grok status row (pinned above the input box while a turn runs):
+# "⠙ <verb/tool description>… 3.0s      5.0s ⇣14.0k [↓][stop]". The left text
+# varies per phase (tool description, "Waiting for response…"), so the anchor
+# is the constant RIGHT side: the session token counter (⇣<n>k) followed by
+# bracket badges ending in [stop] at end of line. Neither half alone is safe in
+# prose; the combination on one line is. Captured live on grok 0.2.111.
+# Trailing `█?`: on narrow panes the TUI's right-edge scrollbar block can land
+# after the badge — a hard $ right at [stop] would then read a busy pane as
+# idle (restart-guard barging a live turn is the failure that buys).
+_GROK_WORKING_RE = re.compile(
+    r"⇣[\d.,]+[kKmM]?\s*(?:\[[^\]\n]*\]\s*)*\[stop\]\s*█?\s*$", re.MULTILINE
+)
+
+
+def is_grok_working(pane_text: str) -> bool:
+    """True iff a Grok pane shows a turn actively running (interruptible).
+
+    Grok (like codex) has no ─ chrome separator for is_claude_working to
+    anchor on — its busy signal is the status row's "⇣<tokens> … [stop]"
+    right-hand side, gone the moment the turn ends ("Worked for 12s" done
+    marker carries neither). Bottom rows only, so scrollback prose that
+    happens to contain the combo can't false-fire.
+    """
+    if not pane_text:
+        return False
+    tail = "\n".join(pane_text.split("\n")[-15:])
+    return bool(_GROK_WORKING_RE.search(tail))
+
+
+# Grok's analog of Claude Code's queued-messages hint: a message typed mid-turn
+# queues and grok pins "Queued · Enter to send now" above the input box (the
+# queued rows themselves render as "#1 <text>"). Presence means the latest
+# input has NOT yet entered the agent's context — same reaction-ack semantics
+# as has_queued_messages.
+_GROK_QUEUED_RE = re.compile(r"Queued\b.*Enter to send now")
+
+
+def has_grok_queued_messages(pane_text: str) -> bool:
+    """True if Grok is showing buffered (not-yet-ingested) input.
+
+    Bottom-rows only, like has_queued_messages, so a scrollback occurrence of
+    the phrase can't false-fire.
+    """
+    if not pane_text:
+        return False
+    tail = "\n".join(pane_text.split("\n")[-15:])
+    return bool(_GROK_QUEUED_RE.search(tail))
+
+
+# Canary for Claude Code TUI updates: a status line we found but could not
+# classify means the render changed (it has, repeatedly — see the dated
+# layout notes around UI_PATTERNS) and every detector downstream degrades
+# *silently*: busy agents look idle (mail wake types into a running turn,
+# reaction-confirm presses Enter mid-turn). Rate-limited so a weird-but-
+# harmless transient doesn't spam: one WARNING per unique text per hour.
+_unrecognized_status_seen: dict[str, float] = {}
+_UNRECOGNIZED_STATUS_LOG_INTERVAL = 3600.0
+
+
+def _warn_unrecognized_status(status: str) -> None:
+    now = time.monotonic()
+    key = status[:80]
+    # No 0.0 default: monotonic() counts from boot, so on a machine up
+    # <1h a zero sentinel would read as "logged recently" and mute the
+    # very first warning (seen on fresh CI runners and post-reboot).
+    last = _unrecognized_status_seen.get(key)
+    if last is not None and now - last < _UNRECOGNIZED_STATUS_LOG_INTERVAL:
+        return
+    _unrecognized_status_seen[key] = now
+    logger.warning(
+        "Unrecognized Claude Code status line (TUI format may have "
+        "changed; busy-detection degraded): %r",
+        key,
+    )
+
+
+# ── Automatic model-switch (safeguard) notice ───────────────────────────
+
+# Fable 5 (and future peers) silently downgrade to a fallback model when their
+# safeguards flag a message, printing a yellow notice block into the transcript
+# — NOT the JSONL, so SessionMonitor never sees it. We catch it by scanning the
+# live pane. The trigger phrase is stable across the notice's wording; the
+# fallback model ("Switched to Opus 4.8.") is parsed when present. Whitespace is
+# flattened before matching so the pane's word-wrapping can't split the phrase.
+_SAFEGUARD_NOTICE_RE = re.compile(r"safeguards flagged this message", re.IGNORECASE)
+# ". " / end anchors the model name so "Opus 4.8" isn't clipped to "Opus 4" at
+# the "4.8" dot; length-capped to stay a model name, not a runaway match.
+_SWITCHED_TO_RE = re.compile(r"Switched to (.{1,40}?)\.(?:\s|$)", re.IGNORECASE)
+
+
+def detect_model_switch(pane_text: str) -> str | None:
+    """Detect Claude Code's safeguard model-switch notice in a captured pane.
+
+    Returns the fallback model name (e.g. ``"Opus 4.8"``) when the notice is on
+    screen, an empty string when the notice is present but the model name
+    couldn't be parsed, or ``None`` when there is no such notice.
+    """
+    if not pane_text:
+        return None
+    flat = " ".join(pane_text.split())
+    if not _SAFEGUARD_NOTICE_RE.search(flat):
+        return None
+    m = _SWITCHED_TO_RE.search(flat)
+    return m.group(1).strip() if m else ""
+
+
+# ── Pane chrome stripping & bash output extraction ─────────────────────
+
+
+def strip_pane_chrome(lines: list[str]) -> list[str]:
+    """Strip Claude Code's bottom chrome (prompt area + status bar).
+
+    The bottom of the pane looks like::
+
+        ────────────────────────  (separator)
+        ❯                        (prompt)
+        ────────────────────────  (separator)
+          [Opus 4.6] Context: 34%
+          ⏵⏵ bypass permissions…
+
+    This function finds the topmost ``────`` separator in the last 10 lines
+    and strips everything from there down.
+    """
+    search_start = max(0, len(lines) - 10)
+    for i in range(search_start, len(lines)):
+        stripped = lines[i].strip()
+        if len(stripped) >= 20 and all(c == "─" for c in stripped):
+            return lines[:i]
+    return lines
+
+
+def extract_bash_output(pane_text: str, command: str) -> str | None:
+    """Extract ``!`` command output from a captured tmux pane.
+
+    Searches from the bottom for the ``! <command>`` echo line, then
+    returns that line and everything below it (including the ``⎿`` output).
+    Returns *None* if the command echo wasn't found.
+    """
+    lines = strip_pane_chrome(pane_text.splitlines())
+
+    # Find the last "! <command>" echo line (search from bottom).
+    # Match on the first 10 chars of the command in case the line is truncated.
+    cmd_idx: int | None = None
+    match_prefix = command[:10]
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if stripped.startswith(f"! {match_prefix}") or stripped.startswith(
+            f"!{match_prefix}"
+        ):
+            cmd_idx = i
+            break
+
+    if cmd_idx is None:
+        return None
+
+    # Include the command echo line and everything after it
+    raw_output = lines[cmd_idx:]
+
+    # Strip trailing empty lines
+    while raw_output and not raw_output[-1].strip():
+        raw_output.pop()
+
+    if not raw_output:
+        return None
+
+    return "\n".join(raw_output).strip()
+
+
+# ── Usage modal parsing ──────────────────────────────────────────────────────────
+
+
+@dataclass
+class UsageInfo:
+    """Parsed output from Claude Code's /usage modal."""
+
+    raw_text: str  # Full captured pane text
+    parsed_lines: list[str]  # Cleaned content lines from the modal
+
+
+def parse_usage_output(pane_text: str) -> UsageInfo | None:
+    """Extract usage information from Claude Code's /usage settings tab.
+
+    The /usage modal shows a Settings overlay with a "Usage" tab containing
+    progress bars and reset times.  This parser looks for the Settings header
+    line, then collects all content until "Esc to cancel".
+
+    Returns UsageInfo with cleaned lines, or None if not detected.
+    """
+    if not pane_text:
+        return None
+
+    lines = pane_text.strip().split("\n")
+
+    # Find the Settings header that indicates we're in the usage modal
+    start_idx: int | None = None
+    end_idx: int | None = None
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if start_idx is None:
+            # The usage tab header line
+            if "Settings:" in stripped and "Usage" in stripped:
+                start_idx = i + 1  # skip the header itself
+        else:
+            if stripped.startswith("Esc to"):
+                end_idx = i
+                break
+
+    if start_idx is None:
+        return None
+    if end_idx is None:
+        end_idx = len(lines)
+
+    # Collect content lines, stripping progress bar characters and whitespace
+    cleaned: list[str] = []
+    for line in lines[start_idx:end_idx]:
+        # Strip the line but preserve meaningful content
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Remove progress bar block characters but keep the rest
+        # Progress bars are like: █████▋   38% used
+        # Strip leading block chars, keep the percentage
+        stripped = re.sub(r"^[\u2580-\u259f\s]+", "", stripped).strip()
+        if stripped:
+            cleaned.append(stripped)
+
+    if cleaned:
+        return UsageInfo(raw_text=pane_text, parsed_lines=cleaned)
+
+    return None

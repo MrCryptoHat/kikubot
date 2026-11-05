@@ -1,0 +1,1989 @@
+"""Tests for SessionManager pure dict operations."""
+
+import json
+import time
+from unittest.mock import AsyncMock
+
+import pytest
+
+from kikubot.session import SessionManager, WindowState
+
+
+@pytest.fixture
+def mgr(monkeypatch) -> SessionManager:
+    monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+    monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+    return SessionManager()
+
+
+class TestMenuShownTopics:
+    """Per-topic menu-keyboard exactly-once flag (see menu_shown_topics)."""
+
+    def test_default_not_shown(self, mgr: SessionManager) -> None:
+        assert mgr.is_menu_shown(100, 42) is False
+
+    def test_none_thread_not_shown(self, mgr: SessionManager) -> None:
+        assert mgr.is_menu_shown(100, None) is False
+
+    def test_mark_and_check(self, mgr: SessionManager) -> None:
+        mgr.mark_menu_shown(100, 42)
+        assert mgr.is_menu_shown(100, 42) is True
+        # A different topic of the same user stays unmarked.
+        assert mgr.is_menu_shown(100, 43) is False
+
+    def test_mark_is_idempotent(self, mgr: SessionManager) -> None:
+        mgr.mark_menu_shown(100, 42)
+        mgr.mark_menu_shown(100, 42)
+        assert mgr.menu_shown_topics == {"100:42"}
+
+    def test_clear(self, mgr: SessionManager) -> None:
+        mgr.mark_menu_shown(100, 42)
+        mgr.clear_menu_shown(100, 42)
+        assert mgr.is_menu_shown(100, 42) is False
+
+
+class TestThreadDirectoryMemory:
+    """Learned topic→directory memory (auto-rebind by permanent thread_id)."""
+
+    def test_record_and_get(self, mgr: SessionManager) -> None:
+        mgr.record_thread_directory(100, 42, "/home/user/projects/myapp")
+        assert mgr.get_remembered_directory(100, 42) == "/home/user/projects/myapp"
+
+    def test_get_unknown_returns_none(self, mgr: SessionManager) -> None:
+        assert mgr.get_remembered_directory(100, 42) is None
+
+    def test_record_overwrites(self, mgr: SessionManager) -> None:
+        mgr.record_thread_directory(100, 42, "/a")
+        mgr.record_thread_directory(100, 42, "/b")
+        assert mgr.get_remembered_directory(100, 42) == "/b"
+
+    def test_empty_directory_ignored(self, mgr: SessionManager) -> None:
+        mgr.record_thread_directory(100, 42, "")
+        assert mgr.get_remembered_directory(100, 42) is None
+
+    def test_users_and_threads_independent(self, mgr: SessionManager) -> None:
+        mgr.record_thread_directory(100, 1, "/u100t1")
+        mgr.record_thread_directory(100, 2, "/u100t2")
+        mgr.record_thread_directory(200, 1, "/u200t1")
+        assert mgr.get_remembered_directory(100, 1) == "/u100t1"
+        assert mgr.get_remembered_directory(100, 2) == "/u100t2"
+        assert mgr.get_remembered_directory(200, 1) == "/u200t1"
+
+    def test_idempotent_record_skips_save(self, mgr: SessionManager) -> None:
+        # Re-recording the same dir must not trigger a redundant state write.
+        calls = {"n": 0}
+        mgr._save_state = lambda: calls.__setitem__("n", calls["n"] + 1)  # type: ignore[method-assign]
+        mgr.record_thread_directory(100, 42, "/same")
+        mgr.record_thread_directory(100, 42, "/same")
+        assert calls["n"] == 1
+
+    def test_load_coerces_int_keys(self, monkeypatch, tmp_path) -> None:
+        # JSON object keys are strings; load must coerce user_id/thread_id to int
+        # so lookups (which pass ints) hit. The riskiest part of the new field.
+        from kikubot import session as session_mod
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps(
+                {"thread_directory_memory": {"100": {"42": "/home/user/agents/demo"}}}
+            )
+        )
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        mgr = SessionManager()
+        assert mgr.get_remembered_directory(100, 42) == "/home/user/agents/demo"
+
+
+class TestThreadRuntimeMemory:
+    """Runtime remembered alongside the directory — a codex topic must rebind
+    as codex after its window dies, not silently as Claude."""
+
+    def test_record_with_runtime(self, mgr: SessionManager) -> None:
+        mgr.record_thread_directory(100, 42, "/p", runtime="codex")
+        assert mgr.get_remembered_runtime(100, 42) == "codex"
+
+    def test_unknown_returns_none(self, mgr: SessionManager) -> None:
+        # Legacy rows predate the runtime axis — callers pick the fallback.
+        assert mgr.get_remembered_runtime(100, 42) is None
+
+    def test_record_without_runtime_keeps_previous(self, mgr: SessionManager) -> None:
+        mgr.record_thread_directory(100, 42, "/p", runtime="codex")
+        mgr.record_thread_directory(100, 42, "/p")  # runtime omitted
+        assert mgr.get_remembered_runtime(100, 42) == "codex"
+
+    def test_runtime_change_alone_triggers_save(self, mgr: SessionManager) -> None:
+        calls = {"n": 0}
+        mgr._save_state = lambda: calls.__setitem__("n", calls["n"] + 1)  # type: ignore[method-assign]
+        mgr.record_thread_directory(100, 42, "/same", runtime="claude")
+        mgr.record_thread_directory(100, 42, "/same", runtime="codex")
+        mgr.record_thread_directory(100, 42, "/same", runtime="codex")
+        assert calls["n"] == 2
+        assert mgr.get_remembered_runtime(100, 42) == "codex"
+
+    def test_forget_drops_runtime_keeps_directory(self, mgr: SessionManager) -> None:
+        # Ending the session on purpose (/kill, panel, topic close) forgets the
+        # CLI so the next launch asks again — the folder memory survives.
+        mgr.record_thread_directory(100, 42, "/p", runtime="grok")
+        mgr.forget_thread_runtime(100, 42)
+        assert mgr.get_remembered_runtime(100, 42) is None
+        assert mgr.get_remembered_directory(100, 42) == "/p"
+
+    def test_forget_leaves_other_topics_alone(self, mgr: SessionManager) -> None:
+        mgr.record_thread_directory(100, 42, "/p", runtime="grok")
+        mgr.record_thread_directory(100, 43, "/q", runtime="codex")
+        mgr.forget_thread_runtime(100, 42)
+        assert mgr.get_remembered_runtime(100, 43) == "codex"
+
+    def test_forget_unknown_is_noop(self, mgr: SessionManager) -> None:
+        calls = {"n": 0}
+        mgr._save_state = lambda: calls.__setitem__("n", calls["n"] + 1)  # type: ignore[method-assign]
+        mgr.forget_thread_runtime(100, 42)  # never recorded
+        assert calls["n"] == 0
+
+    def test_load_coerces_int_keys(self, monkeypatch, tmp_path) -> None:
+        from kikubot import session as session_mod
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "thread_directory_memory": {"100": {"42": "/w"}},
+                    "thread_runtime_memory": {"100": {"42": "codex"}},
+                }
+            )
+        )
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        mgr = SessionManager()
+        assert mgr.get_remembered_runtime(100, 42) == "codex"
+
+    def test_legacy_state_without_runtime_map_loads(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        # Old state.json has no thread_runtime_memory key — must load clean.
+        from kikubot import session as session_mod
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps({"thread_directory_memory": {"100": {"42": "/w"}}})
+        )
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        mgr = SessionManager()
+        assert mgr.get_remembered_directory(100, 42) == "/w"
+        assert mgr.get_remembered_runtime(100, 42) is None
+
+
+class TestNoteRuntimeVersion:
+    """Self-update canary persistence: only a real version BUMP returns the
+    previous value (the alert trigger); first sighting and no-change are None."""
+
+    def test_first_sighting_records_silently(self, mgr: SessionManager) -> None:
+        assert mgr.note_runtime_version("codex", "codex-cli 0.144.5") is None
+        assert mgr.runtime_versions["codex"] == "codex-cli 0.144.5"
+
+    def test_no_change_returns_none(self, mgr: SessionManager) -> None:
+        mgr.note_runtime_version("codex", "codex-cli 0.144.5")
+        assert mgr.note_runtime_version("codex", "codex-cli 0.144.5") is None
+
+    def test_bump_returns_previous(self, mgr: SessionManager) -> None:
+        mgr.note_runtime_version("codex", "codex-cli 0.144.5")
+        prev = mgr.note_runtime_version("codex", "codex-cli 0.146.0")
+        assert prev == "codex-cli 0.144.5"
+        assert mgr.runtime_versions["codex"] == "codex-cli 0.146.0"
+
+    def test_state_roundtrip(self, monkeypatch, tmp_path) -> None:
+        from kikubot import session as session_mod
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps({"runtime_versions": {"claude": "2.0.1 (Claude Code)"}})
+        )
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        mgr = SessionManager()
+        assert mgr.note_runtime_version("claude", "2.0.1 (Claude Code)") is None
+        assert mgr.note_runtime_version("claude", "2.1.0 (Claude Code)") == (
+            "2.0.1 (Claude Code)"
+        )
+
+
+class TestTagWindowRuntime:
+    """The shared bootstrap stamp: runtime tag always; cwd persisted only for
+    hookless runtimes (their transcript resolves by cwd)."""
+
+    def test_claude_tags_runtime_but_not_cwd(self, mgr: SessionManager) -> None:
+        mgr.tag_window_runtime("@1", "claude", "/p")
+        ws = mgr.get_window_state("@1")
+        assert ws.runtime == "claude"
+        assert ws.cwd == ""  # claude's cwd comes from its SessionStart hook
+
+    def test_codex_tags_runtime_and_cwd(self, mgr: SessionManager) -> None:
+        mgr.tag_window_runtime("@2", "codex", "/p")
+        ws = mgr.get_window_state("@2")
+        assert ws.runtime == "codex"
+        assert ws.cwd == "/p"
+
+    def test_idempotent_skips_save(self, mgr: SessionManager) -> None:
+        calls = {"n": 0}
+        mgr._save_state = lambda: calls.__setitem__("n", calls["n"] + 1)  # type: ignore[method-assign]
+        mgr.tag_window_runtime("@3", "codex", "/p")
+        mgr.tag_window_runtime("@3", "codex", "/p")
+        assert calls["n"] == 1
+
+
+class TestWorktreeMeta:
+    """Worktree-agent metadata keyed by permanent thread_id."""
+
+    def _meta(self, **kw):
+        from kikubot.worktrees import WorktreeMeta
+
+        base = dict(
+            repo="/home/user/projects/kikubot",
+            repo_name="kikubot",
+            branch="wt/hero",
+            base_branch="main",
+            path="/home/user/.kikubot/worktrees/kikubot/hero",
+            task_title="редизайн шапки",
+        )
+        base.update(kw)
+        return WorktreeMeta(**base)  # type: ignore[arg-type]
+
+    def test_set_and_get(self, mgr: SessionManager) -> None:
+        mgr.set_worktree_meta(100, 42, self._meta())
+        got = mgr.get_worktree_meta(100, 42)
+        assert got is not None and got.branch == "wt/hero" and got.status == "active"
+
+    def test_get_unknown_returns_none(self, mgr: SessionManager) -> None:
+        assert mgr.get_worktree_meta(100, 42) is None
+
+    def test_clear_removes(self, mgr: SessionManager) -> None:
+        mgr.set_worktree_meta(100, 42, self._meta())
+        mgr.clear_worktree_meta(100, 42)
+        assert mgr.get_worktree_meta(100, 42) is None
+
+    def test_mark_orphaned_flips_once(self, mgr: SessionManager) -> None:
+        mgr.set_worktree_meta(100, 42, self._meta())
+        assert mgr.mark_worktree_orphaned(100, 42) is True
+        assert mgr.get_worktree_meta(100, 42).status == "orphaned"  # type: ignore[union-attr]
+        assert mgr.mark_worktree_orphaned(100, 42) is False  # already orphaned
+
+    def test_mark_orphaned_unknown_returns_false(self, mgr: SessionManager) -> None:
+        assert mgr.mark_worktree_orphaned(100, 999) is False
+
+    def test_iter(self, mgr: SessionManager) -> None:
+        mgr.set_worktree_meta(100, 1, self._meta())
+        mgr.set_worktree_meta(200, 2, self._meta(repo_name="myapp"))
+        rows = sorted((u, t, m.repo_name) for u, t, m in mgr.iter_worktree_meta())
+        assert rows == [(100, 1, "kikubot"), (200, 2, "myapp")]
+
+    def test_is_worktree_window(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "@5")
+        assert mgr.is_worktree_window("@5") is False  # bound, but no meta
+        mgr.set_worktree_meta(100, 42, self._meta())
+        assert mgr.is_worktree_window("@5") is True
+        assert mgr.is_worktree_window("@99") is False  # unknown window
+
+    def test_reconcile_drops_only_unbound_and_gone(self, mgr, tmp_path) -> None:
+        live = tmp_path / "live"
+        live.mkdir()
+        # (a) unbound + path gone → dropped
+        mgr.set_worktree_meta(100, 1, self._meta(path="/nope/gone"))
+        # (b) bound + path gone → kept (a live agent whose window just died)
+        mgr.set_worktree_meta(100, 2, self._meta(path="/nope/gone2"))
+        mgr.bind_thread(100, 2, "@7")
+        # (c) unbound + path exists → kept (worktree still on disk)
+        mgr.set_worktree_meta(100, 3, self._meta(path=str(live)))
+
+        assert mgr.reconcile_worktree_meta() == 1
+        assert mgr.get_worktree_meta(100, 1) is None
+        assert mgr.get_worktree_meta(100, 2) is not None
+        assert mgr.get_worktree_meta(100, 3) is not None
+
+    def test_load_coerces_int_keys(self, monkeypatch, tmp_path) -> None:
+        # JSON object keys are strings; load must coerce user_id/thread_id to int
+        # (lookups pass ints) and rebuild WorktreeMeta from its dict form.
+        from kikubot import session as session_mod
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "worktree_meta": {
+                        "100": {
+                            "42": {
+                                "repo": "/home/user/projects/kikubot",
+                                "repo_name": "kikubot",
+                                "branch": "wt/hero",
+                                "base_branch": "main",
+                                "path": "/home/user/.kikubot/worktrees/kikubot/hero",
+                                "task_title": "редизайн шапки",
+                                "status": "orphaned",
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        mgr = SessionManager()
+        got = mgr.get_worktree_meta(100, 42)
+        assert got is not None
+        assert got.task_title == "редизайн шапки" and got.status == "orphaned"
+
+
+class TestThreadBindings:
+    def test_bind_and_get(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1")
+        assert mgr.get_window_for_thread(100, 1) == "@1"
+
+    def test_bind_unbind_get_returns_none(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1")
+        mgr.unbind_thread(100, 1)
+        assert mgr.get_window_for_thread(100, 1) is None
+
+    def test_unbind_nonexistent_returns_none(self, mgr: SessionManager) -> None:
+        assert mgr.unbind_thread(100, 999) is None
+
+    def test_iter_thread_bindings(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1")
+        mgr.bind_thread(100, 2, "@2")
+        mgr.bind_thread(200, 3, "@3")
+        result = set(mgr.iter_thread_bindings())
+        assert result == {(100, 1, "@1"), (100, 2, "@2"), (200, 3, "@3")}
+
+
+class TestGroupChatId:
+    """Tests for group chat_id routing (supergroup forum topic support).
+
+    IMPORTANT: These tests protect against regression. The group_chat_ids
+    mapping is required for Telegram supergroup forum topics — without it,
+    all outbound messages fail with "Message thread not found". This was
+    erroneously removed once (26cb81f) and restored in PR #23. Do NOT
+    delete these tests or the underlying functionality.
+    """
+
+    def test_resolve_with_stored_group_id(self, mgr: SessionManager) -> None:
+        """resolve_chat_id returns stored group chat_id for known thread."""
+        mgr.set_group_chat_id(100, 1, -1001234567890)
+        assert mgr.resolve_chat_id(100, 1) == -1001234567890
+
+    def test_resolve_without_group_id_falls_back_to_user_id(
+        self, mgr: SessionManager
+    ) -> None:
+        """resolve_chat_id falls back to user_id when no group_id stored."""
+        assert mgr.resolve_chat_id(100, 1) == 100
+
+    def test_resolve_none_thread_id_falls_back_to_user_id(
+        self, mgr: SessionManager
+    ) -> None:
+        """resolve_chat_id returns user_id when thread_id is None (private chat)."""
+        mgr.set_group_chat_id(100, 1, -1001234567890)
+        assert mgr.resolve_chat_id(100) == 100
+
+    def test_set_group_chat_id_overwrites(self, mgr: SessionManager) -> None:
+        """set_group_chat_id updates the stored value on change."""
+        mgr.set_group_chat_id(100, 1, -999)
+        mgr.set_group_chat_id(100, 1, -888)
+        assert mgr.resolve_chat_id(100, 1) == -888
+
+    def test_multiple_threads_independent(self, mgr: SessionManager) -> None:
+        """Different threads for the same user store independent group chat_ids."""
+        mgr.set_group_chat_id(100, 1, -111)
+        mgr.set_group_chat_id(100, 2, -222)
+        assert mgr.resolve_chat_id(100, 1) == -111
+        assert mgr.resolve_chat_id(100, 2) == -222
+
+    def test_multiple_users_independent(self, mgr: SessionManager) -> None:
+        """Different users store independent group chat_ids."""
+        mgr.set_group_chat_id(100, 1, -111)
+        mgr.set_group_chat_id(200, 1, -222)
+        assert mgr.resolve_chat_id(100, 1) == -111
+        assert mgr.resolve_chat_id(200, 1) == -222
+
+    def test_set_group_chat_id_with_none_thread(self, mgr: SessionManager) -> None:
+        """set_group_chat_id handles None thread_id (mapped to 0)."""
+        mgr.set_group_chat_id(100, None, -999)
+        # thread_id=None in resolve falls back to user_id (by design)
+        assert mgr.resolve_chat_id(100, None) == 100
+        # The stored key is "100:0", only accessible with explicit thread_id=0
+        assert mgr.group_chat_ids.get("100:0") == -999
+
+
+class TestWindowState:
+    def test_get_creates_new(self, mgr: SessionManager) -> None:
+        state = mgr.get_window_state("@0")
+        assert state.session_id == ""
+        assert state.cwd == ""
+
+    def test_get_returns_existing(self, mgr: SessionManager) -> None:
+        state = mgr.get_window_state("@1")
+        state.session_id = "abc"
+        assert mgr.get_window_state("@1").session_id == "abc"
+
+    def test_clear_window_session(self, mgr: SessionManager) -> None:
+        state = mgr.get_window_state("@1")
+        state.session_id = "abc"
+        mgr.clear_window_session("@1")
+        assert mgr.get_window_state("@1").session_id == ""
+
+
+class TestResolveWindowForThread:
+    def test_none_thread_id_returns_none(self, mgr: SessionManager) -> None:
+        assert mgr.resolve_window_for_thread(100, None) is None
+
+    def test_unbound_thread_returns_none(self, mgr: SessionManager) -> None:
+        assert mgr.resolve_window_for_thread(100, 42) is None
+
+    def test_bound_thread_returns_window(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "@3")
+        assert mgr.resolve_window_for_thread(100, 42) == "@3"
+
+
+class TestDisplayNames:
+    def test_get_display_name_fallback(self, mgr: SessionManager) -> None:
+        """get_display_name returns window_id when no display name is set."""
+        assert mgr.get_display_name("@99") == "@99"
+
+    def test_set_and_get_display_name(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1", window_name="myproject")
+        assert mgr.get_display_name("@1") == "myproject"
+
+    def test_set_display_name_update(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1", window_name="old-name")
+        mgr.window_display_names["@1"] = "new-name"
+        assert mgr.get_display_name("@1") == "new-name"
+
+    def test_bind_thread_sets_display_name(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1", window_name="proj")
+        assert mgr.get_display_name("@1") == "proj"
+
+    def test_bind_thread_without_name_no_display(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1")
+        # No display name set, fallback to window_id
+        assert mgr.get_display_name("@1") == "@1"
+
+
+class TestIsWindowId:
+    def test_valid_ids(self, mgr: SessionManager) -> None:
+        assert mgr._is_window_id("@0") is True
+        assert mgr._is_window_id("@12") is True
+        assert mgr._is_window_id("@999") is True
+
+    def test_invalid_ids(self, mgr: SessionManager) -> None:
+        assert mgr._is_window_id("myproject") is False
+        assert mgr._is_window_id("@") is False
+        assert mgr._is_window_id("") is False
+        assert mgr._is_window_id("@abc") is False
+
+
+class TestDockerBindingHelpers:
+    """Binding-type helpers that let callers branch between tmux and docker
+    transports without parsing binding strings ad-hoc.
+    """
+
+    def test_is_docker_binding_positive(self) -> None:
+        assert SessionManager._is_docker_binding("docker:assistant") is True
+        assert SessionManager._is_docker_binding("docker:a") is True
+
+    def test_is_docker_binding_negative(self) -> None:
+        assert SessionManager._is_docker_binding("@12") is False
+        assert SessionManager._is_docker_binding("docker:") is False
+        assert SessionManager._is_docker_binding("") is False
+        assert SessionManager._is_docker_binding("myproject") is False
+
+    def test_resolve_binding_tmux(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@12")
+        assert mgr.resolve_binding(100, 1) == ("tmux", "@12")
+
+    def test_resolve_binding_docker(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "docker:assistant")
+        assert mgr.resolve_binding(100, 1) == ("docker", "assistant")
+
+    def test_resolve_binding_unbound_returns_none(self, mgr: SessionManager) -> None:
+        assert mgr.resolve_binding(100, 42) is None
+
+    def test_resolve_binding_none_thread_returns_none(
+        self, mgr: SessionManager
+    ) -> None:
+        assert mgr.resolve_binding(100, None) is None
+
+
+class TestResolveStaleIdsPreservesDocker:
+    """resolve_stale_ids rebuilds mappings from live tmux windows. Docker
+    bindings have no tmux window to match and must survive verbatim —
+    otherwise a bot restart (or tmux server restart) would silently drop
+    the topic-to-container link.
+    """
+
+    async def test_docker_thread_binding_survives_empty_tmux(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import tmux_manager as tm_mod
+
+        async def _no_windows():
+            return []
+
+        monkeypatch.setattr(tm_mod.tmux_manager, "list_windows", _no_windows)
+        mgr.bind_thread(100, 1, "docker:assistant")
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 1) == "docker:assistant"
+
+    async def test_docker_binding_preserved_alongside_stale_tmux(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """Docker binding stays even when a sibling tmux binding gets dropped."""
+        from kikubot import tmux_manager as tm_mod
+
+        async def _no_windows():
+            return []
+
+        monkeypatch.setattr(tm_mod.tmux_manager, "list_windows", _no_windows)
+        mgr.bind_thread(100, 1, "docker:assistant")
+        mgr.bind_thread(100, 2, "@99")  # stale — no matching live window
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 1) == "docker:assistant"
+        assert mgr.get_window_for_thread(100, 2) is None
+
+    async def test_docker_window_state_preserved(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import tmux_manager as tm_mod
+
+        async def _no_windows():
+            return []
+
+        monkeypatch.setattr(tm_mod.tmux_manager, "list_windows", _no_windows)
+        ws = mgr.get_window_state("docker:assistant")
+        ws.session_id = "sid-1"
+        ws.cwd = "/workspace"
+        await mgr.resolve_stale_ids()
+        assert "docker:assistant" in mgr.window_states
+        assert mgr.window_states["docker:assistant"].session_id == "sid-1"
+
+
+class TestResolveStaleIdsOnUnreadableTmux:
+    async def test_bindings_survive_a_failed_read(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        # A failed read is not "every window is gone": dropping every binding
+        # at boot on it would orphan every live agent for the janitor.
+        from kikubot import tmux_manager as tm_mod
+
+        monkeypatch.setattr(
+            tm_mod.tmux_manager,
+            "list_windows",
+            AsyncMock(side_effect=tm_mod.TmuxReadError("boom")),
+        )
+        mgr.bind_thread(100, 1, "@4")
+        mgr.get_window_state("@4").session_id = "sid-4"
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 1) == "@4"
+        assert "@4" in mgr.window_states
+        assert mgr.boot_orphans == []
+
+
+class TestLostWindows:
+    """A window unbound because it looked gone goes back to its topic if it
+    turns out alive — otherwise the janitor would kill it 90 s later."""
+
+    def test_alive_window_goes_back_to_its_topic(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@4", window_name="proj")
+        assert mgr.unbind_lost_window(100, 1) == "@4"
+        assert mgr.get_window_for_thread(100, 1) is None
+        assert mgr.take_lost_window("@4", "proj") == (100, 1)
+        assert mgr.take_lost_window("@4", "proj") is None  # one-shot
+
+    def test_not_taken_when_it_is_another_window(self, mgr: SessionManager) -> None:
+        # tmux reuses window ids after a server restart.
+        mgr.bind_thread(100, 1, "@4", window_name="proj")
+        mgr.unbind_lost_window(100, 1)
+        assert mgr.take_lost_window("@4", "other") is None
+
+    def test_not_taken_when_the_topic_moved_on(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@4", window_name="proj")
+        mgr.unbind_lost_window(100, 1)
+        mgr.bind_thread(100, 1, "@9", window_name="proj-2")
+        assert mgr.take_lost_window("@4", "proj") is None
+
+    def test_not_taken_after_the_ttl(self, mgr: SessionManager, monkeypatch) -> None:
+        from kikubot import session as session_mod
+
+        mgr.bind_thread(100, 1, "@4", window_name="proj")
+        mgr.unbind_lost_window(100, 1)
+        later = time.monotonic() + session_mod.LOST_WINDOW_TTL + 1
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: later)
+        assert mgr.take_lost_window("@4", "proj") is None
+        assert mgr.lost_windows == {}
+
+    def test_docker_bindings_are_not_recorded(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "docker:assistant")
+        mgr.unbind_lost_window(100, 1)
+        assert mgr.lost_windows == {}
+
+
+class TestTopicRememberingWindow:
+    """The janitor's last check before killing an unbound window: a topic that
+    lost its binding without a trace still remembers its folder and CLI."""
+
+    @staticmethod
+    def _lost_topic(mgr: SessionManager, thread_id: int, path: str, runtime: str):
+        mgr.record_thread_directory(100, thread_id, path, runtime=runtime)
+
+    def test_the_one_matching_topic(self, mgr: SessionManager, tmp_path) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "claude")
+        self._lost_topic(mgr, 2, str(tmp_path / "elsewhere"), "claude")
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) == (100, 1)
+
+    def test_none_when_two_topics_remember_the_folder(
+        self, mgr: SessionManager, tmp_path
+    ) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "claude")
+        self._lost_topic(mgr, 2, str(tmp_path), "claude")
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) is None
+
+    def test_none_for_another_cli(self, mgr: SessionManager, tmp_path) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "codex")
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) is None
+
+    def test_none_after_a_deliberate_end(self, mgr: SessionManager, tmp_path) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "claude")
+        mgr.forget_thread_runtime(100, 1)  # /kill, «End session», topic closed
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) is None
+
+    def test_none_for_a_bound_topic(self, mgr: SessionManager, tmp_path) -> None:
+        self._lost_topic(mgr, 1, str(tmp_path), "claude")
+        mgr.bind_thread(100, 1, "@9")
+        assert mgr.topic_remembering_window("@4", str(tmp_path)) is None
+
+
+class TestBootOrphans:
+    """A tmux binding whose window died with tmux is remembered, with the
+    session it ran, for KIKUBOT_AUTO_RESUME_AGENTS."""
+
+    async def test_dropped_binding_recorded_with_its_session(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import tmux_manager as tm_mod
+
+        monkeypatch.setattr(
+            tm_mod.tmux_manager, "list_windows", AsyncMock(return_value=[])
+        )
+        mgr.bind_thread(100, 1, "@4")
+        mgr.get_window_state("@4").session_id = "sid-4"
+        mgr.bind_thread(100, 2, "docker:assistant")
+        await mgr.resolve_stale_ids()
+        assert mgr.boot_orphans == [(100, 1, "sid-4")]
+
+
+class TestSendToWindowRouting:
+    """send_to_window is the one place where the transport branch happens.
+    Legacy tmux bindings must keep using tmux_manager; docker bindings
+    must route through docker_driver. Docker routing is gated by the
+    ``docker_agents_enabled`` flag so a stale docker:* value in
+    state.json with the flag off can't accidentally drive a container.
+    """
+
+    async def _setup_docker_agent(self, monkeypatch):
+        from pathlib import Path
+
+        from kikubot import session as session_mod
+        from kikubot.config import DockerAgentConfig
+
+        agent = DockerAgentConfig(
+            name="assistant",
+            container="assistant-ctn",
+            workspace_host_path=Path("/tmp/ws"),
+            claude_home_host_path=Path("/tmp/ch"),
+            ipc_dir=Path("/tmp/ipc"),
+            session_map_path=Path("/tmp/sm.json"),
+        )
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [agent])
+        return agent
+
+    async def test_docker_routes_to_driver_when_flag_on(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        await self._setup_docker_agent(monkeypatch)
+
+        calls: list[tuple[str, str]] = []
+
+        async def fake_send(container, text, **kw):
+            calls.append((container, text))
+            return True
+
+        async def fake_alive(_container):
+            return True
+
+        monkeypatch.setattr(session_mod.docker_driver, "send_keys", fake_send)
+        monkeypatch.setattr(session_mod.docker_driver, "is_container_alive", fake_alive)
+
+        ok, _msg = await mgr.send_to_window("docker:assistant", "hi")
+        assert ok is True
+        assert calls == [("assistant-ctn", "hi")]
+
+    async def test_docker_disabled_flag_returns_error(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """Flag off + docker binding must fail explicitly (not silently
+        fall through to tmux and report a confusing 'Window not found')."""
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", False)
+
+        ok, msg = await mgr.send_to_window("docker:assistant", "hi")
+        assert ok is False
+        assert "disabled" in msg.lower()
+
+    async def test_docker_unknown_agent_returns_error(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [])
+
+        ok, msg = await mgr.send_to_window("docker:ghost", "hi")
+        assert ok is False
+        assert "ghost" in msg
+
+    async def test_docker_dead_container_returns_error(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        await self._setup_docker_agent(monkeypatch)
+
+        async def fake_alive(_c):
+            return False
+
+        monkeypatch.setattr(session_mod.docker_driver, "is_container_alive", fake_alive)
+        ok, msg = await mgr.send_to_window("docker:assistant", "hi")
+        assert ok is False
+        assert "not running" in msg.lower()
+
+    async def test_tmux_path_unchanged(self, mgr: SessionManager, monkeypatch) -> None:
+        """Legacy @<id> bindings must NOT touch docker_driver."""
+        from kikubot import session as session_mod
+        from kikubot.tmux_manager import TmuxWindow
+
+        async def fake_find(wid):
+            return TmuxWindow(window_id=wid, window_name="x", cwd="/tmp")
+
+        async def fake_tmux_send(_wid, _text):
+            return True
+
+        async def forbidden(*a, **kw):
+            raise AssertionError("docker_driver must not be called for tmux bindings")
+
+        monkeypatch.setattr(session_mod.tmux_manager, "find_window_by_id", fake_find)
+        monkeypatch.setattr(session_mod.tmux_manager, "send_keys", fake_tmux_send)
+        monkeypatch.setattr(session_mod.docker_driver, "send_keys", forbidden)
+        monkeypatch.setattr(session_mod.docker_driver, "is_container_alive", forbidden)
+
+        ok, _msg = await mgr.send_to_window("@12", "hi")
+        assert ok is True
+
+
+class TestResolveAgentBinding:
+    """resolve_agent_binding maps a bare agent name → binding value for the
+    /inject endpoint: docker agent → docker:<name>, live tmux window →
+    @<id>, neither → None (the "agent not running" signal)."""
+
+    async def test_docker_agent_resolves_to_docker_binding(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(
+            session_mod.config, "get_docker_agent", lambda name: object()
+        )
+
+        # A docker agent must NOT fall through to a tmux lookup.
+        async def forbidden(_name):
+            raise AssertionError("tmux lookup must not run for a docker agent")
+
+        monkeypatch.setattr(session_mod.tmux_manager, "find_window_by_name", forbidden)
+        assert await mgr.resolve_agent_binding("assistant") == "docker:assistant"
+
+    async def test_tmux_window_resolves_to_window_id(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+        from kikubot.tmux_manager import TmuxWindow
+
+        monkeypatch.setattr(session_mod.config, "get_docker_agent", lambda name: None)
+
+        async def fake_find(name):
+            assert name == "example.com"
+            return TmuxWindow(window_id="@7", window_name=name, cwd="/tmp")
+
+        monkeypatch.setattr(session_mod.tmux_manager, "find_window_by_name", fake_find)
+        assert await mgr.resolve_agent_binding("example.com") == "@7"
+
+    async def test_unknown_name_resolves_to_none(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(session_mod.config, "get_docker_agent", lambda name: None)
+
+        async def fake_find(_name):
+            return None
+
+        monkeypatch.setattr(session_mod.tmux_manager, "find_window_by_name", fake_find)
+        assert await mgr.resolve_agent_binding("ghost") is None
+
+
+class TestDockerJsonlResolution:
+    """resolve_session_for_window must read the docker agent's JSONL from
+    the agent-specific projects root (bind-mounted claude-home), not the
+    host's ~/.claude/projects — that's the whole point of keeping the
+    container isolated. These tests exercise the full
+    binding → projects_root → file_path resolution path.
+    """
+
+    def _agent(self, tmp_path, name="assistant"):
+        from kikubot.config import DockerAgentConfig
+
+        return DockerAgentConfig(
+            name=name,
+            container=f"{name}-ctn",
+            workspace_host_path=tmp_path / name / "workspace",
+            claude_home_host_path=tmp_path / name / "claude-home",
+            ipc_dir=tmp_path / name / "ipc",
+            session_map_path=tmp_path / name / "session-map.json",
+        )
+
+    def test_projects_root_for_docker(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [agent])
+        root = mgr._projects_root_for_binding("docker:assistant")
+        assert root == agent.claude_home_host_path / "projects"
+
+    def test_projects_root_for_tmux_uses_default(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from pathlib import Path
+
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(
+            session_mod.config, "claude_projects_path", Path("/fake/default")
+        )
+        assert mgr._projects_root_for_binding("@12") == Path("/fake/default")
+
+    def test_projects_root_for_unknown_docker_falls_back(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """Docker binding pointing at an agent that isn't configured: fall
+        back to the default projects path so the caller fails by missing
+        the file rather than blowing up on None."""
+        from pathlib import Path
+
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(
+            session_mod.config, "claude_projects_path", Path("/fake/default")
+        )
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [])
+        assert mgr._projects_root_for_binding("docker:ghost") == Path("/fake/default")
+
+    async def test_resolve_session_for_docker_binding(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """End-to-end: a docker binding with persisted sid+cwd resolves to
+        the JSONL under the agent's projects root."""
+        from kikubot import session as session_mod
+
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [agent])
+
+        encoded = SessionManager._encode_cwd("/workspace")
+        project_dir = agent.claude_home_host_path / "projects" / encoded
+        project_dir.mkdir(parents=True)
+        sid = "docker-session-uuid"
+        jsonl = project_dir / f"{sid}.jsonl"
+        jsonl.write_text(
+            '{"type":"summary","summary":"hello from container"}\n'
+            '{"type":"user","message":{"content":"hi"}}\n'
+        )
+
+        ws = mgr.get_window_state("docker:assistant")
+        ws.session_id = sid
+        ws.cwd = "/workspace"
+
+        session = await mgr.resolve_session_for_window("docker:assistant")
+        assert session is not None
+        assert session.session_id == sid
+        assert str(jsonl) == session.file_path
+
+    async def test_resolve_missing_jsonl_keeps_session_id(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """A freshly-launched session (after «Новая»/restart) has no transcript
+        file until its first turn, yet the hook already reported its id. resolve
+        must return None WITHOUT clearing session_id — otherwise it ping-pongs
+        against load_session_map (which re-applies the id every poll) and the
+        bot can never track the new session."""
+        from kikubot import session as session_mod
+
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [agent])
+        # projects root may exist, but no <sid>.jsonl has been written yet.
+        (agent.claude_home_host_path / "projects").mkdir(parents=True)
+
+        ws = mgr.get_window_state("docker:assistant")
+        ws.session_id = "fresh-session-uuid"
+        ws.cwd = "/workspace"
+
+        session = await mgr.resolve_session_for_window("docker:assistant")
+        assert session is None
+        # The binding must survive so a later poll resolves it once the
+        # transcript appears.
+        survived = mgr.get_window_state("docker:assistant")
+        assert survived.session_id == "fresh-session-uuid"
+        assert survived.cwd == "/workspace"
+
+
+class TestLoadSessionMapMerge:
+    """load_session_map merges the main session_map with every active
+    docker agent's session_map so window_states carry both kinds of
+    entries under their binding values.
+    """
+
+    def _agent(self, tmp_path, name="assistant"):
+        from kikubot.config import DockerAgentConfig
+
+        return DockerAgentConfig(
+            name=name,
+            container=f"{name}-ctn",
+            workspace_host_path=tmp_path / name / "workspace",
+            claude_home_host_path=tmp_path / name / "claude-home",
+            ipc_dir=tmp_path / name / "ipc",
+            session_map_path=tmp_path / name / "session-map.json",
+        )
+
+    async def test_merges_main_and_docker(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        import json
+
+        from kikubot import session as session_mod
+
+        main_map = tmp_path / "main.json"
+        main_map.write_text(
+            json.dumps(
+                {
+                    "kikubot:@12": {
+                        "session_id": "tmux-sid",
+                        "cwd": "/host/proj",
+                        "window_name": "tmux-proj",
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(session_mod.config, "session_map_file", main_map)
+        agent = self._agent(tmp_path)
+        agent.session_map_path.parent.mkdir(parents=True, exist_ok=True)
+        agent.session_map_path.write_text(
+            json.dumps(
+                {
+                    "docker:assistant": {
+                        "session_id": "docker-sid",
+                        "cwd": "/workspace",
+                        "window_name": "assistant",
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [agent])
+
+        await mgr.load_session_map()
+
+        assert mgr.window_states["@12"].session_id == "tmux-sid"
+        assert mgr.window_states["docker:assistant"].session_id == "docker-sid"
+        assert mgr.window_display_names["docker:assistant"] == "assistant"
+
+
+class TestAgentFilePathResolver:
+    """resolve_agent_file_path enforces the /workspace whitelist for
+    docker bindings so a compromised agent can't exfiltrate
+    /auth/.credentials.json or any other bind-mounted secret by writing
+    ``(send file: /auth/...)``. Also guards against `..` traversal.
+    """
+
+    def _agent(self, tmp_path, name="assistant"):
+        from kikubot.config import DockerAgentConfig
+
+        workspace = tmp_path / name / "workspace"
+        workspace.mkdir(parents=True)
+        return DockerAgentConfig(
+            name=name,
+            container=f"{name}-ctn",
+            workspace_host_path=workspace,
+            claude_home_host_path=tmp_path / name / "claude-home",
+            ipc_dir=tmp_path / name / "ipc",
+            session_map_path=tmp_path / name / "session-map.json",
+        )
+
+    def test_tmux_binding_passes_through(self, mgr: SessionManager) -> None:
+        from pathlib import Path
+
+        assert mgr.resolve_agent_file_path("@12", "/tmp/foo.txt") == Path(
+            "/tmp/foo.txt"
+        )
+
+    def test_docker_workspace_path_resolves(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [agent])
+        resolved = mgr.resolve_agent_file_path(
+            "docker:assistant", "/workspace/outputs/x.png"
+        )
+        assert resolved == (agent.workspace_host_path / "outputs/x.png").resolve()
+
+    def test_docker_rejects_non_workspace(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """Attempts to send secrets or system files from the container
+        must be refused — this is the security perimeter."""
+        from kikubot import session as session_mod
+
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [agent])
+        for bad in [
+            "/auth/.credentials.json",
+            "/root/.ssh/id_rsa",
+            "/etc/passwd",
+            "/workspace-sibling/x",  # prefix-match style probing
+            "relative/path.txt",
+        ]:
+            assert mgr.resolve_agent_file_path("docker:assistant", bad) is None, bad
+
+    def test_docker_rejects_traversal(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """``/workspace/../auth/x`` must not escape workspace_host_path."""
+        from kikubot import session as session_mod
+
+        agent = self._agent(tmp_path)
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [agent])
+        assert (
+            mgr.resolve_agent_file_path("docker:assistant", "/workspace/../etc/passwd")
+            is None
+        )
+
+    def test_docker_unknown_agent_rejected(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(session_mod.config, "docker_agents", [])
+        assert mgr.resolve_agent_file_path("docker:ghost", "/workspace/x.png") is None
+
+
+class TestLoadSessionMapMergeNoop:
+    """Separate from TestLoadSessionMapMerge so the noop check stands alone."""
+
+    async def test_no_sources_is_noop(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """No session_map source anywhere → preserve window_states. Matches
+        the old early-return on first boot before any hook fires."""
+        from kikubot import session as session_mod
+
+        mgr.get_window_state("@7").session_id = "preserved"
+        monkeypatch.setattr(
+            session_mod.config, "session_map_file", tmp_path / "absent.json"
+        )
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", False)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [])
+
+        await mgr.load_session_map()
+        assert mgr.window_states["@7"].session_id == "preserved"
+
+
+class TestEncodeCwd:
+    def test_encoding_replaces_non_alnum(self, monkeypatch) -> None:
+        # Encoding only — symlink resolution is test_symlink_resolved's job.
+        # Letting the real _normalize_cwd run here made this assert the host's
+        # filesystem layout: on macOS /home is a firmlink, so the input came
+        # back as /System/Volumes/Data/home/... and the test failed for a
+        # reason that has nothing to do with encoding.
+        monkeypatch.setattr(SessionManager, "_normalize_cwd", staticmethod(lambda c: c))
+        assert SessionManager._encode_cwd("/home/user/a_b.c") == "-home-user-a-b-c"
+
+    def test_empty(self) -> None:
+        assert SessionManager._encode_cwd("") == ""
+
+    def test_symlink_resolved(self, tmp_path) -> None:
+        # Real directory and a symlink pointing to it must encode to the same
+        # string — otherwise Claude Code splits session history.
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        assert SessionManager._encode_cwd(str(link)) == SessionManager._encode_cwd(
+            str(real)
+        )
+
+    def test_normalize_missing_path_no_crash(self) -> None:
+        # realpath on a non-existent path just returns the absolute form —
+        # must not raise.
+        result = SessionManager._encode_cwd("/nonexistent/some/path")
+        assert result.startswith("-")
+
+
+class TestLoadSessionMapUnreadableSource:
+    """A session_map source that exists but fails to read/parse must not
+    trigger the stale-window_states cleanup — one corrupt or mid-write
+    file would otherwise wipe every tracked window in a single poll."""
+
+    async def test_corrupt_main_map_preserves_window_states(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        st = mgr.get_window_state("@7")
+        st.session_id = "sid-7"
+
+        main_map = tmp_path / "main.json"
+        main_map.write_text("{ this is not json")
+        monkeypatch.setattr(session_mod.config, "session_map_file", main_map)
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", False)
+
+        await mgr.load_session_map()
+
+        assert "@7" in mgr.window_states
+        assert mgr.window_states["@7"].session_id == "sid-7"
+
+    async def test_readable_empty_map_still_cleans_up(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        """Contrast case: a VALID map without the entry does clean up —
+        the guard keys on readability, not on emptiness."""
+        import json as json_mod
+
+        from kikubot import session as session_mod
+
+        st = mgr.get_window_state("@7")
+        st.session_id = "sid-7"
+
+        main_map = tmp_path / "main.json"
+        main_map.write_text(json_mod.dumps({}))
+        monkeypatch.setattr(session_mod.config, "session_map_file", main_map)
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", False)
+
+        await mgr.load_session_map()
+
+        assert "@7" not in mgr.window_states
+
+
+class TestPerAgentSessionMapSpoof:
+    """A per-agent session_map is written inside the container — untrusted.
+    Only the agent's own binding key may be ingested; a foreign docker:*
+    key would let a compromised agent overwrite another agent's state."""
+
+    def _agent(self, tmp_path, name="assistant"):
+        from kikubot.config import DockerAgentConfig
+
+        return DockerAgentConfig(
+            name=name,
+            container=f"{name}-ctn",
+            workspace_host_path=tmp_path / name / "workspace",
+            claude_home_host_path=tmp_path / name / "claude-home",
+            ipc_dir=tmp_path / name / "ipc",
+            session_map_path=tmp_path / name / "session-map.json",
+        )
+
+    async def test_foreign_key_in_agent_map_is_ignored(
+        self, mgr: SessionManager, tmp_path, monkeypatch
+    ) -> None:
+        import json as json_mod
+
+        from kikubot import session as session_mod
+
+        agent = self._agent(tmp_path, "assistant")
+        agent.session_map_path.parent.mkdir(parents=True, exist_ok=True)
+        agent.session_map_path.write_text(
+            json_mod.dumps(
+                {
+                    "docker:assistant": {
+                        # Long enough to pass is_valid_session_id — a malformed
+                        # id is dropped now (it would be interpolated into the
+                        # transcript path).
+                        "session_id": "own-sid-0001",
+                        "cwd": "/workspace",
+                        "window_name": "assistant",
+                    },
+                    "docker:admin": {
+                        "session_id": "EVIL",
+                        "cwd": "/pwned",
+                        "window_name": "admin",
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(
+            session_mod.config, "session_map_file", tmp_path / "absent.json"
+        )
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [agent])
+
+        await mgr.load_session_map()
+
+        assert mgr.window_states["docker:assistant"].session_id == "own-sid-0001"
+        assert "docker:admin" not in mgr.window_states
+
+
+class TestSendLockSerialization:
+    """Per-binding send lock: concurrent multi-step sends into one pane
+    must not interleave (chunked typing + Enter is a critical section);
+    different bindings must still run in parallel."""
+
+    class _FakeWindow:
+        window_id = "@1"
+
+    def _patch_transport(self, monkeypatch, events: list[str], delay: float = 0.01):
+        import asyncio as aio
+
+        from kikubot import session as session_mod
+
+        async def fake_find(window_id):
+            w = self._FakeWindow()
+            w.window_id = window_id
+            return w
+
+        async def fake_send(window_id, text):
+            events.append(f"start:{window_id}:{text}")
+            await aio.sleep(delay)
+            events.append(f"end:{window_id}:{text}")
+            return True
+
+        monkeypatch.setattr(session_mod.tmux_manager, "find_window_by_id", fake_find)
+        monkeypatch.setattr(session_mod.tmux_manager, "send_keys", fake_send)
+
+    async def test_same_binding_serializes(self, mgr: SessionManager, monkeypatch):
+        import asyncio as aio
+
+        events: list[str] = []
+        self._patch_transport(monkeypatch, events)
+
+        await aio.gather(
+            mgr.send_to_window("@1", "first"),
+            mgr.send_to_window("@1", "second"),
+        )
+
+        # Each send completes before the next begins.
+        assert [e.split(":")[0] for e in events] == ["start", "end", "start", "end"]
+
+    async def test_different_bindings_parallel(self, mgr: SessionManager, monkeypatch):
+        import asyncio as aio
+
+        events: list[str] = []
+        self._patch_transport(monkeypatch, events)
+
+        await aio.gather(
+            mgr.send_to_window("@1", "a"),
+            mgr.send_to_window("@2", "b"),
+        )
+
+        # Both started before either finished — no cross-binding serialization.
+        kinds = [e.split(":")[0] for e in events]
+        assert kinds[:2] == ["start", "start"]
+
+
+class TestRuntimeAwareBusyChecks:
+    """is_agent_working / agent_has_queued_input dispatch on WindowState.runtime,
+    so the same 'don't barge' call sites work for a Claude window and a Codex
+    window without an `if codex:` branch (CLAUDE.md 'runtime is a SECOND axis')."""
+
+    _SEP = "─" * 40
+    _CLAUDE_WORKING = f"✶ Orbiting… (3m 13s · esc to interrupt)\n{_SEP}\n  ❯ \n{_SEP}\n"
+    _CODEX_WORKING = (
+        "◦ Working (4s • esc to interrupt)\n"
+        "› Summarize recent commits\n"
+        "  gpt-5.5 medium · /home/user/project\n"
+    )
+    _CODEX_QUEUED = (
+        "◦ Working (7s • esc to interrupt)\n"
+        "• Messages to be submitted after next tool call "
+        "(press esc to interrupt and send immediately)\n"
+        "  gpt-5.5 medium · /home/user/project\n"
+    )
+
+    def _mgr(self):
+        from kikubot.session import WindowState
+
+        mgr = SessionManager()
+        mgr.window_states["@5"] = WindowState(runtime="claude")
+        mgr.window_states["@9"] = WindowState(runtime="codex")
+        return mgr
+
+    def test_window_runtime(self):
+        mgr = self._mgr()
+        assert mgr.window_runtime("@5") == "claude"
+        assert mgr.window_runtime("@9") == "codex"
+        # Unknown / docker binding with no state → default claude.
+        assert mgr.window_runtime("docker:x") == "claude"
+
+    def test_is_agent_working_dispatches(self):
+        mgr = self._mgr()
+        assert mgr.is_agent_working("@5", self._CLAUDE_WORKING) is True
+        assert mgr.is_agent_working("@9", self._CODEX_WORKING) is True
+        # Cross: the codex window's detector doesn't fire on Claude chrome
+        # (no ─ separator match), and Claude's doesn't fire on the codex pane.
+        assert mgr.is_agent_working("@9", self._CLAUDE_WORKING) is False
+        assert mgr.is_agent_working("@5", self._CODEX_WORKING) is False
+
+    def test_empty_pane_not_working(self):
+        mgr = self._mgr()
+        assert mgr.is_agent_working("@9", None) is False
+        assert mgr.is_agent_working("@9", "") is False
+
+    def test_agent_has_queued_input_dispatches(self):
+        mgr = self._mgr()
+        assert mgr.agent_has_queued_input("@9", self._CODEX_QUEUED) is True
+        assert mgr.agent_has_queued_input("@9", self._CODEX_WORKING) is False
+        assert mgr.agent_has_queued_input("@9", None) is False
+
+
+class TestSendComposerImage:
+    """Codex image delivery: type path → WAIT for the idle auto-convert to
+    [Image #N] (NO Enter — an Enter would submit the image alone) → caption →
+    ONE Enter (submit), all under one send_lock via the tmux primitives."""
+
+    @pytest.mark.asyncio
+    async def test_deterministic_attach_sequence(self, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kikubot.session import WindowState
+        import kikubot.session as sess
+
+        mgr = SessionManager()
+        mgr.window_states["@9"] = WindowState(runtime="codex")
+
+        tm = MagicMock()
+        tm.find_window_by_id = AsyncMock(return_value=MagicMock(window_id="w9"))
+        tm.send_keys = AsyncMock(return_value=True)
+        # pane already shows the attach token → the wait poll breaks at once.
+        tm.capture_pane = AsyncMock(return_value="› [Image #1]\n  model · dir\n")
+        monkeypatch.setattr(sess, "tmux_manager", tm)
+        monkeypatch.setattr(sess.asyncio, "sleep", AsyncMock())
+
+        ok = await mgr.send_composer_image("@9", "/tmp/x.png", "what is this")
+        assert ok is True
+
+        sends = [(c.args[1], c.kwargs) for c in tm.send_keys.await_args_list]
+        # path (literal, no enter) → caption (literal) → ONE Enter. Crucially NO
+        # Enter between path and caption — that premature Enter submitted the
+        # image alone and split the caption into a second turn (the bug).
+        assert sends == [
+            ("/tmp/x.png", {"enter": False, "literal": True}),
+            (" what is this", {"enter": False, "literal": True}),
+            ("Enter", {"enter": False, "literal": False}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_no_caption_single_submit(self, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kikubot.session import WindowState
+        import kikubot.session as sess
+
+        mgr = SessionManager()
+        mgr.window_states["@9"] = WindowState(runtime="codex")
+        tm = MagicMock()
+        tm.find_window_by_id = AsyncMock(return_value=MagicMock(window_id="w9"))
+        tm.send_keys = AsyncMock(return_value=True)
+        tm.capture_pane = AsyncMock(return_value="› [Image #1]\n")
+        monkeypatch.setattr(sess, "tmux_manager", tm)
+        monkeypatch.setattr(sess.asyncio, "sleep", AsyncMock())
+
+        ok = await mgr.send_composer_image("@9", "/tmp/x.png", "")
+        assert ok is True
+        sends = [c.args[1] for c in tm.send_keys.await_args_list]
+        # image-only: path, then ONE Enter (submit). No stray extra Enter.
+        assert sends == ["/tmp/x.png", "Enter"]
+
+    @pytest.mark.asyncio
+    async def test_missing_window_returns_false(self, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        import kikubot.session as sess
+
+        mgr = SessionManager()
+        tm = MagicMock()
+        tm.find_window_by_id = AsyncMock(return_value=None)
+        monkeypatch.setattr(sess, "tmux_manager", tm)
+        assert await mgr.send_composer_image("@9", "/tmp/x.png", "cap") is False
+
+
+class TestDockerSubAgents:
+    """Sub-agents: ``docker:<agent>/<slug>`` — a second Claude Code in the SAME
+    container. They share the parent's container, /workspace mount and
+    claude-home; only the in-container tmux session differs.
+    """
+
+    @pytest.fixture
+    def agent(self, monkeypatch):
+        from pathlib import Path
+
+        from kikubot import session as session_mod
+        from kikubot.config import DockerAgentConfig
+
+        cfg = DockerAgentConfig(
+            name="assistant",
+            container="assistant-ctn",
+            workspace_host_path=Path("/tmp/ws"),
+            claude_home_host_path=Path("/tmp/ch"),
+            ipc_dir=Path("/tmp/ipc"),
+            session_map_path=Path("/tmp/sm.json"),
+        )
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [cfg])
+        return cfg
+
+    def test_split_main_binding(self) -> None:
+        assert SessionManager.split_docker_binding("docker:assistant") == (
+            "assistant",
+            None,
+        )
+
+    def test_split_sub_binding(self) -> None:
+        assert SessionManager.split_docker_binding("docker:assistant/fitness") == (
+            "assistant",
+            "fitness",
+        )
+
+    def test_split_rejects_bad_slug(self) -> None:
+        # The slug lands in a tmux session name and a session_map key written
+        # from inside the container — anything off-shape is refused outright.
+        for bad in (
+            "docker:assistant/",
+            "docker:assistant/-x",
+            "docker:assistant/A B",
+            "docker:/x",
+        ):
+            assert SessionManager.split_docker_binding(bad) is None
+
+    def test_split_non_docker(self) -> None:
+        assert SessionManager.split_docker_binding("@12") is None
+
+    def test_find_sub_binding_both_spellings(self, mgr: SessionManager, agent) -> None:
+        # /bind takes the binding spelling and the topic spelling alike.
+        mgr.window_states["docker:assistant/notes"] = WindowState()
+        for name in ("assistant/notes", "assistant-notes", "Assistant-Notes"):
+            assert mgr.find_sub_agent_binding(name) == "docker:assistant/notes"
+
+    def test_find_sub_binding_unknown_slug(self, mgr: SessionManager, agent) -> None:
+        # kikubot is the only creator of siblings — a slug it never made (or
+        # already tore down) must not conjure a binding.
+        assert mgr.find_sub_agent_binding("assistant-notes") is None
+        assert mgr.find_sub_agent_binding("assistant/notes") is None
+        assert mgr.find_sub_agent_binding("nosuch-notes") is None
+
+    def test_find_sub_binding_rejects_bad_slug(
+        self, mgr: SessionManager, agent
+    ) -> None:
+        mgr.window_states["docker:assistant/A B"] = WindowState()
+        assert mgr.find_sub_agent_binding("assistant/A B") is None
+
+    def test_is_sub_agent(self, mgr: SessionManager) -> None:
+        assert mgr.is_docker_sub_agent("docker:assistant/fitness") is True
+        assert mgr.is_docker_sub_agent("docker:assistant") is False
+        assert mgr.is_docker_sub_agent("@12") is False
+
+    def test_resolve_target_main(self, mgr: SessionManager, agent) -> None:
+        target = mgr.resolve_docker_target("docker:assistant")
+        assert target is not None
+        assert target.agent is agent and target.tmux_session == "claude"
+        assert target.sub is None
+
+    def test_resolve_target_sub_shares_agent(self, mgr: SessionManager, agent) -> None:
+        target = mgr.resolve_docker_target("docker:assistant/fitness")
+        assert target is not None
+        assert target.agent is agent  # same container, workspace, claude-home
+        assert target.tmux_session == "claude-fitness"
+        assert target.sub == "fitness"
+
+    def test_resolve_target_unknown_agent(self, mgr: SessionManager, agent) -> None:
+        assert mgr.resolve_docker_target("docker:nope/x") is None
+
+    async def test_send_routes_to_sub_session(
+        self, mgr: SessionManager, agent, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        sends: list[dict] = []
+
+        async def fake_send(container, text, **kw):
+            sends.append({"container": container, "text": text, **kw})
+            return True
+
+        monkeypatch.setattr(session_mod.docker_driver, "send_keys", fake_send)
+        monkeypatch.setattr(
+            session_mod.docker_driver,
+            "is_container_alive",
+            AsyncMock(return_value=True),
+        )
+        ok, _ = await mgr.send_to_window("docker:assistant/fitness", "hi")
+        assert ok is True
+        assert sends[0]["container"] == "assistant-ctn"
+        assert sends[0]["session"] == "claude-fitness"
+
+    async def test_kill_targets_only_the_sub_session(
+        self, mgr: SessionManager, agent, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        killed: list[dict] = []
+
+        async def fake_kill(container, session=None):
+            killed.append({"container": container, "session": session})
+            return True
+
+        monkeypatch.setattr(session_mod.docker_driver, "kill_session", fake_kill)
+        monkeypatch.setattr(
+            session_mod.docker_driver,
+            "is_container_alive",
+            AsyncMock(return_value=True),
+        )
+        assert await mgr.kill_agent("docker:assistant/fitness") is True
+        # NOT the container's main `claude` session — that would take the
+        # parent agent down with the sibling.
+        assert killed == [{"container": "assistant-ctn", "session": "claude-fitness"}]
+
+    def test_file_marker_maps_to_parent_workspace(
+        self, mgr: SessionManager, agent
+    ) -> None:
+        from pathlib import Path
+
+        got = mgr.resolve_agent_file_path(
+            "docker:assistant/fitness", "/workspace/a.txt"
+        )
+        # Compare resolved: the perimeter resolves the path to defeat `..`
+        # traversal, and on macOS /tmp is itself a symlink to /private/tmp.
+        assert got == Path("/tmp/ws/a.txt").resolve()
+        # The whitelist stays just as strict for a sub-agent.
+        assert (
+            mgr.resolve_agent_file_path("docker:assistant/fitness", "/auth/x") is None
+        )
+
+    def test_projects_root_is_the_parents(self, mgr: SessionManager, agent) -> None:
+        from pathlib import Path
+
+        assert mgr._projects_root_for_binding("docker:assistant/fitness") == Path(
+            "/tmp/ch/projects"
+        )
+
+    async def test_start_pins_session_and_names_the_agent(
+        self, mgr: SessionManager, agent, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        started: list[dict] = []
+
+        async def fake_start(container, **kw):
+            started.append({"container": container, **kw})
+            return True
+
+        monkeypatch.setattr(session_mod.docker_driver, "start_session", fake_start)
+        monkeypatch.setattr(
+            session_mod.docker_driver,
+            "is_container_alive",
+            AsyncMock(return_value=True),
+        )
+        sid = "11111111-2222-3333-4444-555555555555"
+        ok = await mgr.start_docker_agent(
+            "docker:assistant/fitness", new_session_id=sid
+        )
+        assert ok is True
+        call = started[0]
+        assert call["session"] == "claude-fitness"
+        assert call["new_session_id"] == sid
+        # The per-session AGENT_NAME is what makes the container's hook write
+        # THIS binding's key instead of the parent's.
+        assert call["env"] == {"AGENT_NAME": "assistant/fitness"}
+        # Pinned id is recorded at once — no waiting on the hook.
+        assert mgr.window_states["docker:assistant/fitness"].session_id == sid
+
+    async def test_taken_slugs_merges_bindings_and_container(
+        self, mgr: SessionManager, agent, monkeypatch
+    ) -> None:
+        from kikubot import session as session_mod
+
+        mgr.bind_thread(100, 1, "docker:assistant/bound")
+        monkeypatch.setattr(
+            session_mod.docker_driver,
+            "list_sessions",
+            AsyncMock(return_value=["claude", "claude-live", "other"]),
+        )
+        taken = await mgr.taken_sub_slugs("assistant")
+        assert taken == {"bound", "live"}
+
+    def test_can_offer_sibling(self, mgr: SessionManager, agent) -> None:
+        from kikubot.session import WindowState
+
+        assert mgr.can_offer_sibling("docker:assistant") is True
+        mgr.window_states["@1"] = WindowState(cwd="/home/u/p")
+        assert mgr.can_offer_sibling("@1") is True
+        # A hookless runtime resolves its transcript by cwd — two of its
+        # windows on one directory would mirror each other.
+        mgr.window_states["@2"] = WindowState(cwd="/home/u/p", runtime="codex")
+        assert mgr.can_offer_sibling("@2") is False
+        # Nothing known about the window → nothing to clone.
+        assert mgr.can_offer_sibling("@3") is False
+
+    def test_forget_binding_drops_state(self, mgr: SessionManager) -> None:
+        from kikubot.session import WindowState
+
+        mgr.window_states["docker:assistant/fitness"] = WindowState(session_id="s")
+        mgr.window_display_names["docker:assistant/fitness"] = "assistant-fitness"
+        mgr.forget_binding("docker:assistant/fitness")
+        assert "docker:assistant/fitness" not in mgr.window_states
+        assert "docker:assistant/fitness" not in mgr.window_display_names
+
+    def test_docker_session_map_only_docker_rows(self, mgr: SessionManager) -> None:
+        from kikubot.session import WindowState
+
+        mgr.window_states["@1"] = WindowState(session_id="tmux-sid")
+        mgr.window_states["docker:assistant"] = WindowState(session_id="main-sid")
+        mgr.window_states["docker:assistant/fitness"] = WindowState(
+            session_id="sub-sid"
+        )
+        mgr.window_states["docker:assistant/empty"] = WindowState()
+        assert mgr.docker_session_map() == {
+            "docker:assistant": "main-sid",
+            "docker:assistant/fitness": "sub-sid",
+        }
+
+
+class TestSubAgentSessionMapIngestion:
+    """The per-agent map file is written INSIDE the container (untrusted) and
+    is typically rewritten whole with a single key. Both facts shape what
+    load_session_map accepts and what it is allowed to forget.
+    """
+
+    @pytest.fixture
+    def mgr_with_agent(self, mgr, tmp_path, monkeypatch):
+        from kikubot import session as session_mod
+        from kikubot.config import DockerAgentConfig
+
+        cfg = DockerAgentConfig(
+            name="assistant",
+            container="assistant-ctn",
+            workspace_host_path=tmp_path / "ws",
+            claude_home_host_path=tmp_path / "ch",
+            ipc_dir=tmp_path / "ipc",
+            session_map_path=tmp_path / "sm.json",
+        )
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", [cfg])
+        monkeypatch.setattr(session_mod.config, "active_docker_agents", lambda: [cfg])
+        monkeypatch.setattr(
+            session_mod.config, "session_map_file", tmp_path / "main-map.json"
+        )
+        return mgr, cfg
+
+    async def test_sub_key_is_accepted_for_a_known_sibling(
+        self, mgr_with_agent
+    ) -> None:
+        mgr, cfg = mgr_with_agent
+        # kikubot created this sibling, so the row exists before the hook fires.
+        mgr.window_states["docker:assistant/fitness"] = WindowState(
+            session_id="sub-sid-0001", cwd="/workspace"
+        )
+        cfg.session_map_path.write_text(
+            json.dumps(
+                {
+                    "docker:assistant/fitness": {
+                        "session_id": "sub-sid-0002",
+                        "cwd": "/workspace",
+                    }
+                }
+            )
+        )
+        await mgr.load_session_map()
+        assert (
+            mgr.window_states["docker:assistant/fitness"].session_id == "sub-sid-0002"
+        )
+
+    async def test_unknown_sub_key_is_ignored(self, mgr_with_agent) -> None:
+        """Only kikubot creates siblings. A sub key it never heard of is a
+        container inventing rows — and docker rows are exempt from the stale
+        sweep, so they would accumulate (and keep dead sessions monitored)."""
+        mgr, cfg = mgr_with_agent
+        cfg.session_map_path.write_text(
+            json.dumps(
+                {
+                    f"docker:assistant/ghost{i}": {
+                        "session_id": f"ghost-sid-{i:04d}",
+                        "cwd": "/workspace",
+                    }
+                    for i in range(5)
+                }
+            )
+        )
+        await mgr.load_session_map()
+        assert not [k for k in mgr.window_states if k.startswith("docker:assistant/")]
+
+    async def test_malformed_session_id_is_ignored(self, mgr_with_agent) -> None:
+        """The id lands in `<projects>/<cwd>/<id>.jsonl` — a path-shaped value
+        would read a transcript outside the agent's own claude-home."""
+        mgr, cfg = mgr_with_agent
+        cfg.session_map_path.write_text(
+            json.dumps(
+                {
+                    "docker:assistant": {
+                        "session_id": "../../../elsewhere/00000000-1111-2222",
+                        "cwd": "/workspace",
+                    }
+                }
+            )
+        )
+        await mgr.load_session_map()
+        assert "docker:assistant" not in mgr.window_states
+
+    async def test_another_agents_key_is_rejected(self, mgr_with_agent) -> None:
+        mgr, cfg = mgr_with_agent
+        cfg.session_map_path.write_text(
+            json.dumps({"docker:other/x": {"session_id": "spoof", "cwd": "/workspace"}})
+        )
+        await mgr.load_session_map()
+        assert "docker:other/x" not in mgr.window_states
+
+    async def test_parent_key_cannot_steal_a_subs_session(self, mgr_with_agent) -> None:
+        """A container hook that hardcodes its agent name reports the SUB's
+        session under the PARENT's key — which would re-point the parent topic
+        at its child's transcript."""
+        mgr, cfg = mgr_with_agent
+        mgr.window_states["docker:assistant/fitness"] = WindowState(
+            session_id="sub-sid-0001", cwd="/workspace"
+        )
+        mgr.window_states["docker:assistant"] = WindowState(
+            session_id="main-sid-001", cwd="/workspace"
+        )
+        cfg.session_map_path.write_text(
+            json.dumps(
+                {"docker:assistant": {"session_id": "sub-sid", "cwd": "/workspace"}}
+            )
+        )
+        await mgr.load_session_map()
+        assert mgr.window_states["docker:assistant"].session_id == "main-sid-001"
+
+    async def test_docker_rows_survive_a_map_that_lost_them(
+        self, mgr_with_agent
+    ) -> None:
+        """Sibling started → the hook rewrote the file with only ITS key. The
+        parent must stay tracked; absence in that file proves nothing."""
+        mgr, cfg = mgr_with_agent
+        mgr.window_states["docker:assistant"] = WindowState(
+            session_id="main-sid-001", cwd="/workspace"
+        )
+        mgr.window_states["docker:assistant/fitness"] = WindowState(
+            session_id="sub-sid-0001", cwd="/workspace"
+        )
+        cfg.session_map_path.write_text(
+            json.dumps(
+                {
+                    "docker:assistant/fitness": {
+                        "session_id": "sub-sid-0002",
+                        "cwd": "/workspace",
+                    }
+                }
+            )
+        )
+        await mgr.load_session_map()
+        assert mgr.window_states["docker:assistant"].session_id == "main-sid-001"
+        assert (
+            mgr.window_states["docker:assistant/fitness"].session_id == "sub-sid-0002"
+        )
+
+    async def test_sub_display_name_is_not_overwritten_by_the_hook(
+        self, mgr_with_agent
+    ) -> None:
+        mgr, cfg = mgr_with_agent
+        mgr.window_states["docker:assistant/fitness"] = WindowState(cwd="/workspace")
+        mgr.window_display_names["docker:assistant/fitness"] = "assistant-fitness"
+        cfg.session_map_path.write_text(
+            json.dumps(
+                {
+                    "docker:assistant/fitness": {
+                        "session_id": "sub-sid-0003",
+                        "cwd": "/workspace",
+                        "window_name": "assistant/fitness",
+                    }
+                }
+            )
+        )
+        await mgr.load_session_map()
+        assert (
+            mgr.window_display_names["docker:assistant/fitness"] == "assistant-fitness"
+        )
+
+
+class TestSubAgentTopics:
+    """Only agents kikubot created as extras (➕ sibling, docker sub-agent) may
+    be deleted from the panel — see SessionManager.can_delete_agent."""
+
+    def test_unflagged_topic_is_not_deletable(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "@7")
+        assert mgr.can_delete_agent("@7") is False
+
+    def test_flagged_topic_is_deletable(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "@7")
+        mgr.mark_sub_agent_topic(100, 42)
+        assert mgr.is_sub_agent_topic(100, 42) is True
+        assert mgr.can_delete_agent("@7") is True
+
+    def test_flag_is_per_topic(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "@7")
+        mgr.bind_thread(100, 43, "@8")
+        mgr.mark_sub_agent_topic(100, 42)
+        assert mgr.can_delete_agent("@8") is False
+
+    def test_clear_drops_the_flag(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "@7")
+        mgr.mark_sub_agent_topic(100, 42)
+        mgr.clear_sub_agent_topic(100, 42)
+        assert mgr.can_delete_agent("@7") is False
+
+    def test_docker_sub_agent_needs_no_flag(self, mgr: SessionManager) -> None:
+        assert mgr.can_delete_agent("docker:assistant/notes") is True
+
+    def test_docker_main_agent_is_not_deletable(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 42, "docker:assistant")
+        assert mgr.can_delete_agent("docker:assistant") is False
+
+
+class TestLiveWindowForSession:
+    """One process per session: the --resume guard finds a LIVE window only."""
+
+    SID = "ea000000-0000-4000-8000-000000000000"
+
+    async def test_live_window_found_dead_one_ignored(self, mgr, monkeypatch):
+        from kikubot import tmux_manager as tm_mod
+
+        mgr.window_states["@4"] = WindowState(session_id=self.SID)
+        mgr.window_states["@7"] = WindowState(session_id="other")
+        live = {"@4"}
+        monkeypatch.setattr(
+            tm_mod.tmux_manager,
+            "find_window_by_id",
+            AsyncMock(side_effect=lambda w: object() if w in live else None),
+        )
+        assert await mgr.live_window_for_session(self.SID) == "@4"
+        live.clear()
+        assert await mgr.live_window_for_session(self.SID) is None
+
+
+class TestConfirmSubmitted:
+    """A typed message whose Enter got swallowed gets Enter again; one that
+    never leaves the box is reported, not claimed as sent."""
+
+    async def _run(self, mgr, monkeypatch, held: list[bool]):
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(session_mod, "SUBMIT_CHECK_DELAY", 0)
+        states = iter(held)
+        monkeypatch.setattr(mgr, "capture_pane", AsyncMock(return_value="pane"))
+        rt = type("RT", (), {"unsent_in_composer": lambda self, p, t: next(states)})()
+        monkeypatch.setattr(session_mod, "get_runtime", lambda name: rt)
+        press = AsyncMock(return_value=True)
+        monkeypatch.setattr(mgr, "_send_keys_unlocked", press)
+        ok = await mgr._confirm_submitted("@1", "hello")
+        return ok, press
+
+    async def test_clean_submit_presses_nothing(self, mgr, monkeypatch):
+        ok, press = await self._run(mgr, monkeypatch, [False])
+        assert ok is True
+        press.assert_not_awaited()
+
+    async def test_swallowed_enter_is_repeated(self, mgr, monkeypatch):
+        ok, press = await self._run(mgr, monkeypatch, [True, False])
+        assert ok is True
+        press.assert_awaited_once_with("@1", "Enter", enter=False, literal=False)
+
+    async def test_stuck_box_reported_after_retries(self, mgr, monkeypatch):
+        ok, press = await self._run(mgr, monkeypatch, [True, True, True])
+        assert ok is False
+        assert press.await_count == 2
+
+
+class TestDockerAgentForDir:
+    """A container agent's workspace is recognised (realpath-equal), so no
+    host window is started on the same files."""
+
+    def test_workspace_matches_and_others_do_not(self, mgr, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        from kikubot import session as session_mod
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (tmp_path / "link").symlink_to(ws)
+        agent = SimpleNamespace(name="agent", workspace_host_path=ws)
+        monkeypatch.setattr(session_mod.config, "active_docker_agents", lambda: [agent])
+        assert mgr.docker_agent_for_dir(str(ws)) == "agent"
+        assert mgr.docker_agent_for_dir(str(tmp_path / "link")) == "agent"
+        assert mgr.docker_agent_for_dir(str(tmp_path)) is None
+
+
+class TestVoiceLedgerFile:
+    """The TTS ledger is a flock-guarded file shared by every process."""
+
+    @pytest.fixture
+    def ledger_dir(self, tmp_path, monkeypatch):
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(session_mod.config, "config_dir", tmp_path)
+        monkeypatch.setattr(session_mod.config, "tts_daily_budget_usd", 1.0)
+        return tmp_path
+
+    def test_two_managers_share_one_budget(self, ledger_dir, monkeypatch) -> None:
+        """A stale second bot process must not get a second budget."""
+        from kikubot.voice.safety import DENY_BUDGET, SpendDenied
+
+        monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+        monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+        a, b = SessionManager(), SessionManager()
+        a.tts_reserve(0.6, 10)
+        with pytest.raises(SpendDenied) as exc:
+            b.tts_reserve(0.6, 10)
+        assert exc.value.reason == DENY_BUDGET
+
+    def test_reservation_is_on_disk_before_call(self, ledger_dir, mgr) -> None:
+        mgr.tts_reserve(0.25, 10)
+        on_disk = json.loads((ledger_dir / "voice_ledger.json").read_text())
+        assert on_disk["spent_usd"] == pytest.approx(0.25)
+        assert on_disk["calls"] == 1
+
+    def test_breaker_trip_is_persisted(self, ledger_dir, mgr) -> None:
+        from kikubot.voice.safety import MAX_CALLS_PER_MINUTE, SpendDenied
+
+        with pytest.raises(SpendDenied):
+            for _ in range(MAX_CALLS_PER_MINUTE + 1):
+                mgr.tts_reserve(0.001, 1)
+        on_disk = json.loads((ledger_dir / "voice_ledger.json").read_text())
+        assert on_disk["tripped"]
+
+    def test_corrupt_ledger_fails_closed(self, ledger_dir, mgr) -> None:
+        (ledger_dir / "voice_ledger.json").write_text("{not json")
+        with pytest.raises(ValueError):
+            mgr.tts_reserve(0.01, 1)

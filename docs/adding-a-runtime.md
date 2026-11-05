@@ -1,6 +1,6 @@
 # Adding an agent runtime
 
-ccbot can drive any terminal AI agent, not just Claude Code — Codex is the
+kikubot can drive any terminal AI agent, not just Claude Code — Codex is the
 built-in second runtime and the reference for everything below. A *runtime* is
 the CLI a topic's window runs; it is orthogonal to the *transport* (tmux
 window vs docker container). All runtime-specific behavior lives in one class:
@@ -12,7 +12,7 @@ pick it up automatically.
 
 Two hard requirements, check them before writing any code:
 
-1. **It runs as an interactive TUI inside tmux.** ccbot types into the pane
+1. **It runs as an interactive TUI inside tmux.** kikubot types into the pane
    and screenshots it; a pure batch CLI won't work.
 2. **It writes session transcripts to files on disk** (JSONL or similar, in a
    discoverable location). The monitor is a file poller — an agent that keeps
@@ -24,7 +24,7 @@ like Codex).
 
 ## The contract, member by member
 
-Subclass `AgentRuntime` in `src/ccbot/runtimes.py` and register the singleton
+Subclass `AgentRuntime` in `src/kikubot/runtimes.py` and register the singleton
 in `RUNTIMES`. Everything not listed here inherits a sane Claude-shaped
 default.
 
@@ -34,7 +34,7 @@ default.
 | --- | --- |
 | `name` | Stable id persisted in `WindowState.runtime` and env config. |
 | `display_name`, `picker_icon` | Label + emoji on the session-picker tab. |
-| `cli_command()` | Configured launch command (add a `Config` field with a `CCBOT_*`/env override). First token is probed by `is_available()` — no binary ⇒ no picker tab, zero config needed. |
+| `cli_command()` | Configured launch command (add a `Config` field with a `KIKUBOT_*`/env override). First token is probed by `is_available()` — no binary ⇒ no picker tab, zero config needed. |
 
 **Lifecycle**
 
@@ -93,10 +93,10 @@ sleep 10 && tmux capture-pane -t probe -p     # idle state
 # ...ask it something long-running, capture the busy state, menus, etc.
 ```
 
-Pin every captured layout in tests (see `tests/ccbot/test_runtimes.py` and
+Pin every captured layout in tests (see `tests/kikubot/test_runtimes.py` and
 `test_terminal_parser.py` — fixtures are string literals of real panes,
 **sanitized**: no real paths, names or session ids; this repo is public).
-Note the CLI version you captured against: agent CLIs self-update, and ccbot's
+Note the CLI version you captured against: agent CLIs self-update, and kikubot's
 version canary (`_check_runtime_versions`) will warn when the installed
 version drifts from the captured one.
 

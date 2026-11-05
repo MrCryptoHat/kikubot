@@ -69,28 +69,33 @@ venv.bak/
 # Project specific
 .uv/
 
-# --- Server-specific plugins (private ccbot-plugins overlay) ---
+# The package dir before the rename: a plugin checkout's leftover links
+# (remove with src/kikubot/legacy.py).
+/src/ccbot/
+/tests/ccbot/
+
+# --- Server-specific plugins (private kikubot-plugins overlay) ---
 # Symlinked/checked out here on a configured deployment; NEVER committed to
-# the public tree. Activated via CCBOT_PLUGINS in .env. See ccbot-plugins.
-/src/ccbot/wamcp
-/src/ccbot/tgmcp
-/src/ccbot/mail
-/src/ccbot/drive
-/src/ccbot/fleet
-/src/ccbot/topicicons
-/src/ccbot/alertsru
-/tests/ccbot/wamcp
-/tests/ccbot/tgmcp
-/tests/ccbot/test_mail_notifier.py
-/tests/ccbot/test_mail_wake.py
-/tests/ccbot/test_mail_plugin.py
-/tests/ccbot/test_mail_gateway.py
-/tests/ccbot/test_mail_approval.py
-/tests/ccbot/test_mail_window_wake.py
-/tests/ccbot/test_drive.py
-/tests/ccbot/test_fleet_live_board.py
-/tests/ccbot/test_topicicons.py
-/tests/ccbot/test_alertsru.py
+# the public tree. Activated via KIKUBOT_PLUGINS in .env. See kikubot-plugins.
+/src/kikubot/wamcp
+/src/kikubot/tgmcp
+/src/kikubot/mail
+/src/kikubot/drive
+/src/kikubot/fleet
+/src/kikubot/topicicons
+/src/kikubot/alertsru
+/tests/kikubot/wamcp
+/tests/kikubot/tgmcp
+/tests/kikubot/test_mail_notifier.py
+/tests/kikubot/test_mail_wake.py
+/tests/kikubot/test_mail_plugin.py
+/tests/kikubot/test_mail_gateway.py
+/tests/kikubot/test_mail_approval.py
+/tests/kikubot/test_mail_window_wake.py
+/tests/kikubot/test_drive.py
+/tests/kikubot/test_fleet_live_board.py
+/tests/kikubot/test_topicicons.py
+/tests/kikubot/test_alertsru.py
 /.claude/rules/wamcp-integration.md
 /.claude/rules/tgmcp-integration.md
 /.claude/rules/plugin-development.md

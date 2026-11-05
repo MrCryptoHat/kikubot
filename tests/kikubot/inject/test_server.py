@@ -1,0 +1,279 @@
+"""Integration tests for inject.server using aiohttp's test client.
+
+Covers the full status-code matrix: token auth, bad JSON / bad text,
+allowlist gate (403 forbidden_agent) vs not-running (503 not_running),
+empty-after-sanitize, reject-if-busy, unavailable, send failure, and the
+success path for both docker and host-tmux bindings (including that the
+text actually pushed is the sanitized form — leading "!" defused).
+
+Agent-name → binding resolution is stubbed via
+``session_manager.resolve_agent_binding`` (its own logic is unit-tested in
+test_session.py); these tests pin only what the HTTP layer does with each
+resolution outcome.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import pytest
+import pytest_asyncio
+from aiohttp.test_utils import TestClient, TestServer
+
+from kikubot.config import InjectConfig
+from kikubot.inject.server import build_app
+
+_TOKEN = "s3cret"
+_HDR = {"X-Inject-Token": _TOKEN}
+_RESOLVE = "kikubot.inject.server.session_manager.resolve_agent_binding"
+_CAPTURE = "kikubot.inject.server.session_manager.capture_pane"
+_SEND = "kikubot.inject.server.session_manager.send_to_window"
+
+
+def _cfg(
+    tmp_path: Path, *, agents: frozenset[str] = frozenset({"assistant", "example.com"})
+) -> InjectConfig:
+    return InjectConfig(
+        token=_TOKEN,
+        socket_path=tmp_path / "inject.sock",
+        allowed_agents=agents,
+    )
+
+
+@pytest_asyncio.fixture
+async def client(tmp_path: Path) -> AsyncGenerator[TestClient, None]:
+    app = build_app(_cfg(tmp_path))
+    async with TestClient(TestServer(app)) as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_missing_token_unauthorized(client: TestClient) -> None:
+    r = await client.post("/inject", json={"agent": "assistant", "text": "hi"})
+    assert r.status == 401
+
+
+@pytest.mark.asyncio
+async def test_wrong_token_unauthorized(client: TestClient) -> None:
+    r = await client.post(
+        "/inject",
+        json={"agent": "assistant", "text": "hi"},
+        headers={"X-Inject-Token": "nope"},
+    )
+    assert r.status == 401
+
+
+@pytest.mark.asyncio
+async def test_bad_json_returns_400(client: TestClient) -> None:
+    r = await client.post(
+        "/inject",
+        data=b"not-json",
+        headers={**_HDR, "Content-Type": "application/json"},
+    )
+    assert r.status == 400
+
+
+@pytest.mark.asyncio
+async def test_non_string_text_returns_400(client: TestClient) -> None:
+    r = await client.post(
+        "/inject", json={"agent": "assistant", "text": 123}, headers=_HDR
+    )
+    assert r.status == 400
+    assert (await r.json())["error"] == "bad_text"
+
+
+@pytest.mark.asyncio
+async def test_agent_not_in_allowlist_forbidden(client: TestClient) -> None:
+    r = await client.post(
+        "/inject", json={"agent": "kikubot", "text": "hi"}, headers=_HDR
+    )
+    assert r.status == 403
+    assert (await r.json())["error"] == "forbidden_agent"
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_but_not_running_returns_503(client: TestClient) -> None:
+    # In the allowlist, but resolves to no binding (no docker agent, no live
+    # tmux window) → the agent isn't up. Distinct from forbidden_agent.
+    with patch(_RESOLVE, new=AsyncMock(return_value=None)):
+        r = await client.post(
+            "/inject", json={"agent": "example.com", "text": "hi"}, headers=_HDR
+        )
+    assert r.status == 503
+    assert (await r.json())["error"] == "not_running"
+
+
+@pytest.mark.asyncio
+async def test_empty_after_sanitize_returns_400(client: TestClient) -> None:
+    with patch(_RESOLVE, new=AsyncMock(return_value="docker:assistant")):
+        r = await client.post(
+            "/inject", json={"agent": "assistant", "text": "\x1b\r\x00"}, headers=_HDR
+        )
+    assert r.status == 400
+    assert (await r.json())["error"] == "empty_text"
+
+
+@pytest.mark.asyncio
+async def test_busy_returns_409(client: TestClient) -> None:
+    with (
+        patch(_RESOLVE, new=AsyncMock(return_value="docker:assistant")),
+        patch(_CAPTURE, new=AsyncMock(return_value="… (5s · esc to interrupt)")),
+        patch(
+            "kikubot.inject.server.session_manager.is_agent_working", return_value=True
+        ),
+    ):
+        r = await client.post(
+            "/inject", json={"agent": "assistant", "text": "hi"}, headers=_HDR
+        )
+    assert r.status == 409
+    assert (await r.json())["error"] == "busy"
+
+
+@pytest.mark.asyncio
+async def test_unreachable_pane_returns_503_unavailable(client: TestClient) -> None:
+    with (
+        patch(_RESOLVE, new=AsyncMock(return_value="docker:assistant")),
+        patch(_CAPTURE, new=AsyncMock(return_value=None)),
+    ):
+        r = await client.post(
+            "/inject", json={"agent": "assistant", "text": "hi"}, headers=_HDR
+        )
+    assert r.status == 503
+    assert (await r.json())["error"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_send_failure_returns_503_unavailable(client: TestClient) -> None:
+    with (
+        patch(_RESOLVE, new=AsyncMock(return_value="docker:assistant")),
+        patch(_CAPTURE, new=AsyncMock(return_value="idle")),
+        patch(_SEND, new=AsyncMock(return_value=(False, "Container not running"))),
+    ):
+        r = await client.post(
+            "/inject", json={"agent": "assistant", "text": "hi"}, headers=_HDR
+        )
+    assert r.status == 503
+    assert (await r.json())["error"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_success_docker_injects_sanitized_text(client: TestClient) -> None:
+    send_mock = AsyncMock(return_value=(True, "ok"))
+    with (
+        patch(_RESOLVE, new=AsyncMock(return_value="docker:assistant")),
+        patch(_CAPTURE, new=AsyncMock(return_value="idle prompt")),
+        patch(_SEND, new=send_mock),
+    ):
+        # Leading "!" must be defused before it reaches send_to_window.
+        r = await client.post(
+            "/inject",
+            json={"agent": "assistant", "text": "!купи молоко"},
+            headers=_HDR,
+        )
+    assert r.status == 200
+    assert (await r.json())["ok"] is True
+    send_mock.assert_awaited_once()
+    assert send_mock.await_args is not None
+    binding, text = send_mock.await_args.args
+    assert binding == "docker:assistant"
+    assert text == " !купи молоко"
+    assert not text.startswith("!")
+
+
+@pytest.mark.asyncio
+async def test_success_tmux_binding_sent(client: TestClient) -> None:
+    # A host-tmux agent resolves to an @<id> binding; the send path is the
+    # same transport-agnostic send_to_window.
+    send_mock = AsyncMock(return_value=(True, "ok"))
+    with (
+        patch(_RESOLVE, new=AsyncMock(return_value="@7")),
+        patch(_CAPTURE, new=AsyncMock(return_value="idle prompt")),
+        patch(_SEND, new=send_mock),
+    ):
+        r = await client.post(
+            "/inject",
+            json={"agent": "example.com", "text": "deploy please"},
+            headers=_HDR,
+        )
+    assert r.status == 200
+    assert send_mock.await_args is not None
+    binding, text = send_mock.await_args.args
+    assert binding == "@7"
+    assert text == "deploy please"
+
+
+# ── /stop — end a docker agent the way ⏹ does (for an external idle-reaper) ──
+
+_SM = "kikubot.inject.server.session_manager"
+_SIDE = "docker:agent/side"
+
+
+def _stop_patches(*, running: bool = True, pane: str = "idle", working: bool = False):
+    from unittest.mock import MagicMock
+
+    return (
+        patch(f"{_SM}.iter_thread_bindings", return_value=[(1, 7, _SIDE)]),
+        patch(f"{_SM}.resolve_docker_target", return_value=MagicMock()),
+        patch(f"{_SM}.docker_agent_running", AsyncMock(return_value=running)),
+        patch(f"{_SM}.capture_pane", AsyncMock(return_value=pane)),
+        patch(f"{_SM}.is_agent_working", return_value=working),
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_needs_token(client: TestClient) -> None:
+    r = await client.post("/stop", json={"binding": _SIDE})
+    assert r.status == 401
+
+
+@pytest.mark.asyncio
+async def test_stop_rejects_non_docker_binding(client: TestClient) -> None:
+    r = await client.post("/stop", json={"binding": "@4"}, headers=_HDR)
+    assert r.status == 400
+    assert (await r.json())["error"] == "bad_binding"
+
+
+@pytest.mark.asyncio
+async def test_stop_unknown_binding_is_404(client: TestClient) -> None:
+    with patch(f"{_SM}.iter_thread_bindings", return_value=[]):
+        r = await client.post("/stop", json={"binding": _SIDE}, headers=_HDR)
+    assert r.status == 404
+
+
+@pytest.mark.asyncio
+async def test_stop_idle_agent(client: TestClient) -> None:
+    p = _stop_patches()
+    with p[0], p[1], p[2], p[3], p[4]:
+        with patch(f"{_SM}.stop_docker_agent", AsyncMock(return_value=True)) as stop:
+            r = await client.post("/stop", json={"binding": _SIDE}, headers=_HDR)
+    assert r.status == 200
+    assert await r.json() == {"ok": True, "was_running": True}
+    stop.assert_awaited_once_with(_SIDE)
+
+
+@pytest.mark.asyncio
+async def test_stop_refuses_a_working_agent_unless_forced(client: TestClient) -> None:
+    p = _stop_patches(working=True)
+    with p[0], p[1], p[2], p[3], p[4]:
+        with patch(f"{_SM}.stop_docker_agent", AsyncMock(return_value=True)) as stop:
+            r = await client.post("/stop", json={"binding": _SIDE}, headers=_HDR)
+            assert r.status == 409
+            stop.assert_not_awaited()
+            r = await client.post(
+                "/stop", json={"binding": _SIDE, "force": True}, headers=_HDR
+            )
+            assert r.status == 200
+
+
+@pytest.mark.asyncio
+async def test_stop_already_down_still_records_the_stop(client: TestClient) -> None:
+    # Dead with its container but never marked: marking is the whole point,
+    # or auto-resume brings it back on the next poll.
+    p = _stop_patches(running=False)
+    with p[0], p[1], p[2], p[3], p[4]:
+        with patch(f"{_SM}.stop_docker_agent", AsyncMock(return_value=True)) as stop:
+            r = await client.post("/stop", json={"binding": _SIDE}, headers=_HDR)
+    assert await r.json() == {"ok": True, "was_running": False}
+    stop.assert_awaited_once()

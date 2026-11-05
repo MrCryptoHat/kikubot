@@ -1,7 +1,7 @@
 ---
 paths:
-  - "src/ccbot/worktrees.py"
-  - "src/ccbot/handlers/worktrees.py"
+  - "src/kikubot/worktrees.py"
+  - "src/kikubot/handlers/worktrees.py"
   - "tests/**worktree**"
 ---
 
@@ -41,7 +41,7 @@ kept the chat under a rolling 429 that froze every send in the bot (2026-10-29).
 ## State, naming, layout — the non-obvious bits
 
 - **`worktree_meta` keyed by `thread_id`** (like every per-topic structure), value = repo / branch / base / path / task_title / status. Holds only what git can't recover. Deleting the whole map degrades worktree topics to plain tmux topics — routing never breaks. `reconcile_worktree_meta()` (post-init) drops rows whose worktree is gone AND thread is unbound.
-- **Worktrees live in `~/.ccbot/worktrees/<repo>/<slug>`** — outside the scanned `~/projects`/`~/agents` roots, so name-based auto-bind never mistakes a worktree for a bindable project.
+- **Worktrees live in `~/.kikubot/worktrees/<repo>/<slug>`** — outside the scanned `~/projects`/`~/agents` roots, so name-based auto-bind never mistakes a worktree for a bindable project.
 - **`slugify` transliterates** (task names are Russian; a naive `[^a-z0-9-]` strip yields all-dashes) and the result must be a filesystem-safe slug (`^[a-z0-9][a-z0-9-]{0,29}$` — leading alnum, 1-30 chars). Dedup the slug against `taken_slugs` (existing worktree dirs **and** `wt/*` branches) — a leftover branch makes `git worktree add -b` hard-fail mid-provision. Provisioning is transactional: a failure after `create_forum_topic` rolls the topic back.
 - **Dirty-guard subtracts seeded artifacts** — a symlinked `.env` / installed `.venv`/`node_modules` read as untracked unless the target repo gitignores them, so `parse_porcelain` filters `SEED_*` before deciding 🟢 vs ⚪. Seeding: `.env` symlinked, `.venv` via `uv sync`, node via pnpm/npm (never symlink `.venv` — it bakes absolute paths).
 - **Unmerged-guard (🟡) is `git cherry` against MULTIPLE bases, not `rev-list`** — `count_unmerged` counts unmerged commits by patch-id (`git cherry <ref> <branch>`, `+`-lines) against every resolvable candidate base (local `<base>`, `origin/<base>`, upstreams of base and branch) and takes the MINIMUM («integrated anywhere ⇒ integrated»). A plain `rev-list --count <base>..<branch>` against the *local* base raised false 🟡 alarms when work landed by **direct push to the remote base** (`git push origin wt/x:master` — local base lags origin) or by **squash/rebase merge** (diff under a new sha); patch-id + multi-base covers both. Falls back to `rev-list` only when no candidate ref resolves.
