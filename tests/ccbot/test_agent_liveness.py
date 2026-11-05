@@ -9,18 +9,19 @@ tmux is installed — the kernel behaviour the rule stands on.
 from __future__ import annotations
 
 import asyncio
-import os
-import shlex
 import shutil
-import subprocess
 import time
-from types import SimpleNamespace
 
-import libtmux
 import pytest
 
 from ccbot import tmux_manager as tm_mod
-from ccbot.tmux_manager import PaneState, TmuxManager, TmuxWindow, pane_agent_running
+from ccbot.tmux_manager import (
+    PaneState,
+    TmuxManager,
+    TmuxResult,
+    TmuxWindow,
+    pane_agent_running,
+)
 
 SHELL = 100  # pid of a pane's shell in the pure tests
 
@@ -102,29 +103,26 @@ def _record(window_id: str, window_name: str, **overrides: str) -> str:
         "pane_start_command": "",
     }
     fields.update(overrides)
-    values = [fields[name] for name in tm_mod._LIST_FIELDS]
+    values = [fields[name] for name in tm_mod._PANE_FIELDS]
     return tm_mod._FIELD_SEP.join(values) + tm_mod._RECORD_END
 
 
-def _answer(*records: str, stderr: str = "", rc: int = 0) -> SimpleNamespace:
-    """A libtmux tmux_cmd result: stdout split on newlines, trailing "" dropped."""
-    stdout = "\n".join(records).split("\n") if records else []
-    return SimpleNamespace(
-        stdout=stdout, stderr=[stderr] if stderr else [], returncode=rc
-    )
+def _answer(*records: str, stderr: str = "", rc: int = 0) -> TmuxResult:
+    """tmux's answer: one line per record, exactly as tmux prints it."""
+    return TmuxResult(rc, "".join(r + "\n" for r in records), stderr)
 
 
-def _manager_answering(monkeypatch, *answers: SimpleNamespace) -> tuple:
+def _manager_answering(monkeypatch, *answers: TmuxResult) -> tuple:
     """A TmuxManager whose tmux gives ``answers`` in turn (the last repeats)."""
     monkeypatch.setattr(tm_mod, "LIST_RETRY_DELAY", 0)
     manager = TmuxManager(session_name="test")
     calls: list[tuple] = []
 
-    def cmd(*args):
+    def tmux(*args):
         calls.append(args)
         return answers[min(len(calls), len(answers)) - 1]
 
-    manager._server = SimpleNamespace(cmd=cmd)
+    monkeypatch.setattr(manager, "_tmux_sync", tmux)
     return manager, calls
 
 
@@ -201,10 +199,21 @@ class TestListWindows:
             _answer("@1" + tm_mod._FIELD_SEP + "proj" + tm_mod._RECORD_END),
             _answer("garbage"),
             _answer(_record("%1", "proj")),  # not a window id in front
+            # Rows tmux cut short (format time limit): mid-row, then as an
+            # empty line in front, in the middle and at the very end — the
+            # last one libtmux dropped as a trailing blank, silently losing
+            # that pane's window.
+            _answer(
+                tm_mod._FIELD_SEP.join(["@1", "1", "100", "0", "test", ""]),
+                _record("@2", "b"),
+            ),
+            _answer("", _record("@1", "a")),
+            _answer(_record("@1", "a"), "", _record("@2", "b")),
+            _answer(_record("@1", "a"), ""),
         ],
     )
     async def test_unreadable_listing_raises_not_empty(
-        self, monkeypatch, answer: SimpleNamespace
+        self, monkeypatch, answer: TmuxResult
     ) -> None:
         # The bug: libtmux turned a failed read into "no session", so every
         # window read as gone and the poller unbound live agents.
@@ -238,8 +247,8 @@ class TestAgentRunningIds:
             looked_up.append(list(pids))
             return dict(foreground)
 
-        def fake_default() -> str:
-            asked.append("default-command")
+        async def fake_default(window_id: str) -> str:
+            asked.append(window_id)
             return default_command
 
         monkeypatch.setattr(tm_mod, "foreground_process_groups", fake_foreground)
@@ -281,75 +290,28 @@ class TestAgentRunningIds:
         assert asked == []
         from_default = TmuxWindow("@2", "b", "/p", [PaneState(100, False, '"zsh -l"')])
         assert await manager.agent_running_ids([from_default]) == set()
-        assert asked == ["default-command"]
+        assert asked == ["@2"]
 
 
 class TestDefaultCommand:
-    def test_reads_the_effective_option(self, monkeypatch) -> None:
-        manager = TmuxManager(session_name="test")
-        calls: list[tuple[str, ...]] = []
+    async def test_reads_the_effective_option(self, monkeypatch) -> None:
+        manager, calls = _manager_answering(monkeypatch, TmuxResult(0, "zsh -l\n", ""))
+        assert await manager._default_command("@3") == "zsh -l"
+        # Addressed through a window id: global, unlike a session name.
+        assert calls == [("show-options", "-t", "@3", "-Av", "default-command")]
 
-        def cmd(*args: str) -> SimpleNamespace:
-            calls.append(args)
-            return SimpleNamespace(stdout=["zsh -l"])
-
-        monkeypatch.setattr(manager, "get_session", lambda: SimpleNamespace(cmd=cmd))
-        assert manager._default_command() == "zsh -l"
-        assert calls == [("show-options", "-Av", "default-command")]
-
-    def test_unset_or_failing_reads_empty(self, monkeypatch) -> None:
-        manager = TmuxManager(session_name="test")
-        unset = SimpleNamespace(cmd=lambda *args: SimpleNamespace(stdout=[]))
-        monkeypatch.setattr(manager, "get_session", lambda: unset)
-        assert manager._default_command() == ""
-
-        def boom(*args: str) -> SimpleNamespace:
-            raise RuntimeError("tmux went away")
-
-        monkeypatch.setattr(manager, "get_session", lambda: SimpleNamespace(cmd=boom))
-        assert manager._default_command() == ""
+    @pytest.mark.parametrize(
+        "answer",
+        [TmuxResult(0, "\n", ""), TmuxResult(1, "", "no server running on x")],
+    )
+    async def test_unset_or_failing_reads_empty(
+        self, monkeypatch, answer: TmuxResult
+    ) -> None:
+        manager, _ = _manager_answering(monkeypatch, answer)
+        assert await manager._default_command("@3") == ""
 
 
 TMUX = shutil.which("tmux")
-
-
-@pytest.fixture
-def tmux_server():
-    """A throwaway tmux server on a private socket, /bin/sh panes, no config.
-
-    /bin/sh and -f /dev/null keep the user's dotfiles out of the timing, and
-    the private socket keeps the test away from any real ccbot session.
-    Yields ``(tmux, manager, signal)`` — ``signal`` is the shell prefix that
-    fires a ``wait-for`` channel from inside a pane.
-    """
-    assert TMUX is not None
-    binary: str = TMUX
-    socket = f"ccbot-liveness-{os.getpid()}"
-    env = {k: v for k, v in os.environ.items() if k != "TMUX"}
-    env.update(SHELL="/bin/sh", ENV="")
-
-    def tmux(*args: str) -> str:
-        return subprocess.run(
-            [binary, "-L", socket, "-f", "/dev/null", *args],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout
-
-    tmux("new-session", "-d", "-s", "t", "-n", "agent")
-    manager = TmuxManager(session_name="t")
-    manager._server = libtmux.Server(socket_name=socket)
-    try:
-        yield tmux, manager, f"{shlex.quote(binary)} -L {socket} wait-for -S"
-    finally:
-        subprocess.run(
-            [binary, "-L", socket, "kill-server"],
-            env=env,
-            capture_output=True,
-            timeout=10,
-        )
 
 
 async def _settle(manager: TmuxManager, name: str, expected: bool) -> bool:

@@ -397,6 +397,7 @@ STRINGS.update(
         # -- spoll --
         "spoll.agent_stopped": "⚠️ Agent *{name}* stopped. The window will be closed in {grace}s. Use /restart to restart it.",
         "spoll.auto_resume_failed": "⚠️ Couldn't bring agent {name} back after it stopped ({err}). Its topic falls back to the session picker.",
+        "spoll.window_reclaimed": "↩️ Agent *{name}* is still running — it's connected to this topic again.",
         "spoll.window_closed": "💀 Window *{name}* closed (the agent was down for {secs}s).",
         "spoll.model_switched": "⚠️ A model safeguard fired on the last message — the agent auto-switched to {model}. Safeguards are broad right now and can trip even on safe work (coding, cybersecurity, biology).",
         "spoll.model_switched_fallback": "another model",

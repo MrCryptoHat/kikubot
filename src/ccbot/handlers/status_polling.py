@@ -438,7 +438,7 @@ async def _poll_one_binding(bot: Bot, user_id: int, thread_id: int, wid: str) ->
                 if now - first_absent < STALE_BINDING_GRACE:
                     return
                 _window_absent_since.pop(wid, None)
-                session_manager.unbind_thread(user_id, thread_id)
+                session_manager.unbind_lost_window(user_id, thread_id)
                 await clear_topic_state(user_id, thread_id, bot)
                 logger.info(
                     "Cleaned up stale binding: user=%d thread=%d window_id=%s",
@@ -547,6 +547,103 @@ async def _check_runtime_versions(bot: Bot) -> None:
                     )
         except Exception as e:  # noqa: BLE001 — canary must never kill the poll loop
             logger.debug("Runtime version check failed for %s: %s", rt.name, e)
+
+
+async def _orphan_janitor(bot: Bot) -> None:
+    """One pass of the orphan-window janitor (see the module docstring).
+
+    Also hands a window unbound as gone, but alive after all, back to its
+    topic (SessionManager.reclaim_lost_window) — before anything is reaped.
+    """
+    global _zero_bindings_since, _zero_bindings_warned
+    # Orphan window janitor — any non-__main__ tmux window with no thread
+    # binding is stale (topic deleted while bot was offline, leftover from
+    # a re-bind, or a window created in tmux outside the bot). Kill it
+    # after ORPHAN_WINDOW_GRACE so a single iteration in the brief window
+    # between create_window and bind_thread cannot trigger a kill.
+    try:
+        all_windows = await tmux_manager.list_windows()
+        live_ids = {w.window_id for w in all_windows}
+        bound_wids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
+        # A window unbound because it looked gone, alive after all: back to
+        # its topic at once, before any reaping (and before the
+        # zero-bindings guard — its own topic may be the only one).
+        for w in all_windows:
+            if w.window_id in bound_wids:
+                continue
+            reclaimed = session_manager.reclaim_lost_window(w.window_id, w.window_name)
+            if reclaimed is None:
+                continue
+            uid, tid = reclaimed
+            bound_wids.add(w.window_id)
+            _orphan_since.pop(w.window_id, None)
+            logger.warning(
+                "Window %s (%s) was unbound as gone but is alive — "
+                "rebound to thread %d",
+                w.window_id,
+                w.window_name,
+                tid,
+            )
+            await safe_send(
+                bot,
+                session_manager.resolve_chat_id(uid, tid),
+                tr("spoll.window_reclaimed", name=w.window_name),
+                message_thread_id=tid,
+            )
+        now = time.monotonic()
+        agent_windows = [w for w in all_windows if w.window_name != "__main__"]
+        if agent_windows and not bound_wids:
+            # Zero bindings while agent windows are alive smells like a
+            # lost/corrupt state.json, not N simultaneously orphaned
+            # topics — reaping on that signal would kill every live
+            # agent 90s after a single bad state write. It is also the
+            # normal transient during the very first bind (create_window
+            # precedes bind_thread), so only warn once the episode
+            # outlives the grace — and only once, not every poll tick.
+            if _zero_bindings_since is None:
+                _zero_bindings_since = now
+            if (
+                not _zero_bindings_warned
+                and now - _zero_bindings_since >= ORPHAN_WINDOW_GRACE
+            ):
+                _zero_bindings_warned = True
+                logger.warning(
+                    "Orphan janitor: no thread bindings but %d agent "
+                    "window(s) alive — skipping reap (possible state loss)",
+                    len(agent_windows),
+                )
+            agent_windows = []
+        else:
+            _zero_bindings_since = None
+            _zero_bindings_warned = False
+        for w in agent_windows:
+            if w.window_id in bound_wids:
+                _orphan_since.pop(w.window_id, None)
+                continue
+            first_seen = _orphan_since.setdefault(w.window_id, now)
+            elapsed = now - first_seen
+            if elapsed >= ORPHAN_WINDOW_GRACE:
+                display = w.window_name
+                # If this is a worktree window, flag its meta orphaned
+                # before reaping — never destroy the worktree/branch here
+                # (headless path, no guard). The phase-3 GC reclaims it.
+                ws = session_manager.get_window_state(w.window_id)
+                if ws and ws.cwd:
+                    session_manager.mark_worktree_orphaned_by_path(ws.cwd)
+                await tmux_manager.kill_window(w.window_id)
+                _orphan_since.pop(w.window_id, None)
+                logger.info(
+                    "Auto-killed orphan window %s (%s) after %.0fs without binding",
+                    w.window_id,
+                    display,
+                    elapsed,
+                )
+
+        stale = [wid for wid in _orphan_since if wid not in live_ids]
+        for wid in stale:
+            _orphan_since.pop(wid, None)
+    except Exception as e:
+        logger.debug("Orphan window janitor error: %s", e)
 
 
 async def status_poll_loop(bot: Bot) -> None:
@@ -699,69 +796,6 @@ async def status_poll_loop(bot: Bot) -> None:
         except Exception as e:
             logger.debug("Agent health check error: %s", e)
 
-        # Orphan window janitor — any non-__main__ tmux window with no thread
-        # binding is stale (topic deleted while bot was offline, leftover from
-        # a re-bind, or a window created in tmux outside the bot). Kill it
-        # after ORPHAN_WINDOW_GRACE so a single iteration in the brief window
-        # between create_window and bind_thread cannot trigger a kill.
-        try:
-            all_windows = await tmux_manager.list_windows()
-            live_ids = {w.window_id for w in all_windows}
-            bound_wids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
-            now = time.monotonic()
-            agent_windows = [w for w in all_windows if w.window_name != "__main__"]
-            if agent_windows and not bound_wids:
-                # Zero bindings while agent windows are alive smells like a
-                # lost/corrupt state.json, not N simultaneously orphaned
-                # topics — reaping on that signal would kill every live
-                # agent 90s after a single bad state write. It is also the
-                # normal transient during the very first bind (create_window
-                # precedes bind_thread), so only warn once the episode
-                # outlives the grace — and only once, not every poll tick.
-                global _zero_bindings_since, _zero_bindings_warned
-                if _zero_bindings_since is None:
-                    _zero_bindings_since = now
-                if (
-                    not _zero_bindings_warned
-                    and now - _zero_bindings_since >= ORPHAN_WINDOW_GRACE
-                ):
-                    _zero_bindings_warned = True
-                    logger.warning(
-                        "Orphan janitor: no thread bindings but %d agent "
-                        "window(s) alive — skipping reap (possible state loss)",
-                        len(agent_windows),
-                    )
-                agent_windows = []
-            else:
-                _zero_bindings_since = None
-                _zero_bindings_warned = False
-            for w in agent_windows:
-                if w.window_id in bound_wids:
-                    _orphan_since.pop(w.window_id, None)
-                    continue
-                first_seen = _orphan_since.setdefault(w.window_id, now)
-                elapsed = now - first_seen
-                if elapsed >= ORPHAN_WINDOW_GRACE:
-                    display = w.window_name
-                    # If this is a worktree window, flag its meta orphaned
-                    # before reaping — never destroy the worktree/branch here
-                    # (headless path, no guard). The phase-3 GC reclaims it.
-                    ws = session_manager.get_window_state(w.window_id)
-                    if ws and ws.cwd:
-                        session_manager.mark_worktree_orphaned_by_path(ws.cwd)
-                    await tmux_manager.kill_window(w.window_id)
-                    _orphan_since.pop(w.window_id, None)
-                    logger.info(
-                        "Auto-killed orphan window %s (%s) after %.0fs without binding",
-                        w.window_id,
-                        display,
-                        elapsed,
-                    )
-
-            stale = [wid for wid in _orphan_since if wid not in live_ids]
-            for wid in stale:
-                _orphan_since.pop(wid, None)
-        except Exception as e:
-            logger.debug("Orphan window janitor error: %s", e)
+        await _orphan_janitor(bot)
 
         await asyncio.sleep(STATUS_POLL_INTERVAL)

@@ -1,155 +1,180 @@
-"""Tests for TmuxManager.send_keys — literal sends must survive tmux flag parsing.
+"""Tests for TmuxManager's tmux commands — argv shapes, and the real thing.
 
-libtmux's pane.send_keys(literal=True) builds `send-keys -l <text>` without
-`--`, so text starting with "-" is eaten as tmux flags and the send silently
-fails. The manager therefore issues `send-keys -l -- <text>` via pane.cmd();
-these tests pin that argv shape with fake libtmux objects (no real tmux).
+The unit half pins argv with a fake tmux: literal sends must carry `--` (text
+starting with "-" is otherwise eaten as tmux flags and the send fails), and
+session-level commands must address the session by its `$N` id. The real half
+runs each operation against a throwaway tmux server, when tmux is installed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import shutil
 
 import pytest
 
-from ccbot.tmux_manager import TmuxManager
+from ccbot import tmux_manager as tm_mod
+from ccbot.config import config
+from ccbot.tmux_manager import TmuxManager, TmuxResult
+
+TMUX = shutil.which("tmux")
+OK = TmuxResult(0, "", "")
 
 
-class _FakeCmdResult:
-    def __init__(self, stderr: list[str] | None = None):
-        self.stderr = stderr or []
-
-
-class _FakePane:
-    def __init__(self, stderr: list[str] | None = None):
-        self.cmd_calls: list[tuple] = []
-        self.send_keys_calls: list[tuple] = []
-        self._stderr = stderr
-
-    def cmd(self, *args):
-        self.cmd_calls.append(args)
-        return _FakeCmdResult(self._stderr)
-
-    def send_keys(self, text, enter=True, literal=False):
-        self.send_keys_calls.append((text, enter, literal))
-
-
-class _FakeWindows:
-    def __init__(self, window):
-        self._window = window
-
-    def get(self, window_id=None):
-        return self._window
-
-
-class _FakeWindow:
-    def __init__(self, pane):
-        self.active_pane = pane
-
-
-class _FakeSession:
-    def __init__(self, window):
-        self.windows = _FakeWindows(window)
+def _sessions(*pairs: tuple[str, str]) -> TmuxResult:
+    """A list-sessions answer in the manager's own format."""
+    rows = (
+        f"{sid}{tm_mod._FIELD_SEP}{name}{tm_mod._RECORD_END}\n" for sid, name in pairs
+    )
+    return TmuxResult(0, "".join(rows), "")
 
 
 @pytest.fixture
-def manager_with_fake_pane(monkeypatch):
-    """TmuxManager whose get_session returns fakes; sleeps neutered."""
+def fake_tmux(monkeypatch):
+    """TmuxManager on a scripted tmux; sleeps neutered. Yields (manager, calls, answers).
+
+    ``answers`` maps a tmux subcommand to its result (default: success).
+    """
     manager = TmuxManager(session_name="test")
-    pane = _FakePane()
-    session = _FakeSession(_FakeWindow(pane))
-    monkeypatch.setattr(manager, "get_session", lambda: session)
+    calls: list[tuple[str, ...]] = []
+    answers: dict[str, TmuxResult] = {}
+
+    def tmux(*args: str) -> TmuxResult:
+        calls.append(args)
+        return answers.get(args[0], OK)
+
+    monkeypatch.setattr(manager, "_tmux_sync", tmux)
 
     async def _no_sleep(_):
         return None
 
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-    return manager, pane
+    return manager, calls, answers
 
 
 class TestLiteralSendArgv:
-    async def test_leading_dash_text_survives_flag_parsing(
-        self, manager_with_fake_pane
-    ) -> None:
-        manager, pane = manager_with_fake_pane
-        ok = await manager.send_keys("@1", "-1 за такой вариант")
-        assert ok is True
-        assert pane.cmd_calls[0] == ("send-keys", "-l", "--", "-1 за такой вариант")
-        # Enter is sent as an interpreted key afterwards.
-        assert pane.send_keys_calls == [("", True, False)]
+    async def test_leading_dash_text_survives_flag_parsing(self, fake_tmux) -> None:
+        manager, calls, _ = fake_tmux
+        assert await manager.send_keys("@1", "-1 за такой вариант") is True
+        assert calls == [
+            ("send-keys", "-t", "@1", "-l", "--", "-1 за такой вариант"),
+            ("send-keys", "-t", "@1", "Enter"),  # an interpreted key, on its own
+        ]
 
-    async def test_literal_no_enter_uses_guarded_argv(
-        self, manager_with_fake_pane
-    ) -> None:
-        manager, pane = manager_with_fake_pane
-        ok = await manager.send_keys("@1", "--help", enter=False, literal=True)
-        assert ok is True
-        assert pane.cmd_calls == [("send-keys", "-l", "--", "--help")]
-        assert pane.send_keys_calls == []
+    async def test_literal_no_enter_uses_guarded_argv(self, fake_tmux) -> None:
+        manager, calls, _ = fake_tmux
+        assert await manager.send_keys("@1", "--help", enter=False) is True
+        assert calls == [("send-keys", "-t", "@1", "-l", "--", "--help")]
 
-    async def test_named_key_keeps_interpreted_path(
-        self, manager_with_fake_pane
-    ) -> None:
-        manager, pane = manager_with_fake_pane
+    async def test_named_key_keeps_interpreted_path(self, fake_tmux) -> None:
+        manager, calls, _ = fake_tmux
         ok = await manager.send_keys("@1", "Escape", enter=False, literal=False)
         assert ok is True
-        assert pane.cmd_calls == []
-        assert pane.send_keys_calls == [("Escape", False, False)]
+        assert calls == [("send-keys", "-t", "@1", "Escape")]
 
-    async def test_long_text_chunked_each_chunk_guarded(
-        self, manager_with_fake_pane
-    ) -> None:
-        manager, pane = manager_with_fake_pane
-        text = "a" * 450  # chunks of 200, 200, 50
-        ok = await manager.send_keys("@1", text)
-        assert ok is True
-        chunks = [c[-1] for c in pane.cmd_calls]
-        assert chunks == ["a" * 200, "a" * 200, "a" * 50]
-        for call in pane.cmd_calls:
-            assert call[:3] == ("send-keys", "-l", "--")
+    async def test_long_text_chunked_each_chunk_guarded(self, fake_tmux) -> None:
+        manager, calls, _ = fake_tmux
+        assert await manager.send_keys("@1", "a" * 450) is True  # 200 + 200 + 50
+        assert [c[-1] for c in calls[:-1]] == ["a" * 200, "a" * 200, "a" * 50]
+        for call in calls[:-1]:
+            assert call[:5] == ("send-keys", "-t", "@1", "-l", "--")
+        assert calls[-1] == ("send-keys", "-t", "@1", "Enter")
 
-    async def test_send_keys_stderr_reports_failure(self, monkeypatch) -> None:
-        manager = TmuxManager(session_name="test")
-        pane = _FakePane(stderr=["unknown flag"])
-        session = _FakeSession(_FakeWindow(pane))
-        monkeypatch.setattr(manager, "get_session", lambda: session)
-
-        async def _no_sleep(_):
-            return None
-
-        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-        ok = await manager.send_keys("@1", "text")
-        assert ok is False
+    async def test_send_keys_failure_is_reported(self, fake_tmux) -> None:
+        manager, calls, answers = fake_tmux
+        answers["send-keys"] = TmuxResult(1, "", "can't find window: @1")
+        assert await manager.send_keys("@1", "text") is False
+        assert len(calls) == 1  # no Enter after a failed text
 
 
-class TestSessionEnvExport:
-    """get_or_create_session must publish CCBOT_DIR into the tmux session env.
+class TestSessionById:
+    """ensure_session must publish CCBOT_DIR into the tmux session env.
 
     The SessionStart hook runs in agent panes and inherits the tmux server
     environment, not the bot's — a `.env`-only CCBOT_DIR would silently split
     session_map.json across two directories without this export.
     """
 
-    def test_existing_session_gets_ccbot_dir(self, monkeypatch) -> None:
-        from ccbot.config import config
+    def test_existing_session_gets_env_by_id(self, fake_tmux) -> None:
+        manager, calls, answers = fake_tmux
+        # "test-x" would match a `-t test` by prefix; ours is found exactly.
+        answers["list-sessions"] = _sessions(("$7", "test-x"), ("$3", "test"))
+        assert manager.ensure_session() == "$3"
+        assert ("set-environment", "-t", "$3", "CCBOT_DIR", str(config.config_dir)) in (
+            calls
+        )
+        for var in config.sensitive_env_vars:
+            assert ("set-environment", "-t", "$3", "-u", var) in calls
+        assert not any(c[0] == "new-session" for c in calls)
 
-        class _EnvSession:
-            def __init__(self):
-                self.env_set: list[tuple[str, str]] = []
-                self.env_unset: list[str] = []
-                self.windows = []
-
-            def set_environment(self, name, value):
-                self.env_set.append((name, value))
-
-            def unset_environment(self, name):
-                self.env_unset.append(name)
-
+    def test_missing_session_is_created(self, monkeypatch) -> None:
         manager = TmuxManager(session_name="test")
-        session = _EnvSession()
-        monkeypatch.setattr(manager, "get_session", lambda: session)
+        sessions = [("$7", "test-x")]
+        calls: list[tuple[str, ...]] = []
 
-        result = manager.get_or_create_session()
+        def tmux(*args: str) -> TmuxResult:
+            calls.append(args)
+            if args[0] == "list-sessions":
+                return _sessions(*sessions)
+            if args[0] == "new-session":
+                sessions.append(("$8", "test"))
+            return OK
 
-        assert result is session
-        assert ("CCBOT_DIR", str(config.config_dir)) in session.env_set
+        monkeypatch.setattr(manager, "_tmux_sync", tmux)
+        assert manager.ensure_session() == "$8"
+        new = next(c for c in calls if c[0] == "new-session")
+        assert new[:4] == ("new-session", "-d", "-s", "test")
+
+
+@pytest.mark.skipif(TMUX is None, reason="tmux not installed")
+class TestOnRealTmux:
+    async def test_create_rename_capture_kill(self, tmux_server, tmp_path) -> None:
+        tmux, manager, signal = tmux_server
+        ok, _, name, wid = await manager.create_window(
+            str(tmp_path), window_name="proj", start_claude=False
+        )
+        assert ok and name == "proj" and wid.startswith("@")
+        # Same name again → deduplicated, never reused.
+        ok, _, name2, wid2 = await manager.create_window(
+            str(tmp_path), window_name="proj", start_claude=False
+        )
+        assert ok and name2 == "proj-2" and wid2 != wid
+        assert tmux("show-options", "-w", "-t", wid, "-v", "allow-rename") == "off\n"
+
+        assert await manager.send_keys(wid, f"{signal} up", enter=False)
+        assert await manager.send_keys(wid, "", enter=True, literal=False)
+        tmux("wait-for", "up")  # the shell runs what we typed
+        # A leading "-" must arrive as text, not be parsed as a flag.
+        assert await manager.send_keys(wid, "-n typed", enter=False)
+        captured = ""
+        for _ in range(100):
+            captured = await manager.capture_pane(wid) or ""
+            if "-n typed" in captured:
+                break
+            await asyncio.sleep(0.05)
+        assert "-n typed" in captured
+        assert not captured.endswith("\n")  # trailing blank rows dropped
+
+        assert await manager.rename_window(wid, "renamed")
+        window = await manager.find_window_by_id(wid)
+        assert window is not None and window.window_name == "renamed"
+        assert await manager.kill_window(wid)
+        assert await manager.find_window_by_id(wid) is None
+        assert await manager.kill_window(wid) is False  # already gone
+
+    async def test_ensure_session_creates_and_exports(self, tmux_server) -> None:
+        tmux, manager, _ = tmux_server
+        manager.session_name = "fresh"
+        sid = manager.ensure_session()
+        assert sid.startswith("$")
+        assert tmux("list-windows", "-t", sid, "-F", "#{window_name}") == (
+            f"{config.tmux_main_window_name}\n"
+        )
+        env = tmux("show-environment", "-t", sid, "CCBOT_DIR")
+        assert env == f"CCBOT_DIR={config.config_dir}\n"
+        assert manager.ensure_session() == sid  # idempotent
+
+    async def test_pane_size_is_pinned(self, tmux_server) -> None:
+        tmux, manager, _ = tmux_server
+        await manager.ensure_session_pane_size(120, 40)
+        assert tmux("display", "-p", "-t", "t:agent", "#{window_width}") == "120\n"

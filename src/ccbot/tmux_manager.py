@@ -1,15 +1,18 @@
-"""Tmux session/window management via libtmux.
+"""Tmux session/window management through the tmux CLI.
 
-Wraps libtmux to provide async-friendly operations on a single tmux session:
-  - list_windows / find_window_by_name: discover Claude Code windows. A read
-    that fails raises TmuxReadError — never an empty answer (see there).
+Async-friendly operations on a single tmux session:
+  - list_windows / find_window_by_name / find_window_by_id: discover agent
+    windows. A read that fails raises TmuxReadError, never an empty answer.
   - agent_running_ids / is_agent_running: does a window's agent still hold its
     terminal — the dead-window check; the rule is pane_agent_running.
   - capture_pane: read terminal content (plain or with ANSI colors).
   - send_keys: forward user input or control keys to a window.
-  - create_window / kill_window: lifecycle management.
+  - create_window / rename_window / kill_window: lifecycle management.
 
-All blocking libtmux calls are wrapped in asyncio.to_thread().
+Every call is one ``tmux`` command (blocking, run in asyncio.to_thread).
+Windows are addressed by their global ``@N`` id, the session by its ``$N`` id;
+names are never used as targets — see _session_id for why. Listings use short
+formats of our own and are accepted only whole — see TmuxReadError for why.
 
 Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 """
@@ -19,13 +22,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import subprocess
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import libtmux
-from libtmux._internal.query_list import ObjectDoesNotExist
 
 from .config import config
 from .procinfo import foreground_process_groups
@@ -54,27 +55,49 @@ class TmuxWindow:
     panes: list[PaneState] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class TmuxResult:
+    """One tmux command's outcome, stdout/stderr exactly as tmux wrote them."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+
 class TmuxReadError(Exception):
     """tmux could not be read, so whether a window exists is UNKNOWN.
 
-    Kept apart from an empty listing on purpose. libtmux turned every failed
-    read into "no session", so list_windows answered [] while the windows were
-    alive: status polling unbound a working agent's topic on that one answer,
-    and 90 s later the orphan janitor killed the window as unbound. Nothing
-    destructive may follow from this error; callers skip the step or report a
-    failure instead.
+    Kept apart from an empty listing on purpose. tmux gives up expanding a
+    ``-F`` row that takes over 100 ms (FORMAT_TIME_LIMIT in format.c) and
+    silently prints the row cut short — or as an empty line — which happens
+    under load. libtmux's 136-field rows hit that limit and its parser turned
+    the failure into "no session", so the window list came back empty while
+    every window was alive: status polling unbound a working agent's topic on
+    that one answer, and 90 s later the orphan janitor killed the window as
+    unbound. Nothing destructive may follow from this error; callers skip the
+    step or report a failure instead.
     """
 
 
-# list_windows reads one ``list-panes -a`` with its own short row instead of
-# libtmux's 136-field one. Fixed-shape fields come first, free text last, and
-# every record ends with _RECORD_END, so a value with a newline in it stays
-# inside its record. A record is accepted only whole: the right field count and
-# a window id in front. Anything else is a read error, never a missing window.
-# The session is matched here, by exact name, not with ``-t``: tmux 3.7b's
-# ``list-panes -s -t =<name>`` for a session that doesn't exist answers with
-# another session's panes, which the orphan janitor would then reap as ours.
-_LIST_FIELDS = (
+# Listings use short formats of our own. Each record ends with _RECORD_END
+# right before tmux's newline, fixed-shape fields come first and free text
+# last, so a cut row (see TmuxReadError) can't pass: it either merges with
+# the next row (wrong field count, or a newline in front of the id) or leaves
+# the output without its final terminator.
+_FIELD_SEP = "␟"  # ␟
+_RECORD_END = "␞"  # ␞
+
+
+def _format(*fields: str) -> str:
+    return _FIELD_SEP.join(f"#{{{f}}}" for f in fields) + _RECORD_END
+
+
+# One row per pane of every session; ours are picked by exact session name.
+_PANE_FIELDS = (
     "window_id",
     "pane_active",
     "pane_pid",
@@ -84,35 +107,50 @@ _LIST_FIELDS = (
     "pane_current_path",
     "pane_start_command",
 )
-_FIELD_SEP = "\u241f"  # ␟
-_RECORD_END = "\u241e"  # ␞
-_LIST_FORMAT = _FIELD_SEP.join(f"#{{{f}}}" for f in _LIST_FIELDS) + _RECORD_END
+_PANE_FORMAT = _format(*_PANE_FIELDS)
+_SESSION_FORMAT = _format("session_id", "session_name")
 _WINDOW_ID_RE = re.compile(r"@\d+")
+_SESSION_ID_RE = re.compile(r"\$\d+")
 # No server answered. On macOS a connection refused for a full accept backlog
-# reads exactly like a dead server ("no server running"), so this one is
-# trusted only after every attempt says it.
+# reads exactly like a dead server ("no server running"), so this is trusted
+# only after every attempt says it.
 _SERVER_ABSENT = ("no server running", "No such file or directory")
+TMUX_CALL_TIMEOUT = 15.0  # seconds; a wedged server must not hang a thread forever
 LIST_READ_ATTEMPTS = 3
 LIST_RETRY_DELAY = 0.2  # seconds between attempts
 _READ_WARN_INTERVAL = 30.0  # one WARNING per this many seconds; the rest DEBUG
 _last_read_warning = 0.0
 
 
-def _parse_pane_records(raw: str, session_name: str) -> list[TmuxWindow]:
-    """Group the session's ``list-panes`` records into windows.
+def _server_absent(result: TmuxResult) -> bool:
+    return any(marker in result.stderr for marker in _SERVER_ABSENT)
 
-    Raises TmuxReadError on a malformed record, whichever session it is in.
-    """
-    if raw.endswith(_RECORD_END):
-        raw = raw[: -len(_RECORD_END)]
-    if not raw:
+
+def _split_records(
+    stdout: str, n_fields: int, id_re: re.Pattern[str], what: str
+) -> list[list[str]]:
+    """Split a listing into records; TmuxReadError unless every one is whole."""
+    if not stdout:
         return []
-    windows: dict[str, TmuxWindow] = {}
-    for record in raw.split(_RECORD_END + "\n"):
+    terminator = _RECORD_END + "\n"
+    if not stdout.endswith(terminator):
+        raise TmuxReadError(f"{what} output cut short: {stdout[-300:]!r}")
+    records = []
+    for record in stdout[: -len(terminator)].split(terminator):
         values = record.split(_FIELD_SEP)
-        if len(values) != len(_LIST_FIELDS) or not _WINDOW_ID_RE.fullmatch(values[0]):
-            raise TmuxReadError(f"malformed list-panes record: {record[:300]!r}")
-        row = dict(zip(_LIST_FIELDS, values, strict=True))
+        if len(values) != n_fields or not id_re.fullmatch(values[0]):
+            raise TmuxReadError(f"malformed {what} record: {record[:300]!r}")
+        records.append(values)
+    return records
+
+
+def _parse_pane_records(stdout: str, session_name: str) -> list[TmuxWindow]:
+    """Group the session's ``list-panes -a`` records into windows."""
+    windows: dict[str, TmuxWindow] = {}
+    for values in _split_records(
+        stdout, len(_PANE_FIELDS), _WINDOW_ID_RE, "list-panes"
+    ):
+        row = dict(zip(_PANE_FIELDS, values, strict=True))
         if row["session_name"] != session_name:
             continue
         window_id = row["window_id"]
@@ -237,72 +275,100 @@ def pane_agent_running(
 class TmuxManager:
     """Manages tmux windows for Claude Code sessions."""
 
-    def __init__(self, session_name: str | None = None):
+    def __init__(self, session_name: str | None = None, socket_name: str = ""):
         """Initialize tmux manager.
 
         Args:
             session_name: Name of the tmux session to use (default from config)
+            socket_name: tmux ``-L`` socket; "" = tmux's own default (tests
+                point this at a throwaway server)
         """
         self.session_name = session_name or config.tmux_session_name
-        self._server: libtmux.Server | None = None
+        self.socket_name = socket_name
 
-    @property
-    def server(self) -> libtmux.Server:
-        """Get or create tmux server connection."""
-        if self._server is None:
-            self._server = libtmux.Server()
-        return self._server
+    # --- tmux primitive -----------------------------------------------------
 
-    def get_session(self) -> libtmux.Session | None:
-        """Get the tmux session if it exists.
-
-        None also when tmux couldn't be read (libtmux hands back an empty
-        session list then), so a None here must never be taken to mean the
-        windows are gone. list_windows doesn't go through here for that reason.
-        """
+    def _tmux_sync(self, *args: str) -> TmuxResult:
+        """Run one tmux command against our server. Never raises."""
+        argv = ["tmux"]
+        if self.socket_name:
+            argv += ["-L", self.socket_name]
+        argv += args
         try:
-            return self.server.sessions.get(session_name=self.session_name)
-        except ObjectDoesNotExist:
-            return None
-        except Exception as e:
-            logger.warning("tmux session lookup failed: %s: %s", type(e).__name__, e)
-            return None
-
-    def get_or_create_session(self) -> libtmux.Session:
-        """Get existing session or create a new one."""
-        session = self.get_session()
-        if session:
-            self._scrub_session_env(session)
-            self._export_ccbot_dir(session)
-            return session
-
-        # Create new session with main window named specifically
-        session = self.server.new_session(
-            session_name=self.session_name,
-            start_directory=str(Path.home()),
+            proc = subprocess.run(argv, capture_output=True, timeout=TMUX_CALL_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as e:
+            return TmuxResult(-1, "", f"tmux did not run: {e}")
+        return TmuxResult(
+            proc.returncode,
+            proc.stdout.decode("utf-8", "replace"),
+            proc.stderr.decode("utf-8", "replace"),
         )
-        # Rename the default window to the main window name
-        if session.windows:
-            session.windows[0].rename_window(config.tmux_main_window_name)
-        self._scrub_session_env(session)
-        self._export_ccbot_dir(session)
-        return session
 
-    @staticmethod
-    def _scrub_session_env(session: libtmux.Session) -> None:
+    async def _tmux(self, *args: str) -> TmuxResult:
+        return await asyncio.to_thread(self._tmux_sync, *args)
+
+    # --- session ------------------------------------------------------------
+
+    def _session_id(self) -> str | None:
+        """The session's ``$N`` id; None when tmux answered without it.
+
+        Session-level commands take this id, never the name: tmux matches a
+        ``-t <name>`` by prefix (``ccbot`` hits ``ccbot-x`` while ``ccbot`` is
+        gone), show-options/set-environment refuse ``=<name>``, and
+        ``list-panes -s -t =<missing>`` answers with ANOTHER session's panes.
+
+        Raises:
+            TmuxReadError: tmux couldn't be read.
+        """
+        res = self._tmux_sync("list-sessions", "-F", _SESSION_FORMAT)
+        if not res.ok:
+            if _server_absent(res):
+                return None
+            raise TmuxReadError(f"list-sessions rc={res.returncode}: {res.stderr!r}")
+        for sid, name in _split_records(res.stdout, 2, _SESSION_ID_RE, "session"):
+            if name == self.session_name:
+                return sid
+        return None
+
+    def ensure_session(self) -> str:
+        """Create the session if it's missing; return its ``$N`` id.
+
+        Also re-scrubs secrets from its environment and re-exports CCBOT_DIR,
+        on every call — new windows inherit whatever the session env holds.
+
+        Raises:
+            TmuxReadError: tmux couldn't be read, or creating the session failed.
+        """
+        sid = self._session_id()
+        if sid is None:
+            res = self._tmux_sync(
+                "new-session",
+                "-d",
+                "-s",
+                self.session_name,
+                "-n",
+                config.tmux_main_window_name,
+                "-c",
+                str(Path.home()),
+            )
+            sid = self._session_id()  # also covers losing a creation race
+            if sid is None:
+                raise TmuxReadError(f"new-session failed: {res.stderr.strip()!r}")
+        self._scrub_session_env(sid)
+        self._export_ccbot_dir(sid)
+        return sid
+
+    def _scrub_session_env(self, sid: str) -> None:
         """Remove sensitive env vars from the tmux session environment.
 
         Prevents new windows (and their child processes like Claude Code)
-        from inheriting secrets such as TELEGRAM_BOT_TOKEN.
+        from inheriting secrets such as TELEGRAM_BOT_TOKEN. Unsetting a var
+        that isn't set is a no-op for tmux.
         """
         for var in config.sensitive_env_vars:
-            try:
-                session.unset_environment(var)
-            except Exception:
-                pass  # var not set in session env — nothing to remove
+            self._tmux_sync("set-environment", "-t", sid, "-u", var)
 
-    @staticmethod
-    def _export_ccbot_dir(session: libtmux.Session) -> None:
+    def _export_ccbot_dir(self, sid: str) -> None:
         """Publish the bot's resolved CCBOT_DIR to the tmux session env.
 
         The SessionStart hook runs inside agent panes and inherits the tmux
@@ -313,27 +379,29 @@ class TmuxManager:
         resolved path into the session env makes every window created after
         this point see the same directory the bot uses.
         """
-        try:
-            session.set_environment(CCBOT_DIR_ENV, str(config.config_dir))
-        except Exception:
-            logger.warning("Failed to export CCBOT_DIR into tmux session env")
+        res = self._tmux_sync(
+            "set-environment", "-t", sid, CCBOT_DIR_ENV, str(config.config_dir)
+        )
+        if not res.ok:
+            logger.warning(
+                "Failed to export CCBOT_DIR into tmux session env: %s",
+                res.stderr.strip(),
+            )
 
-    def _list_windows_once(self) -> list[TmuxWindow] | None:
+    # --- windows ------------------------------------------------------------
+
+    async def _list_windows_once(self) -> list[TmuxWindow] | None:
         """One ``list-panes -a`` read. None = no server answered.
 
-        Raises TmuxReadError when tmux answered with anything but a clean
-        listing.
+        Raises:
+            TmuxReadError: tmux answered with anything but a whole listing.
         """
-        try:
-            proc = self.server.cmd("list-panes", "-a", "-F", _LIST_FORMAT)
-        except Exception as e:
-            raise TmuxReadError(f"list-panes did not run: {e}") from e
-        stderr = "\n".join(proc.stderr).strip()
-        if proc.returncode == 0 and not stderr:
-            return _parse_pane_records("\n".join(proc.stdout), self.session_name)
-        if any(marker in stderr for marker in _SERVER_ABSENT):
+        res = await self._tmux("list-panes", "-a", "-F", _PANE_FORMAT)
+        if res.ok:
+            return _parse_pane_records(res.stdout, self.session_name)
+        if _server_absent(res):
             return None
-        raise TmuxReadError(f"list-panes rc={proc.returncode}: {stderr[:300]!r}")
+        raise TmuxReadError(f"list-panes rc={res.returncode}: {res.stderr[:300]!r}")
 
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
@@ -352,7 +420,7 @@ class TmuxManager:
         for attempt in range(1, LIST_READ_ATTEMPTS + 1):
             last = attempt == LIST_READ_ATTEMPTS
             try:
-                windows = await asyncio.to_thread(self._list_windows_once)
+                windows = await self._list_windows_once()
             except TmuxReadError as e:
                 if last:
                     _log_read_failure(e)
@@ -414,47 +482,44 @@ class TmuxManager:
         itself is pane_agent_running.
         """
         windows = list(windows)
-
-        def _sync() -> set[str]:
-            panes = [p for w in windows for p in w.panes]
-            # Dead panes are never looked up: their pid is stale, maybe reused.
-            foreground = foreground_process_groups(
-                p.pid for p in panes if p.pid is not None and not p.dead
-            )
-            # Only a pane started with a command needs default-command to be
-            # judged — skip the tmux call when no pane has one.
-            default_command = (
-                self._default_command() if any(p.start_command for p in panes) else ""
-            )
-            return {
-                w.window_id
-                for w in windows
-                if not w.panes
-                or any(
-                    pane_agent_running(p, foreground, default_command) for p in w.panes
-                )
-            }
-
-        return await asyncio.to_thread(_sync)
+        panes = [p for w in windows for p in w.panes]
+        # Only a pane started with a command needs default-command to be
+        # judged — skip the tmux call when no pane has one.
+        needs_default = next(
+            (w.window_id for w in windows if any(p.start_command for p in w.panes)),
+            None,
+        )
+        default_command = (
+            await self._default_command(needs_default) if needs_default else ""
+        )
+        # Dead panes are never looked up: their pid is stale, maybe reused.
+        foreground = await asyncio.to_thread(
+            foreground_process_groups,
+            [p.pid for p in panes if p.pid is not None and not p.dead],
+        )
+        return {
+            w.window_id
+            for w in windows
+            if not w.panes
+            or any(pane_agent_running(p, foreground, default_command) for p in w.panes)
+        }
 
     async def is_agent_running(self, window: TmuxWindow) -> bool:
         """Whether this window's agent still holds its terminal."""
         return window.window_id in await self.agent_running_ids([window])
 
-    def _default_command(self) -> str:
-        """The session's effective ``default-command`` ("" when unset or unknown).
+    async def _default_command(self, window_id: str) -> str:
+        """The effective ``default-command`` of ``window_id``'s session.
 
-        Unknown degrades safely: a start command that then fails to match is
-        judged "started with a program", i.e. running.
+        "" when unset or unknown. Unknown degrades safely: a start command that
+        then fails to match is judged "started with a program", i.e. running.
         """
-        session = self.get_session()
-        if not session:
+        res = await self._tmux(
+            "show-options", "-t", window_id, "-Av", "default-command"
+        )
+        if not res.ok:
             return ""
-        try:
-            lines = session.cmd("show-options", "-Av", "default-command").stdout
-        except Exception:
-            return ""
-        return lines[0] if lines else ""
+        return res.stdout.split("\n", 1)[0]
 
     async def ensure_session_pane_size(self, cols: int, rows: int) -> None:
         """Pin the session's pane size for screenshots.
@@ -469,43 +534,32 @@ class TmuxManager:
         attached at a smaller size, the smaller size wins for the
         duration of the attach — this is a best-effort floor.
         """
-        # default-size for new windows.
-        await asyncio.create_subprocess_exec(
-            "tmux",
-            "set-option",
-            "-t",
-            self.session_name,
-            "default-size",
-            f"{cols}x{rows}",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        # Resize live windows.
-        session = self.get_session()
-        if not session:
+        try:
+            sid = await asyncio.to_thread(self._session_id)
+            windows = await self.list_windows()
+        except TmuxReadError as e:
+            logger.warning("Pane size not pinned, tmux unreadable: %s", e)
             return
-        for window in list(session.windows):
-            wid = window.window_id
-            if not wid:
-                continue
-            proc = await asyncio.create_subprocess_exec(
-                "tmux",
+        if sid is None:
+            return
+        # default-size for new windows.
+        await self._tmux("set-option", "-t", sid, "default-size", f"{cols}x{rows}")
+        # Resize live windows.
+        for window in windows:
+            res = await self._tmux(
                 "resize-window",
                 "-t",
-                f"{self.session_name}:{wid}",
+                window.window_id,
                 "-x",
                 str(cols),
                 "-y",
                 str(rows),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
+            if not res.ok:
                 logger.debug(
                     "resize-window failed for %s: %s",
-                    wid,
-                    stderr.decode(errors="replace").strip(),
+                    window.window_id,
+                    res.stderr.strip(),
                 )
 
     async def capture_pane(
@@ -526,58 +580,39 @@ class TmuxManager:
                 50-row viewport.
 
         Returns:
-            The captured text, or None on failure.
+            The captured text, or None on failure. The plain capture has its
+            trailing blank rows dropped; with ANSI or scrollback it is tmux's
+            output as is.
         """
+        args = ["capture-pane", "-p"]
+        if with_ansi:
+            args.append("-e")
+        args += ["-t", window_id]
+        if scrollback_lines > 0:
+            args += ["-S", f"-{scrollback_lines}"]
+        res = await self._tmux(*args)
+        if not res.ok:
+            logger.error("Failed to capture pane %s: %s", window_id, res.stderr.strip())
+            return None
         if with_ansi or scrollback_lines > 0:
-            # CLI path covers both ANSI capture and scrollback. libtmux's
-            # pane.capture_pane() defaults to visible-only and we don't
-            # need the extra knob in two places.
-            argv = ["tmux", "capture-pane", "-p", "-t", window_id]
-            if with_ansi:
-                argv.insert(2, "-e")
-            if scrollback_lines > 0:
-                argv.extend(["-S", f"-{scrollback_lines}"])
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode == 0:
-                    return stdout.decode("utf-8")
-                logger.error(
-                    f"Failed to capture pane {window_id}: {stderr.decode('utf-8')}"
-                )
-                return None
-            except Exception as e:
-                logger.error(f"Unexpected error capturing pane {window_id}: {e}")
-                return None
+            return res.stdout
+        return res.stdout.rstrip("\n")
 
-        # Original implementation for plain text - wrap in thread
-        def _sync_capture() -> str | None:
-            session = self.get_session()
-            if not session:
-                return None
-            try:
-                window = session.windows.get(window_id=window_id)
-                if not window:
-                    return None
-                pane = window.active_pane
-                if not pane:
-                    return None
-                lines = pane.capture_pane()
-                return "\n".join(lines) if isinstance(lines, list) else str(lines)
-            except Exception as e:
-                logger.error(f"Failed to capture pane {window_id}: {e}")
-                return None
-
-        return await asyncio.to_thread(_sync_capture)
+    async def _send_keys_once(self, window_id: str, *keys: str) -> bool:
+        res = await self._tmux("send-keys", "-t", window_id, *keys)
+        if not res.ok:
+            logger.error(
+                "send-keys failed for window %s: %s", window_id, res.stderr.strip()
+            )
+        return res.ok
 
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
     ) -> bool:
         """Send keys to a specific window.
+
+        Literal text goes as ``send-keys -l -- <text>``: without ``--`` a text
+        starting with "-" is eaten as tmux flags and the send fails.
 
         Args:
             window_id: The window ID to send to
@@ -589,158 +624,62 @@ class TmuxManager:
         Returns:
             True if successful, False otherwise
         """
-        if literal and enter:
-            # Split into text + delay + Enter via libtmux.
-            # Claude Code's TUI sometimes interprets a rapid-fire Enter
-            # (arriving in the same input batch as the text) as a newline
-            # rather than submit.  A 500ms gap lets the TUI process the
-            # text before receiving Enter.
-            def _send_literal(chars: str) -> bool:
-                session = self.get_session()
-                if not session:
-                    logger.error("No tmux session found")
-                    return False
-                try:
-                    window = session.windows.get(window_id=window_id)
-                    if not window:
-                        logger.error(f"Window {window_id} not found")
-                        return False
-                    pane = window.active_pane
-                    if not pane:
-                        logger.error(f"No active pane in window {window_id}")
-                        return False
-                    # Not pane.send_keys(literal=True): libtmux builds
-                    # `send-keys -l <text>` without `--`, so text starting
-                    # with "-" is eaten as tmux flags and the send fails.
-                    res = pane.cmd("send-keys", "-l", "--", chars)
-                    if res.stderr:
-                        logger.error(
-                            f"send-keys failed for window {window_id}: {res.stderr}"
-                        )
-                        return False
-                    return True
-                except Exception as e:
-                    logger.error(f"Failed to send keys to window {window_id}: {e}")
-                    return False
+        if not literal:
+            if text and not await self._send_keys_once(window_id, text):
+                return False
+            return not enter or await self._send_keys_once(window_id, "Enter")
+        if not enter:
+            return await self._send_keys_once(window_id, "-l", "--", text)
 
-            def _send_enter() -> bool:
-                session = self.get_session()
-                if not session:
-                    return False
-                try:
-                    window = session.windows.get(window_id=window_id)
-                    if not window:
-                        return False
-                    pane = window.active_pane
-                    if not pane:
-                        return False
-                    pane.send_keys("", enter=True, literal=False)
-                    return True
-                except Exception as e:
-                    logger.error(f"Failed to send Enter to window {window_id}: {e}")
-                    return False
-
+        # Text, a pause, then Enter on its own. Claude Code's TUI sometimes
+        # takes an Enter arriving in the same input batch as the text for a
+        # newline rather than submit; the gap lets it process the text first.
+        if text.startswith("!"):
             # Claude Code's ! command mode: send "!" first so the TUI
             # switches to bash mode, wait 1s, then send the rest.
-            if text.startswith("!"):
-                if not await asyncio.to_thread(_send_literal, "!"):
-                    return False
-                rest = text[1:]
-                if rest:
-                    await asyncio.sleep(1.0)
-                    if not await asyncio.to_thread(_send_literal, rest):
-                        return False
-            else:
-                # Split long text into chunks to avoid tmux buffer limits
-                chunk_size = 200
-                for i in range(0, len(text), chunk_size):
-                    chunk = text[i : i + chunk_size]
-                    if not await asyncio.to_thread(_send_literal, chunk):
-                        return False
-                    if i + chunk_size < len(text):
-                        await asyncio.sleep(0.1)
-            # Longer delay for multi-line/long text to let TUI process paste
-            delay = 1.5 if len(text) > 200 else 0.5
-            await asyncio.sleep(delay)
-            return await asyncio.to_thread(_send_enter)
-
-        # Other cases: special keys (literal=False) or no-enter
-        def _sync_send_keys() -> bool:
-            session = self.get_session()
-            if not session:
-                logger.error("No tmux session found")
+            if not await self._send_keys_once(window_id, "-l", "--", "!"):
                 return False
-
-            try:
-                window = session.windows.get(window_id=window_id)
-                if not window:
-                    logger.error(f"Window {window_id} not found")
+            rest = text[1:]
+            if rest:
+                await asyncio.sleep(1.0)
+                if not await self._send_keys_once(window_id, "-l", "--", rest):
                     return False
-
-                pane = window.active_pane
-                if not pane:
-                    logger.error(f"No active pane in window {window_id}")
+        else:
+            # Split long text into chunks to avoid tmux buffer limits
+            chunk_size = 200
+            for i in range(0, len(text), chunk_size):
+                chunk = text[i : i + chunk_size]
+                if not await self._send_keys_once(window_id, "-l", "--", chunk):
                     return False
-
-                if literal:
-                    # `--` guards text starting with "-" (see _send_literal).
-                    res = pane.cmd("send-keys", "-l", "--", text)
-                    if res.stderr:
-                        logger.error(
-                            f"send-keys failed for window {window_id}: {res.stderr}"
-                        )
-                        return False
-                    if enter:
-                        pane.send_keys("", enter=True, literal=False)
-                else:
-                    pane.send_keys(text, enter=enter, literal=literal)
-                return True
-
-            except Exception as e:
-                logger.error(f"Failed to send keys to window {window_id}: {e}")
-                return False
-
-        return await asyncio.to_thread(_sync_send_keys)
+                if i + chunk_size < len(text):
+                    await asyncio.sleep(0.1)
+        # Longer delay for multi-line/long text to let TUI process paste
+        delay = 1.5 if len(text) > 200 else 0.5
+        await asyncio.sleep(delay)
+        return await self._send_keys_once(window_id, "Enter")
 
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename a tmux window by its ID."""
-
-        def _sync_rename() -> bool:
-            session = self.get_session()
-            if not session:
-                return False
-            try:
-                window = session.windows.get(window_id=window_id)
-                if not window:
-                    return False
-                window.rename_window(new_name)
-                logger.info("Renamed window %s to '%s'", window_id, new_name)
-                return True
-            except Exception as e:
-                logger.error(f"Failed to rename window {window_id}: {e}")
-                return False
-
-        return await asyncio.to_thread(_sync_rename)
+        res = await self._tmux("rename-window", "-t", window_id, new_name)
+        if not res.ok:
+            logger.error(
+                "Failed to rename window %s: %s", window_id, res.stderr.strip()
+            )
+            return False
+        logger.info("Renamed window %s to '%s'", window_id, new_name)
+        return True
 
     async def kill_window(self, window_id: str) -> bool:
-        """Kill a tmux window by its ID."""
-
-        def _sync_kill() -> bool:
-            session = self.get_session()
-            if not session:
-                return False
-            try:
-                window = session.windows.get(window_id=window_id)
-                if not window:
-                    return False
-                window.kill()
-                logger.info("Killed window %s", window_id)
-                return True
-            except Exception as e:
-                logger.error(f"Failed to kill window {window_id}: {e}")
-                return False
-
-        return await asyncio.to_thread(_sync_kill)
+        """Kill a tmux window by its ID. False if it failed or was already gone."""
+        res = await self._tmux("kill-window", "-t", window_id)
+        if not res.ok:
+            if "can't find window" not in res.stderr:
+                logger.error(
+                    "Failed to kill window %s: %s", window_id, res.stderr.strip()
+                )
+            return False
+        logger.info("Killed window %s", window_id)
+        return True
 
     async def create_window(
         self,
@@ -773,61 +712,69 @@ class TmuxManager:
 
         # Create window name, adding suffix if name already exists
         final_window_name = window_name if window_name else path.name
-
-        # Check for existing window name
         base_name = final_window_name
         counter = 2
-        while await self.find_window_by_name(final_window_name):
-            final_window_name = f"{base_name}-{counter}"
-            counter += 1
+        try:
+            while await self.find_window_by_name(final_window_name):
+                final_window_name = f"{base_name}-{counter}"
+                counter += 1
+            sid = await asyncio.to_thread(self.ensure_session)
+        except TmuxReadError as e:
+            logger.error("Failed to create window: %s", e)
+            return False, f"Failed to create window: {e}", "", ""
 
-        # Create window in thread
-        def _create_and_start() -> tuple[bool, str, str, str]:
-            session = self.get_or_create_session()
+        res = await self._tmux(
+            "new-window",
+            "-d",
+            "-t",
+            f"{sid}:",
+            "-n",
+            final_window_name,
+            "-c",
+            str(path),
+            "-P",
+            "-F",
+            "#{window_id}",
+        )
+        if not res.ok:
+            logger.error("Failed to create window: %s", res.stderr.strip())
+            return False, f"Failed to create window: {res.stderr.strip()}", "", ""
+        wid = res.stdout.strip()
+        if not _WINDOW_ID_RE.fullmatch(wid):
+            # The -P line can be cut like any -F row (see TmuxReadError); the
+            # name was just made unique, so it finds the window.
             try:
-                # Create new window
-                window = session.new_window(
-                    window_name=final_window_name,
-                    start_directory=str(path),
-                )
+                found = await self.find_window_by_name(final_window_name)
+            except TmuxReadError:
+                found = None
+            if found is None:
+                logger.error("Created window '%s' but lost its id", final_window_name)
+                return False, "Failed to create window: tmux lost its id", "", ""
+            wid = found.window_id
 
-                wid = window.window_id or ""
+        # Prevent Claude Code from overriding window name
+        await self._tmux("set-option", "-w", "-t", wid, "allow-rename", "off")
 
-                # Prevent Claude Code from overriding window name
-                window.set_window_option("allow-rename", "off")
+        # Start the agent CLI if requested. The launch/resume command is
+        # runtime-specific (claude: `claude --name X [--resume Y]`; codex:
+        # `codex [resume Y]`) and built by the runtime — which also
+        # shlex-quotes the window name and validates the resume id (an
+        # unvalidated id typed into the shell is a command-injection vector).
+        # (audit HIGH#1 / MEDIUM)
+        if start_claude:
+            cmd = get_runtime(runtime).launch_command(
+                final_window_name, resume_session_id
+            )
+            await self.send_keys(wid, cmd, enter=False)
+            await self._send_keys_once(wid, "Enter")
 
-                # Start the agent CLI if requested. The launch/resume command
-                # is runtime-specific (claude: `claude --name X [--resume Y]`;
-                # codex: `codex [resume Y]`) and built by the runtime — which
-                # also shlex-quotes the window name and validates the resume id
-                # (an unvalidated id typed into the shell is a command-injection
-                # vector). (audit HIGH#1 / MEDIUM)
-                if start_claude:
-                    pane = window.active_pane
-                    if pane:
-                        cmd = get_runtime(runtime).launch_command(
-                            final_window_name, resume_session_id
-                        )
-                        pane.send_keys(cmd, enter=True)
-
-                logger.info(
-                    "Created window '%s' (id=%s) at %s",
-                    final_window_name,
-                    wid,
-                    path,
-                )
-                return (
-                    True,
-                    f"Created window '{final_window_name}' at {path}",
-                    final_window_name,
-                    wid,
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to create window: {e}")
-                return False, f"Failed to create window: {e}", "", ""
-
-        return await asyncio.to_thread(_create_and_start)
+        logger.info("Created window '%s' (id=%s) at %s", final_window_name, wid, path)
+        return (
+            True,
+            f"Created window '{final_window_name}' at {path}",
+            final_window_name,
+            wid,
+        )
 
 
 # Global instance with default session name

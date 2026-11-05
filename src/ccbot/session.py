@@ -68,6 +68,9 @@ UNSENT_IN_COMPOSER = (
     "The message was typed but the agent did not accept it — it is still "
     "in the input box. The agent may be stuck; try restarting it."
 )
+# How long a window unbound as gone may still be handed back to its topic.
+LOST_WINDOW_TTL = 600.0  # seconds
+
 # Sent back when tmux couldn't be read: the window may well be alive, so this
 # must not read as "the agent is gone".
 TMUX_UNREADABLE = "Couldn't reach the agent's terminal just now. Please try again."
@@ -222,6 +225,12 @@ class SessionManager:
     # unknown). Filled by resolve_stale_ids, drained once at boot by
     # agent_restart.resume_agents_after_boot (CCBOT_AUTO_RESUME_AGENTS).
     boot_orphans: list[tuple[int, int, str]] = field(default_factory=list)
+    # Not persisted: tmux windows a topic was unbound from because they LOOKED
+    # gone (unbind_lost_window), as window_id -> (user_id, thread_id, window
+    # name, monotonic time). If such a window turns up alive, the orphan
+    # janitor hands it back to its topic (reclaim_lost_window) instead of
+    # killing it — an unbind is otherwise half a kill.
+    lost_windows: dict[str, tuple[int, int, str, float]] = field(default_factory=dict)
     # Topics whose agent ccbot created as an EXTRA beside an existing one —
     # the ➕ sibling flow ("user_id:thread_id" keys). Only these (and worktree
     # topics, tracked by worktree_meta) may be torn down from the panel's 🗑:
@@ -2280,6 +2289,44 @@ class SessionManager:
             user_id,
         )
         return window_id
+
+    def unbind_lost_window(self, user_id: int, thread_id: int) -> str | None:
+        """Unbind a topic whose tmux window looks gone, remembering the window.
+
+        For every unbind decided on "tmux doesn't show the window" rather than
+        on a kill we did ourselves. Returns the previously bound window_id.
+        """
+        window_id = self.unbind_thread(user_id, thread_id)
+        if window_id is not None and not self._is_docker_binding(window_id):
+            self.lost_windows[window_id] = (
+                user_id,
+                thread_id,
+                self.get_display_name(window_id),
+                time.monotonic(),
+            )
+        return window_id
+
+    def reclaim_lost_window(
+        self, window_id: str, window_name: str
+    ) -> tuple[int, int] | None:
+        """Bind a lost window that turned out alive back to its topic.
+
+        Only within LOST_WINDOW_TTL, only under the same window name (tmux
+        reuses ids after a server restart), and only while the topic is still
+        unbound. Returns the (user_id, thread_id) it went back to, or None.
+        """
+        now = time.monotonic()
+        for wid, (*_, lost_at) in list(self.lost_windows.items()):
+            if now - lost_at > LOST_WINDOW_TTL:
+                del self.lost_windows[wid]
+        lost = self.lost_windows.pop(window_id, None)
+        if lost is None:
+            return None
+        user_id, thread_id, name, _ = lost
+        if name != window_name or self.get_window_for_thread(user_id, thread_id):
+            return None
+        self.bind_thread(user_id, thread_id, window_id)
+        return user_id, thread_id
 
     def get_window_for_thread(self, user_id: int, thread_id: int) -> str | None:
         """Look up the window_id bound to a thread."""

@@ -147,9 +147,9 @@ def main() -> None:
             config.config_dir,
         )
 
-    # Preflight: missing binaries fail in confusing places later (libtmux
-    # raises deep inside get_or_create_session; a missing `claude` makes every
-    # agent window die silently 30s after creation) — check them up front.
+    # Preflight: missing binaries fail in confusing places later (every tmux
+    # call fails one by one; a missing `claude` makes every agent window die
+    # silently 30s after creation) — check them up front.
     import shutil
 
     if shutil.which("tmux") is None:
@@ -167,8 +167,8 @@ def main() -> None:
         )
 
     # Ensure tmux session exists
-    session = tmux_manager.get_or_create_session()
-    logger.info("Tmux session '%s' ready", session.session_name)
+    session_id = tmux_manager.ensure_session()
+    logger.info("Tmux session '%s' (%s) ready", tmux_manager.session_name, session_id)
 
     logger.info("Starting Telegram bot...")
     from .bot import create_bot

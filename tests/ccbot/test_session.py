@@ -1,6 +1,7 @@
 """Tests for SessionManager pure dict operations."""
 
 import json
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -576,6 +577,50 @@ class TestResolveStaleIdsOnUnreadableTmux:
         assert mgr.get_window_for_thread(100, 1) == "@4"
         assert "@4" in mgr.window_states
         assert mgr.boot_orphans == []
+
+
+class TestLostWindows:
+    """A window unbound because it looked gone goes back to its topic if it
+    turns out alive — otherwise the janitor would kill it 90 s later."""
+
+    def test_alive_window_goes_back_to_its_topic(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@4", window_name="proj")
+        assert mgr.unbind_lost_window(100, 1) == "@4"
+        assert mgr.get_window_for_thread(100, 1) is None
+        assert mgr.reclaim_lost_window("@4", "proj") == (100, 1)
+        assert mgr.get_window_for_thread(100, 1) == "@4"
+        assert mgr.reclaim_lost_window("@4", "proj") is None  # one-shot
+
+    def test_not_reclaimed_when_it_is_another_window(self, mgr: SessionManager) -> None:
+        # tmux reuses window ids after a server restart.
+        mgr.bind_thread(100, 1, "@4", window_name="proj")
+        mgr.unbind_lost_window(100, 1)
+        assert mgr.reclaim_lost_window("@4", "other") is None
+        assert mgr.get_window_for_thread(100, 1) is None
+
+    def test_not_reclaimed_when_the_topic_moved_on(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@4", window_name="proj")
+        mgr.unbind_lost_window(100, 1)
+        mgr.bind_thread(100, 1, "@9", window_name="proj-2")
+        assert mgr.reclaim_lost_window("@4", "proj") is None
+        assert mgr.get_window_for_thread(100, 1) == "@9"
+
+    def test_not_reclaimed_after_the_ttl(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from ccbot import session as session_mod
+
+        mgr.bind_thread(100, 1, "@4", window_name="proj")
+        mgr.unbind_lost_window(100, 1)
+        later = time.monotonic() + session_mod.LOST_WINDOW_TTL + 1
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: later)
+        assert mgr.reclaim_lost_window("@4", "proj") is None
+        assert mgr.lost_windows == {}
+
+    def test_docker_bindings_are_not_recorded(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "docker:assistant")
+        mgr.unbind_lost_window(100, 1)
+        assert mgr.lost_windows == {}
 
 
 class TestBootOrphans:

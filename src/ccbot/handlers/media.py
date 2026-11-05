@@ -175,7 +175,7 @@ async def _validate_media_context(
             gone = False  # unknown: deliver anyway, the send reports a failure
         if gone:
             display = session_manager.get_display_name(wid)
-            session_manager.unbind_thread(user_id, thread_id)
+            session_manager.unbind_lost_window(user_id, thread_id)
             if update.message:
                 await safe_reply(
                     update.message,

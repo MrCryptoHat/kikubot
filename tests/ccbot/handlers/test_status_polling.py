@@ -371,7 +371,7 @@ class TestStaleBindingNeedsSustainedAbsence:
         for _ in range(3):
             await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
             clock[0] += sp.STALE_BINDING_GRACE
-        sm.unbind_thread.assert_not_called()
+        sm.unbind_lost_window.assert_not_called()
 
     async def test_unbinds_only_after_the_grace(self, monkeypatch):
         clock = [100.0]
@@ -379,10 +379,10 @@ class TestStaleBindingNeedsSustainedAbsence:
         await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
         clock[0] += sp.STALE_BINDING_GRACE - 0.1
         await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
-        sm.unbind_thread.assert_not_called()
+        sm.unbind_lost_window.assert_not_called()
         clock[0] += 0.1
         await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
-        sm.unbind_thread.assert_called_once_with(1, 42)
+        sm.unbind_lost_window.assert_called_once_with(1, 42)
 
     async def test_a_sighting_restarts_the_grace(self, monkeypatch):
         clock = [100.0]
@@ -395,4 +395,41 @@ class TestStaleBindingNeedsSustainedAbsence:
         find.return_value = None
         clock[0] += 2
         await sp._poll_one_binding(MagicMock(), 1, 42, "@40")
-        sm.unbind_thread.assert_not_called()
+        sm.unbind_lost_window.assert_not_called()
+
+
+class TestOrphanJanitorReclaims:
+    async def test_lost_window_alive_goes_back_instead_of_dying(self, monkeypatch):
+        from ccbot.handlers import status_polling as sp
+        from ccbot.tmux_manager import TmuxWindow
+
+        sm = MagicMock()
+        sm.iter_thread_bindings.return_value = []  # its topic was the only one
+        sm.reclaim_lost_window.side_effect = lambda wid, name: (
+            (1, 42) if wid == "@40" else None
+        )
+        sm.resolve_chat_id.return_value = -100
+        monkeypatch.setattr(sp, "session_manager", sm)
+        monkeypatch.setattr(
+            sp.tmux_manager,
+            "list_windows",
+            AsyncMock(
+                return_value=[
+                    TmuxWindow("@40", "proj", "/p"),
+                    TmuxWindow("@41", "x", "/p"),
+                ]
+            ),
+        )
+        kill = AsyncMock()
+        monkeypatch.setattr(sp.tmux_manager, "kill_window", kill)
+        send = AsyncMock()
+        monkeypatch.setattr(sp, "safe_send", send)
+        monkeypatch.setattr(sp, "_orphan_since", {})
+
+        await sp._orphan_janitor(MagicMock())
+
+        sm.reclaim_lost_window.assert_any_call("@40", "proj")
+        assert send.await_args.kwargs["message_thread_id"] == 42
+        assert "@40" not in sp._orphan_since
+        assert "@41" in sp._orphan_since  # an ordinary orphan: grace starts
+        kill.assert_not_called()

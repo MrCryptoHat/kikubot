@@ -478,7 +478,7 @@ async def _forward_text_to_agent(
                 user_id,
                 thread_id,
             )
-            session_manager.unbind_thread(user_id, thread_id)
+            session_manager.unbind_lost_window(user_id, thread_id)
             await safe_reply(
                 update.message,
                 i18n.tr("bot.window_gone", name=display),

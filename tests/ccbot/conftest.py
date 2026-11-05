@@ -4,9 +4,15 @@ Provides factories for building JSONL entries, content blocks,
 and sample pane text for terminal parser tests.
 """
 
+import os
+import shlex
+import shutil
+import subprocess
 import time
 
 import pytest
+
+from ccbot.tmux_manager import TmuxManager
 
 
 # ── JSONL entry factories ────────────────────────────────────────────────
@@ -184,3 +190,46 @@ def sample_pane_settings():
 @pytest.fixture
 def sample_pane_no_ui():
     return "$ echo hello\nhello\n$\n"
+
+
+# ── Real tmux ─────────────────────────────────────────────────────────────
+
+TMUX = shutil.which("tmux")
+
+
+@pytest.fixture
+def tmux_server():
+    """A throwaway tmux server on a private socket, /bin/sh panes, no config.
+
+    /bin/sh and -f /dev/null keep the user's dotfiles out of the timing, and
+    the private socket keeps the test away from any real ccbot session.
+    Yields ``(tmux, manager, signal)`` — ``signal`` is the shell prefix that
+    fires a ``wait-for`` channel from inside a pane.
+    """
+    assert TMUX is not None
+    binary: str = TMUX
+    socket = f"ccbot-liveness-{os.getpid()}"
+    env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+    env.update(SHELL="/bin/sh", ENV="")
+
+    def tmux(*args: str) -> str:
+        return subprocess.run(
+            [binary, "-L", socket, "-f", "/dev/null", *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout
+
+    tmux("new-session", "-d", "-s", "t", "-n", "agent")
+    manager = TmuxManager(session_name="t", socket_name=socket)
+    try:
+        yield tmux, manager, f"{shlex.quote(binary)} -L {socket} wait-for -S"
+    finally:
+        subprocess.run(
+            [binary, "-L", socket, "kill-server"],
+            env=env,
+            capture_output=True,
+            timeout=10,
+        )
