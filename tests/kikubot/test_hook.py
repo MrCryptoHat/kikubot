@@ -193,44 +193,6 @@ class TestInstallHookRepair:
         assert f.read_text() == before
 
 
-class TestLegacyHookEntry:
-    """A `ccbot hook` entry from before the rename (legacy.py — delete with it)."""
-
-    @staticmethod
-    def _commands(f: Path) -> list[str]:
-        saved = json.loads(f.read_text())
-        return [
-            h["command"] for e in saved["hooks"]["SessionStart"] for h in e["hooks"]
-        ]
-
-    def test_upgraded_to_the_kikubot_beside_it(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        bin_dir = tmp_path / "venv" / "bin"
-        bin_dir.mkdir(parents=True)
-        for name in ("ccbot", "kikubot"):
-            (bin_dir / name).write_text("#!/bin/sh\n")
-        f = TestHookInstalledInSettings._write_settings(
-            tmp_path, f"{bin_dir / 'ccbot'} hook"
-        )
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-        assert hook.upgrade_legacy_hook() != []
-        assert self._commands(f) == [f"{bin_dir / 'kikubot'} hook"]
-        assert hook.upgrade_legacy_hook() == []  # nothing left to do
-
-    def test_install_repairs_it_instead_of_adding_a_second(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        exe = tmp_path / "bin" / "ccbot"
-        exe.parent.mkdir()
-        exe.write_text("#!/bin/sh\n")
-        f = TestHookInstalledInSettings._write_settings(tmp_path, f"{exe} hook")
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-        monkeypatch.setattr(hook, "_find_kikubot_path", lambda: "/v/bin/kikubot")
-        assert hook._install_hook() == 0
-        assert self._commands(f) == ["/v/bin/kikubot hook"]
-
-
 class TestUninstallHook:
     def test_removes_entry_and_preserves_other_hooks(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

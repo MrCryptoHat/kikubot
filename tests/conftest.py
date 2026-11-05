@@ -42,25 +42,3 @@ os.environ["TELEGRAM_BOT_TOKEN"] = "test:0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAA
 os.environ["ALLOWED_USERS"] = "12345"
 os.environ["KIKUBOT_USER_ALIASES"] = ""
 os.environ["KIKUBOT_DIR"] = tempfile.mkdtemp(prefix="kikubot-test-")
-
-
-@pytest.fixture(autouse=True)
-def _no_migration_of_the_real_install(monkeypatch, tmp_path_factory):
-    """legacy.migrate on a real path would rename the live tmux session and
-    rewrite the repo's .env — refuse it, and keep its tmux off the real server."""
-    from pathlib import Path
-
-    from kikubot import legacy
-
-    real_migrate = legacy.migrate
-    base = tmp_path_factory.getbasetemp().resolve()
-
-    def guarded(home, cwd):
-        for path in (home, cwd):
-            resolved = Path(path).resolve()
-            if resolved != base and base not in resolved.parents:
-                raise AssertionError(f"legacy.migrate on a real path: {path}")
-        return real_migrate(home, cwd)
-
-    monkeypatch.setattr(legacy, "migrate", guarded)
-    monkeypatch.setattr(legacy, "TMUX_SOCKET", f"kikubot-test-nothing-{os.getpid()}")

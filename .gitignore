@@ -69,11 +69,6 @@ venv.bak/
 # Project specific
 .uv/
 
-# The package dir before the rename: a plugin checkout's leftover links
-# (remove with src/kikubot/legacy.py).
-/src/ccbot/
-/tests/ccbot/
-
 # --- Server-specific plugins (private kikubot-plugins overlay) ---
 # Symlinked/checked out here on a configured deployment; NEVER committed to
 # the public tree. Activated via KIKUBOT_PLUGINS in .env. See kikubot-plugins.

@@ -47,7 +47,7 @@ kikubot hook --install                  # Auto-install Claude Code SessionStart 
 
 Env names, defaults and paths are in `config.py`; state-file contents in architecture.md «State files». What those don't tell you:
 
-- **The rename from ccbot lives entirely in `legacy.py`** — the startup migration of an old install plus the old names still accepted (`ccbot` command, `~/.ccbot`, `CCBOT_*`). Delete it as one commit after 2027-01-31 (its docstring lists every call site); until then don't read old names anywhere else.
+- **The old name (ccbot, `~/.ccbot`, `CCBOT_*`) is not read anywhere** — the migration was removed; an old install upgrades through commit `aeed5005d18f` (docs/upgrading-from-ccbot.md). Don't add fallbacks for it. `~/.ccbot` survives on deployments as a symlink only because old transcripts name files under it.
 
 - A local `.env` wins over the config-dir one.
 - **User aliases** (`KIKUBOT_USER_ALIASES`) let extra ids act AS an allowed user — same bindings, same sessions. So handlers must take the sender via `handlers.effective_user(update)`, **never raw `update.effective_user`**: every per-user structure keys on `user.id`, and an unaliased read forks the account into a parallel binding universe. The same seam makes a topic single-agent across users: a second allowed user with no binding in a topic someone's agent already serves acts as that owner (`session_manager.topic_owner`) — bindings are per user, so without it they launched a second window on the same session and every reply arrived twice.

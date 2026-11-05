@@ -11,7 +11,6 @@ import logging
 import logging.handlers
 import os
 import sys
-from pathlib import Path
 
 
 _USAGE = """\
@@ -55,16 +54,6 @@ def main() -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.WARNING,
     )
-
-    # An install from before the rename moves first: config must already find
-    # the new dir, variable names and tmux session (legacy.py).
-    from . import legacy
-
-    try:
-        migrated = legacy.migrate(Path.home(), Path.cwd())
-    except legacy.MigrationError as e:
-        print(f"Error: can't move this install from ccbot to kikubot: {e}")
-        sys.exit(1)
 
     # Import config before enabling DEBUG — avoid leaking debug logs on config errors
     try:
@@ -125,20 +114,6 @@ def main() -> None:
     logger = logging.getLogger(__name__)
 
     from . import config as config_module
-    from .hook import upgrade_legacy_hook
-
-    migrated += upgrade_legacy_hook()
-    for step in migrated:
-        logger.warning("Moved from ccbot: %s", step)
-    for name in config_module.legacy_env_adopted:
-        logger.warning(
-            "%s is set outside the bot's .env (a service unit or shell profile?) "
-            "— read as %s%s; rename it, the old name stops working in 2027",
-            name,
-            legacy.NEW_PREFIX,
-            name[len(legacy.OLD_PREFIX) :],
-        )
-
     from .tmux_manager import tmux_manager
 
     logger.info("Allowed users: %s", config.allowed_users)

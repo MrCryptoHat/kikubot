@@ -54,27 +54,6 @@ class TestKikubotDir:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         assert kikubot_dir() == tmp_path / ".kikubot"
 
-    def test_an_unmigrated_ccbot_install_keeps_its_dir(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ):
-        # Agents' hooks run the new code before the bot restarts and migrates;
-        # they must keep writing where the still-running old bot reads.
-        monkeypatch.delenv("KIKUBOT_DIR", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        (tmp_path / ".ccbot").mkdir()
-        assert kikubot_dir() == tmp_path / ".ccbot"
-        monkeypatch.setenv("CCBOT_DIR", "/old/custom")
-        assert kikubot_dir() == Path("/old/custom")
-
-    def test_a_migrated_install_uses_the_new_dir(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ):
-        monkeypatch.delenv("KIKUBOT_DIR", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        (tmp_path / ".kikubot").mkdir()
-        (tmp_path / ".ccbot").symlink_to(tmp_path / ".kikubot")
-        assert kikubot_dir() == tmp_path / ".kikubot"
-
     def test_expands_tilde(self, monkeypatch: pytest.MonkeyPatch):
         # dotenv does no tilde expansion — a `.env` line `KIKUBOT_DIR=~/.kikubot`
         # must not become a literal `./~` directory.

@@ -26,7 +26,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import legacy
 
 from .procinfo import read_proc_stat
 
@@ -273,8 +272,6 @@ def _is_kikubot_hook_command(cmd: str) -> bool:
         return False
     if len(parts) == 2 and parts[1] == "hook" and Path(parts[0]).name == "kikubot":
         return True
-    if legacy.is_hook_command(cmd):
-        return True
     return cmd == _HOOK_COMMAND_SUFFIX or cmd.endswith("/" + _HOOK_COMMAND_SUFFIX)
 
 
@@ -382,9 +379,7 @@ def _install_hook() -> int:
     # of reporting success on a dead hook.
     existing = _find_hook_entry(settings)
     if existing is not None:
-        if _hook_command_runnable(existing.get("command", "")) and (
-            not legacy.is_hook_command(existing.get("command", ""))
-        ):
+        if _hook_command_runnable(existing.get("command", "")):
             logger.info("Hook already installed in %s", settings_file)
             print(f"Hook already installed in {settings_file}")
             return 0
@@ -417,33 +412,6 @@ def _install_hook() -> int:
     logger.info("Hook installed successfully in %s", settings_file)
     print(f"Hook installed successfully in {settings_file}")
     return 0
-
-
-def upgrade_legacy_hook() -> list[str]:
-    """Point a `ccbot hook` entry in Claude's settings at `kikubot`; legacy.py.
-
-    Prefers the `kikubot` beside the old executable — the same install, renamed.
-    Returns what was done, for the startup log (empty: nothing to do).
-    """
-    settings_file = _claude_settings_file()
-    try:
-        settings = json.loads(settings_file.read_text())
-    except (OSError, json.JSONDecodeError):
-        return []
-    entry = _find_hook_entry(settings) if isinstance(settings, dict) else None
-    old_command = entry.get("command", "") if entry else ""
-    if entry is None or not legacy.is_hook_command(old_command):
-        return []
-    sibling = Path(shlex.split(old_command)[0]).with_name("kikubot")
-    executable = str(sibling) if sibling.exists() else _find_kikubot_path()
-    entry["command"] = f"{shlex.quote(executable)} hook"
-    tmp = settings_file.with_name(settings_file.name + ".kikubot-tmp")
-    try:
-        tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
-        os.replace(tmp, settings_file)
-    except OSError as e:
-        return [f"could not update the hook in {settings_file}: {e}"]
-    return [f"hook in {settings_file}: {old_command} -> {entry['command']}"]
 
 
 def _uninstall_hook() -> int:

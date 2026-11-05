@@ -37,9 +37,6 @@ dependencies = [
 
 [project.scripts]
 kikubot = "kikubot.main:main"
-# The old name, for hooks and service units written before the rename —
-# remove with src/kikubot/legacy.py (after 2027-01-31).
-ccbot = "kikubot.main:main"
 
 [project.urls]
 Homepage = "https://github.com/MrCryptoHat/kikubot"

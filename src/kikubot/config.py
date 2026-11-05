@@ -17,7 +17,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from . import legacy
 from . import plugins as _plugins
 from .utils import kikubot_dir
 
@@ -257,7 +256,6 @@ class Config:
         if global_env.is_file():
             load_dotenv(global_env)
             logger.debug("Loaded env from %s", global_env)
-        legacy_env_adopted.extend(legacy.adopt_env(os.environ))
 
         self.telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN") or ""
         if not self.telegram_bot_token:
@@ -733,9 +731,6 @@ def _preload_dotenv() -> None:
 # its own tmux session (tmux_manager._export_kikubot_dir), but a `claude` run
 # from a plain shell would still write session_map.json to ~/.kikubot.
 # main.py uses this to warn at startup.
-# Old CCBOT_* names from outside the bot's own files (a systemd unit, a shell
-# profile) count under the new ones; main.py warns about each. legacy.py.
-legacy_env_adopted: list[str] = legacy.adopt_env(os.environ)
 kikubot_dir_from_shell: bool = "KIKUBOT_DIR" in os.environ
 
 # Ordering matters:
@@ -750,7 +745,6 @@ kikubot_dir_from_shell: bool = "KIKUBOT_DIR" in os.environ
 # server inherits no secrets. `plugins` doesn't import `config`, so no
 # circular import risk.
 _preload_dotenv()
-legacy_env_adopted.extend(legacy.adopt_env(os.environ))
 _plugins.preload_configs()
 
 config = Config()

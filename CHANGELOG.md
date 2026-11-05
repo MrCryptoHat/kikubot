@@ -10,10 +10,10 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
 
 - **Renamed: ccbot is now Kiku Bot** — package and command `kikubot`, data dir
   `~/.kikubot`, variables `KIKUBOT_*`, tmux session `kikubot`, plugins
-  `kikubot.<name>`, repository `MrCryptoHat/kikubot`. An existing install moves
-  over by itself on its first start, agents keep running; until 2027-01-31 the
-  old command, data path and variable names keep working. See
-  [docs/upgrading-from-ccbot.md](docs/upgrading-from-ccbot.md).
+  `kikubot.<name>`, repository `MrCryptoHat/kikubot`. The old names are not
+  read any more: an existing install upgrades through commit `aeed5005d18f`,
+  which moves it over by itself on its first start while agents keep running.
+  See [docs/upgrading-from-ccbot.md](docs/upgrading-from-ccbot.md).
 
 ### Fixed
 

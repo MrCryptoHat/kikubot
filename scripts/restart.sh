@@ -11,8 +11,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # default "kikubot".
 TMUX_SESSION="${TMUX_SESSION_NAME:-}"
 if [ -z "$TMUX_SESSION" ]; then
-    # ~/.ccbot: an install from before the rename (src/kikubot/legacy.py).
-    for _envf in "$PROJECT_DIR/.env" "${KIKUBOT_DIR:-$HOME/.kikubot}/.env" "${CCBOT_DIR:-$HOME/.ccbot}/.env"; do
+    for _envf in "$PROJECT_DIR/.env" "${KIKUBOT_DIR:-$HOME/.kikubot}/.env"; do
         [ -f "$_envf" ] || continue
         # `|| true`: under `set -e`+pipefail a no-match grep (var absent from
         # this .env — the documented default case) would otherwise abort the
@@ -25,8 +24,6 @@ if [ -z "$TMUX_SESSION" ]; then
         [ -n "$_v" ] && TMUX_SESSION="$_v" && break
     done
 fi
-SESSION_DEFAULTED=0
-[ -z "$TMUX_SESSION" ] && SESSION_DEFAULTED=1
 TMUX_SESSION="${TMUX_SESSION:-kikubot}"
 
 TMUX_WINDOW="__main__"
@@ -34,9 +31,8 @@ TARGET="${TMUX_SESSION}:${TMUX_WINDOW}"
 MAX_WAIT=10  # seconds to wait for graceful SIGINT shutdown
 # Match the running bot on its console-script path — covers `uv run`
 # (.venv/bin/kikubot), `uv tool`, and pipx/PATH installs. Requires `/bin/`
-# so it can't match a process that merely mentions the repo path. `ccbot`:
-# a bot started before the rename (remove with src/kikubot/legacy.py).
-BOT_PATTERN='/bin/(kikubot|ccbot)([[:space:]]|$)'
+# so it can't match a process that merely mentions the repo path.
+BOT_PATTERN='/bin/kikubot([[:space:]]|$)'
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "Error: 'uv' not found in PATH — install it: https://docs.astral.sh/uv/" >&2
@@ -75,8 +71,8 @@ bot_pids() {
             cmdline="$(ps -o command= -p "$pid" 2>/dev/null || true)"
         fi
         case "$cmdline" in
-            *"$PROJECT_DIR/.venv/bin/kikubot"*|*"$PROJECT_DIR/.venv/bin/ccbot"*) ;;  # this repo's instance
-            *"/.venv/bin/kikubot"*|*"/.venv/bin/ccbot"*) continue ;;  # another checkout's — leave it alone
+            *"$PROJECT_DIR/.venv/bin/kikubot"*) ;;  # this repo's instance
+            *"/.venv/bin/kikubot"*) continue ;;    # another checkout's — leave it alone
             *) ;;                                  # unattributable install — legacy behavior
         esac
         printf '%s\n' "$pid"
@@ -110,15 +106,6 @@ if [ -n "$pids" ]; then
     echo "Stopped."
 else
     echo "No kikubot process running."
-fi
-
-# 1b. Before the rename the default session was "ccbot". Renaming it keeps
-#     every agent running; only now, with the old bot stopped — it finds its
-#     session by name. Remove with src/kikubot/legacy.py.
-if [ "$SESSION_DEFAULTED" = 1 ] && ! tmux has-session -t "=$TMUX_SESSION" 2>/dev/null \
-        && tmux has-session -t "=ccbot" 2>/dev/null; then
-    echo "Renaming tmux session 'ccbot' to '$TMUX_SESSION'..."
-    tmux rename-session -t "=ccbot" "$TMUX_SESSION"
 fi
 
 # 2. Ensure tmux session exists (recover from full tmux restart).

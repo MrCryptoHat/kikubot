@@ -20,7 +20,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import legacy
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +57,12 @@ def kikubot_dir() -> Path:
 
     ``expanduser()`` because dotenv does no tilde expansion: a `.env` line
     ``KIKUBOT_DIR=~/.kikubot`` would otherwise become a literal ``./~`` directory
-    created relative to the cwd. Until an install has migrated from ccbot, its
-    old dir and variable still count (see legacy.py).
+    created relative to the cwd.
     """
-    raw = os.environ.get(KIKUBOT_DIR_ENV, "") or legacy.dir_from_env()
+    raw = os.environ.get(KIKUBOT_DIR_ENV, "")
     if raw:
         return Path(raw).expanduser()
-    return legacy.unmigrated_dir() or Path.home() / ".kikubot"
+    return Path.home() / ".kikubot"
 
 
 def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:

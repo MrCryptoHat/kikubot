@@ -349,8 +349,8 @@ and you can always `tmux attach` back. See [How it compares](#how-it-compares).
 **Why "Kiku"?**
 聞く (*kiku*) is Japanese for "to listen": the bot keeps an ear on every agent
 in your fleet and relays what it says — and you can talk back, by voice too.
-It was called *ccbot* until November 2026; an old install moves over by itself
-on its first start — see [Upgrading from ccbot](docs/upgrading-from-ccbot.md).
+It was called *ccbot* until November 2026; an old install upgrades through the
+last version that moves it over — see [Upgrading from ccbot](docs/upgrading-from-ccbot.md).
 
 **Is my code exposed to a third party?**
 No middleman: traffic flows between your server and Telegram's Bot API under

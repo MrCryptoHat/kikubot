@@ -1,17 +1,21 @@
 # Upgrading from ccbot
 
-Kiku Bot was called **ccbot** until November 2026. If you run an install from
-before the rename, update the checkout and restart the bot — that's all most
-installs need:
+Kiku Bot was called **ccbot** until November 2026. The current code no longer
+knows the old name, so an install from before the rename upgrades through the
+last version that moves it over by itself, commit `aeed5005d18f`:
 
 ```bash
-git pull                     # GitHub redirects the old repository URL
-./scripts/restart.sh         # stops the old `ccbot` process, starts `kikubot`
+git fetch                          # GitHub redirects the old repository URL
+git checkout aeed5005d18f
+./scripts/restart.sh               # stops the old `ccbot` process, starts `kikubot`, moves the install
+grep 'Moved from ccbot' ~/.kikubot/logs/kikubot.log   # what it moved
+git checkout main
+./scripts/restart.sh
 ```
 
-## What moves by itself
+## What the move does
 
-On its first start the new code moves the install once, before reading any
+On its first start that version moves the install once, before reading any
 configuration, and logs every step as `Moved from ccbot: …`:
 
 | Before | After |
@@ -32,31 +36,29 @@ The bot refuses to start, saying why, if both the old and the new data dir or
 tmux session already exist: merging them is your call. Move what you need
 into the new one, then start again.
 
-## What keeps working until 2027-01-31
+## What to change yourself before going back to `main`
 
-Agents launched before the update still hold the old names, and files outside
-the bot can't be rewritten from inside it, so for a while:
-
-- the `ccbot` command still works (hooks of running agents call it);
-- `~/.ccbot` points to `~/.kikubot` (running agents write there);
-- `CCBOT_*` variables set outside the bot's `.env` — a systemd unit, a
-  launchd plist, a shell profile — are read under their new names, with a
-  WARNING at every start.
-
-After that date these go away. Before it, check the things below.
-
-## What to check yourself
+`main` has no `ccbot` command and doesn't read `CCBOT_*` variables or
+`~/.ccbot`. Files outside the bot are yours to change:
 
 - **Your service definition.** A systemd unit, launchd plist or script that
   runs `ccbot` → `kikubot`; `Environment=CCBOT_…` → `KIKUBOT_…`. The bundled
   plist is now `scripts/com.kikubot.bot.plist` (label `com.kikubot.bot`).
+  `aeed5005d18f` logs a WARNING at start for every `CCBOT_*` variable it
+  still finds outside the bot's `.env`.
 - **Plugins.** They are `kikubot.<name>` packages now and live in
   `src/kikubot/<name>/`; `KIKUBOT_PLUGINS` lists them. If you link plugins
   into the checkout, link them again — the startup log names leftovers in
   `src/ccbot/`. Then delete that dir.
 - **Anything reading the bot's files**: the log is `~/.kikubot/logs/kikubot.log`
-  now — the old `ccbot.log` is renamed, not kept; logger names are
-  `kikubot.*` instead of `ccbot.*`; the `/inject` socket is
-  `~/.kikubot/run/inject.sock` (the old path works through the symlink).
+  — the old `ccbot.log` is renamed, not kept; logger names are `kikubot.*`
+  instead of `ccbot.*`; the `/inject` socket is `~/.kikubot/run/inject.sock`.
+- **Agents started before the move** keep running, but their Claude Code
+  sessions may still call the old `ccbot hook` path. Restart each one once
+  (🔄 in its topic) so it picks up `kikubot hook`.
 - **Your bot's name in Telegram**, if you want it to match: `/setname` in
   @BotFather.
+
+Keep the `~/.ccbot` symlink: transcripts and notes written before the move
+name files under it (`~/.ccbot/images/…`), and the symlink keeps them working.
+Nothing in the bot reads it.
