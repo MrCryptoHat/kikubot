@@ -4,9 +4,11 @@ Provides factories for building JSONL entries, content blocks,
 and sample pane text for terminal parser tests.
 """
 
+import contextlib
 import os
 import shlex
 import shutil
+import uuid
 import subprocess
 import time
 
@@ -208,7 +210,10 @@ def tmux_server():
     """
     assert TMUX is not None
     binary: str = TMUX
-    socket = f"kikubot-liveness-{os.getpid()}"
+    # Own server per test: kill-server returns before the server is gone, and
+    # a next test reusing the socket met it dying ("server exited
+    # unexpectedly" — regular on Linux).
+    socket = f"kikubot-liveness-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     env = {k: v for k, v in os.environ.items() if k != "TMUX"}
     env.update(SHELL="/bin/sh", ENV="")
 
@@ -223,6 +228,7 @@ def tmux_server():
         ).stdout
 
     tmux("new-session", "-d", "-s", "t", "-n", "agent")
+    socket_path = tmux("display-message", "-p", "#{socket_path}").strip()
     manager = TmuxManager(session_name="t", socket_name=socket)
     try:
         yield tmux, manager, f"{shlex.quote(binary)} -L {socket} wait-for -S"
@@ -233,3 +239,6 @@ def tmux_server():
             capture_output=True,
             timeout=10,
         )
+        # tmux leaves its socket file behind; one per test adds up.
+        with contextlib.suppress(OSError):
+            os.unlink(socket_path)
