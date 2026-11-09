@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kikubot.config import DockerAgentConfig
-from kikubot.handlers.commands import bind_command, start_command
+from kikubot.handlers.commands import bind_command, menu_keyboard, start_command
 from kikubot.i18n import tr
 
 
@@ -233,3 +233,10 @@ class TestKillForgetsRuntime:
 
             mock_sm.unbind_thread.assert_called_once_with(1, 42)
             mock_sm.forget_thread_runtime.assert_called_once_with(1, 42)
+
+
+def test_menu_keyboard_collapses() -> None:
+    # is_persistent made Telegram reopen the menu after every sent message.
+    kb = menu_keyboard()
+    assert not kb.is_persistent
+    assert [b.text for b in kb.keyboard[0]] == [tr("menu.server"), tr("menu.agent")]

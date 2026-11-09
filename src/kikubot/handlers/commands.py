@@ -312,17 +312,22 @@ def _format_cron_groups(
 
 
 def menu_keyboard() -> ReplyKeyboardMarkup:
-    """Build the persistent menu ReplyKeyboard.
+    """Build the menu ReplyKeyboard that stays in a topic.
 
     A function (not a module constant) so a catalog edit takes effect on the
     next send. One row — compact, everything under the thumb. «👾 Agent»
     opens the panel with Nav/Actions tabs inside. /voice and friends stay
     slash-only (too rare for the main keyboard).
+
+    Not ``is_persistent``: that makes Telegram open the keyboard every time
+    the letter keyboard hides — after each sent message, which the operator
+    found irritating. Collapsed, it waits behind the icon in the input field.
+    A change to this markup reaches topics that already hold the old one only
+    if ``session.MENU_KEYBOARD_VERSION`` is bumped.
     """
     return ReplyKeyboardMarkup(
         [[KeyboardButton(tr("menu.server")), KeyboardButton(tr("menu.agent"))]],
         resize_keyboard=True,
-        is_persistent=True,
     )
 
 

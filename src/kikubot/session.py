@@ -71,6 +71,12 @@ UNSENT_IN_COMPOSER = (
 # How long a window unbound as gone may still be handed back to its topic.
 LOST_WINDOW_TTL = 600.0  # seconds
 
+# Bump when handlers.commands.menu_keyboard() changes. A keyboard already in a
+# topic never updates by itself, so a state.json saved under another version
+# forgets which topics hold the menu, and each gets the new one with its next
+# reply. 2: no longer is_persistent.
+MENU_KEYBOARD_VERSION = 2
+
 # Sent back when tmux couldn't be read: the window may well be alive, so this
 # must not read as "the agent is gone".
 TMUX_UNREADABLE = "Couldn't reach the agent's terminal just now. Please try again."
@@ -209,12 +215,13 @@ class SessionManager:
     # only per-topic /pin overrides, keyed "user_id:thread_id" → bool.
     # See handlers/task_pin.py.
     pin_topic_overrides: dict[str, bool] = field(default_factory=dict)
-    # Topics that already received the persistent menu ReplyKeyboard
+    # Topics that already received the menu ReplyKeyboard
     # ("user_id:thread_id" keys). Telegram scopes reply keyboards per forum
     # topic, so each topic needs one message carrying the markup; this set
     # makes that exactly-once — bind confirmations and the first delivered
     # reply (message_queue backstop) attach the keyboard only when the
-    # topic isn't marked yet. /menu re-attaches unconditionally.
+    # topic isn't marked yet. /menu re-attaches unconditionally. Loaded empty
+    # when state.json was written under another MENU_KEYBOARD_VERSION.
     menu_shown_topics: set[str] = field(default_factory=set)
     # Docker bindings whose agent the user stopped on purpose (⏹). A dead
     # agent NOT in here died with its container, and is brought back silently
@@ -395,6 +402,7 @@ class SessionManager:
             "diff_mode_topics": sorted(self.diff_mode_topics),
             "pin_topic_overrides": dict(sorted(self.pin_topic_overrides.items())),
             "menu_shown_topics": sorted(self.menu_shown_topics),
+            "menu_keyboard_version": MENU_KEYBOARD_VERSION,
             "stopped_docker_agents": sorted(self.stopped_docker_agents),
             "sub_agent_topics": sorted(self.sub_agent_topics),
             "topic_agent_names": dict(sorted(self.topic_agent_names.items())),
@@ -612,7 +620,11 @@ class SessionManager:
                 # Legacy shape (pre default-on): a list of opted-in topics.
                 for key in state.get("pin_mode_topics", []):
                     self.pin_topic_overrides.setdefault(str(key), True)
-                self.menu_shown_topics = set(state.get("menu_shown_topics", []))
+                self.menu_shown_topics = (
+                    set(state.get("menu_shown_topics", []))
+                    if state.get("menu_keyboard_version", 1) == MENU_KEYBOARD_VERSION
+                    else set()
+                )
                 self.stopped_docker_agents = set(state.get("stopped_docker_agents", []))
                 self.sub_agent_topics = set(state.get("sub_agent_topics", []))
                 self.topic_agent_names = {
@@ -1068,7 +1080,7 @@ class SessionManager:
         return new_state
 
     def is_menu_shown(self, user_id: int, thread_id: int | None) -> bool:
-        """Has this topic already received the persistent menu keyboard?"""
+        """Has this topic already received the menu keyboard?"""
         if thread_id is None:
             return False
         return f"{user_id}:{thread_id}" in self.menu_shown_topics

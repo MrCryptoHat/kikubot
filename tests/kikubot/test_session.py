@@ -41,6 +41,41 @@ class TestMenuShownTopics:
         mgr.clear_menu_shown(100, 42)
         assert mgr.is_menu_shown(100, 42) is False
 
+    @pytest.mark.parametrize(
+        ("saved", "kept"),
+        [({}, False), ({"menu_keyboard_version": 1}, False), (None, True)],
+    )
+    def test_load_keeps_marks_only_from_same_keyboard_version(
+        self, monkeypatch, tmp_path, saved, kept
+    ) -> None:
+        # A topic holding an older keyboard must be sent the current one.
+        from kikubot import session as session_mod
+
+        version = (
+            {"menu_keyboard_version": session_mod.MENU_KEYBOARD_VERSION}
+            if saved is None
+            else saved
+        )
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"menu_shown_topics": ["100:42"], **version}))
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        assert SessionManager().is_menu_shown(100, 42) is kept
+
+    def test_save_records_keyboard_version(self, monkeypatch, tmp_path) -> None:
+        from kikubot import session as session_mod
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        written: list[dict] = []
+        monkeypatch.setattr(
+            session_mod,
+            "schedule_async_json_write",
+            lambda path, data, **kw: written.append(data),
+        )
+        mgr = SessionManager()
+        mgr.mark_menu_shown(100, 42)
+        assert written[-1]["menu_keyboard_version"] == session_mod.MENU_KEYBOARD_VERSION
+
 
 class TestThreadDirectoryMemory:
     """Learned topic→directory memory (auto-rebind by permanent thread_id)."""
