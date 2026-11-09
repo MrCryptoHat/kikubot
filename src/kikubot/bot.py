@@ -752,7 +752,10 @@ async def _create_and_bind_window(
         return
 
     success, message, created_wname, created_wid = await tmux_manager.create_window(
-        selected_path, resume_session_id=resume_session_id, runtime=rt.name
+        selected_path,
+        window_name=session_manager.topic_window_name(user.id, pending_thread_id),
+        resume_session_id=resume_session_id,
+        runtime=rt.name,
     )
     if success:
         # Stamp runtime (+cwd for hookless runtimes) before anything can poll.

@@ -95,6 +95,9 @@ async def purge_deleted_topic(bot: Bot, user_id: int, thread_id: int, wid: str) 
             await tmux_manager.kill_window(w.window_id)
     session_manager.unbind_thread(user_id, thread_id)
     await clear_topic_state(user_id, thread_id, bot)
+    # Only here, with the topic itself gone: a dead window or an ended session
+    # leaves the topic, and its revived agent must come back under its name.
+    session_manager.topic_agent_names.pop(f"{user_id}:{thread_id}", None)
     logger.info(
         "Topic gone — unbound thread %d, cleaned up (window_id=%s) for user %d",
         thread_id,

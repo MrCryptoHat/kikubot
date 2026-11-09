@@ -133,7 +133,10 @@ async def revive_topic_agent(
         raise ReviveError("bot.session_already_open")
 
     ok, message, wname, wid = await tmux_manager.create_window(
-        cwd, resume_session_id=resume_id or None, runtime=rt.name
+        cwd,
+        window_name=session_manager.topic_window_name(user_id, thread_id),
+        resume_session_id=resume_id or None,
+        runtime=rt.name,
     )
     if not ok:
         logger.warning("Revive: create_window failed for %s: %s", cwd, message)

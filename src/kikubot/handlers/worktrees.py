@@ -187,7 +187,7 @@ async def provision_worktree_agent(
     branch = wtc.branch_name(slug)
     wt_path = wtc.worktree_path(repo_name, slug)
 
-    topic_name = f"🌳 {repo_name} · {task_title}"[:128]
+    topic_name = f"{wtc.TOPIC_MARK} {wtc.agent_name(repo_name, task_title)}"[:128]
     try:
         ft = await bot.create_forum_topic(chat_id=chat_id, name=topic_name)
     except Exception as e:  # noqa: BLE001

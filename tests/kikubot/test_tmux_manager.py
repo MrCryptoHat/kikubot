@@ -166,6 +166,38 @@ class TestOnRealTmux:
         assert await manager.find_window_by_id(wid) is None
         assert await manager.kill_window(wid) is False  # already gone
 
+    async def test_non_ascii_name_survives_a_bare_locale(
+        self, tmux_server, tmp_path, monkeypatch
+    ) -> None:
+        # Started outside tmux (a service unit, cron) with no UTF-8 locale,
+        # tmux prints «·» and Cyrillic as "_": the window would never match its
+        # own name, so dedup and lookup by name would both go blind. ($TMUX
+        # alone makes a client UTF-8, so it goes too.)
+        for var in ("LANG", "LC_ALL", "LC_CTYPE", "TMUX"):
+            monkeypatch.delenv(var, raising=False)
+        _, manager, _ = tmux_server
+        name = "app · дизайн"
+        ok, _, created, wid = await manager.create_window(
+            str(tmp_path), window_name=name, start_claude=False
+        )
+        assert ok and created == name
+        found = await manager.find_window_by_name(name)
+        assert found is not None and found.window_id == wid
+        ok, _, second, _ = await manager.create_window(
+            str(tmp_path), window_name=name, start_claude=False
+        )
+        assert ok and second == f"{name}-2"
+
+    async def test_unique_name_ignores_the_window_itself(
+        self, tmux_server, tmp_path
+    ) -> None:
+        _, manager, _ = tmux_server
+        _, _, _, wid = await manager.create_window(
+            str(tmp_path), window_name="app", start_claude=False
+        )
+        assert await manager.unique_window_name("app", own_id=wid) == "app"
+        assert await manager.unique_window_name("app") == "app-2"
+
     async def test_ensure_session_creates_and_exports(self, tmux_server) -> None:
         tmux, manager, _ = tmux_server
         manager.session_name = "fresh"

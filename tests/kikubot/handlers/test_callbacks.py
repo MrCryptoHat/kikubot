@@ -9,6 +9,7 @@ The guard refuses with an alert instead.
 from __future__ import annotations
 
 import asyncio
+import shutil
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -379,3 +380,57 @@ class TestStalePanelGuard:
         assert not disarms
         alerts = [c for c in query.answer.await_args_list if c.kwargs.get("show_alert")]
         assert not alerts
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
+class TestRestartAdoptsTopicName:
+    """A ➕/🌳 window from before topic naming takes its topic's name on 🔄."""
+
+    @pytest.fixture
+    def sm(self, monkeypatch, tmux_server):
+        from kikubot.handlers import callbacks
+        from kikubot.session import SessionManager
+
+        monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+        monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+        mgr = SessionManager()
+        monkeypatch.setattr(callbacks, "session_manager", mgr)
+        monkeypatch.setattr(callbacks, "tmux_manager", tmux_server[1])
+        return mgr
+
+    async def _window(self, tmux_server, path, name: str) -> str:
+        ok, _, _, wid = await tmux_server[1].create_window(
+            str(path), window_name=name, start_claude=False
+        )
+        assert ok
+        return wid
+
+    async def test_renamed_to_the_topic(self, sm, tmux_server, tmp_path) -> None:
+        from kikubot.handlers.callbacks import _adopt_topic_name
+
+        await self._window(tmux_server, tmp_path, "app")
+        wid = await self._window(tmux_server, tmp_path, "app")  # → app-2
+        sm.bind_thread(100, 42, wid, window_name="app-2")
+        sm.set_topic_agent_name(100, 42, "app-tick")
+        assert await _adopt_topic_name(wid, "app-2") == "app-tick"
+        found = await tmux_server[1].find_window_by_id(wid)
+        assert found is not None and found.window_name == "app-tick"
+        assert sm.get_display_name(wid) == "app-tick"
+
+    async def test_name_taken_by_another_window(
+        self, sm, tmux_server, tmp_path
+    ) -> None:
+        from kikubot.handlers.callbacks import _adopt_topic_name
+
+        await self._window(tmux_server, tmp_path, "app-tick")
+        wid = await self._window(tmux_server, tmp_path, "app-2")
+        sm.bind_thread(100, 42, wid, window_name="app-2")
+        sm.set_topic_agent_name(100, 42, "app-tick")
+        assert await _adopt_topic_name(wid, "app-2") == "app-tick-2"
+
+    async def test_main_topic_keeps_its_name(self, sm, tmux_server, tmp_path) -> None:
+        from kikubot.handlers.callbacks import _adopt_topic_name
+
+        wid = await self._window(tmux_server, tmp_path, "app")
+        sm.bind_thread(100, 42, wid, window_name="app")
+        assert await _adopt_topic_name(wid, "app") == "app"

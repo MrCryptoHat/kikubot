@@ -53,7 +53,7 @@ from .utils import (
     schedule_async_json_write,
 )
 from .voice.safety import Reservation, VoiceBudget
-from .worktrees import WorktreeMeta
+from .worktrees import WorktreeMeta, agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +238,12 @@ class SessionManager:
     # not be able to destroy it. A docker sub-agent (docker:<agent>/<slug>) is
     # self-identifying from its binding and needs no entry here.
     sub_agent_topics: set[str] = field(default_factory=set)
+    # The name a ➕ topic's agent goes by — its topic title without the mark
+    # ("user_id:thread_id" keys). Its tmux window and its Claude session carry
+    # it (topic_window_name), so the terminal and the chat name one agent the
+    # same way; otherwise its window would be the folder name plus -2. The Bot
+    # API can't read a topic's title back, so it is recorded at creation.
+    topic_agent_names: dict[str, str] = field(default_factory=dict)
     # Global toggle (/react): bot puts a 👀 reaction on a user message the
     # moment the agent takes it into context. Default from KIKUBOT_REACTION_ACK
     # (on); /react overrides at runtime (persisted in state.json).
@@ -391,6 +397,7 @@ class SessionManager:
             "menu_shown_topics": sorted(self.menu_shown_topics),
             "stopped_docker_agents": sorted(self.stopped_docker_agents),
             "sub_agent_topics": sorted(self.sub_agent_topics),
+            "topic_agent_names": dict(sorted(self.topic_agent_names.items())),
             "reaction_ack_enabled": self.reaction_ack_enabled,
             "table_style": self.table_style,
             "voice_announced_sessions": sorted(self.voice_announced_sessions),
@@ -608,6 +615,10 @@ class SessionManager:
                 self.menu_shown_topics = set(state.get("menu_shown_topics", []))
                 self.stopped_docker_agents = set(state.get("stopped_docker_agents", []))
                 self.sub_agent_topics = set(state.get("sub_agent_topics", []))
+                self.topic_agent_names = {
+                    str(k): str(v)
+                    for k, v in state.get("topic_agent_names", {}).items()
+                }
                 self.reaction_ack_enabled = bool(
                     state.get("reaction_ack_enabled", config.reaction_ack_default)
                 )
@@ -684,6 +695,7 @@ class SessionManager:
                 self.menu_shown_topics = set()
                 self.stopped_docker_agents = set()
                 self.sub_agent_topics = set()
+                self.topic_agent_names = {}
                 self.reaction_ack_enabled = config.reaction_ack_default
                 self.table_style = config.table_style_default
                 self.voice_announced_sessions = set()
@@ -1088,6 +1100,28 @@ class SessionManager:
         if key in self.sub_agent_topics:
             self.sub_agent_topics.discard(key)
             self._save_state()
+
+    def set_topic_agent_name(self, user_id: int, thread_id: int, name: str) -> None:
+        """Record the name this topic's agent goes by (see topic_window_name)."""
+        self.topic_agent_names[f"{user_id}:{thread_id}"] = name
+        self._save_state()
+
+    def topic_window_name(self, user_id: int, thread_id: int | None) -> str | None:
+        """The window name for this topic's agent: its title without the mark.
+
+        Only for topics kikubot created — a ➕ sibling (recorded name) or a 🌳
+        worktree (built from its meta). None for a main topic: its window takes
+        the folder name. Whitespace is collapsed, so a title can't put a newline
+        into a tmux listing; the cap mirrors Telegram's 128 minus «🌳 ».
+        """
+        if thread_id is None:
+            return None
+        name = self.topic_agent_names.get(f"{user_id}:{thread_id}")
+        if not name:
+            meta = self.get_worktree_meta(user_id, thread_id)
+            name = agent_name(meta.repo_name, meta.task_title) if meta else ""
+        name = " ".join(name.split())[:126]
+        return name or None
 
     def is_sub_agent_topic(self, user_id: int, thread_id: int | None) -> bool:
         """Was this topic's agent created as an extra beside another one?"""

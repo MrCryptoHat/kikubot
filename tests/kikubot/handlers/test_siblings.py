@@ -204,6 +204,10 @@ class TestProvisionTmuxSibling:
         assert not sm.record_thread_directory.call_args.kwargs
         sm.bind_thread.assert_not_called()
         sm.mark_sub_agent_topic.assert_called_once()
+        # Its window will go by the topic's name, not "proj-2".
+        bot.create_forum_topic.assert_awaited_once()
+        assert bot.create_forum_topic.await_args.kwargs["name"] == "➕ proj-notes"
+        assert sm.set_topic_agent_name.call_args.args[2] == "proj-notes"
 
     @pytest.mark.asyncio
     async def test_missing_cwd_is_refused(self) -> None:

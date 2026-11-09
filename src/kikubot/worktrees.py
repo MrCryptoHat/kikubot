@@ -65,6 +65,7 @@ _RU_LATIN = {
 
 SLUG_MAX = 30
 BRANCH_PREFIX = "wt/"
+TOPIC_MARK = "🌳"
 _SLUG_FALLBACK = "task"
 
 
@@ -145,6 +146,11 @@ def is_git_repo(path: Path | None) -> bool:
     catches both. None / non-existent → False.
     """
     return bool(path) and (path / ".git").exists()
+
+
+def agent_name(repo_name: str, task_title: str) -> str:
+    """A worktree agent's name: its topic's title without the 🌳 mark."""
+    return f"{repo_name} · {task_title}"
 
 
 # --- persisted metadata -----------------------------------------------------

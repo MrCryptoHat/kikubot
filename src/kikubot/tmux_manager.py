@@ -290,7 +290,11 @@ class TmuxManager:
 
     def _tmux_sync(self, *args: str) -> TmuxResult:
         """Run one tmux command against our server. Never raises."""
-        argv = ["tmux"]
+        # -u: run outside tmux without a UTF-8 locale (a service unit, cron),
+        # tmux prints every non-ASCII character as "_" — the ␟/␞ our listings
+        # split on too, so every listing would read as cut short, and a window
+        # named «app · дизайн» would never match its own name.
+        argv = ["tmux", "-u"]
         if self.socket_name:
             argv += ["-L", self.socket_name]
         argv += args
@@ -658,6 +662,20 @@ class TmuxManager:
         await asyncio.sleep(delay)
         return await self._send_keys_once(window_id, "Enter")
 
+    async def unique_window_name(self, name: str, *, own_id: str = "") -> str:
+        """``name``, or ``name-2``, ``name-3``… if another window holds it.
+
+        ``own_id``: a window renaming itself doesn't collide with its own name.
+        Raises TmuxReadError: tmux couldn't be read.
+        """
+        candidate, counter = name, 2
+        while True:
+            found = await self.find_window_by_name(candidate)
+            if found is None or found.window_id == own_id:
+                return candidate
+            candidate = f"{name}-{counter}"
+            counter += 1
+
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename a tmux window by its ID."""
         res = await self._tmux("rename-window", "-t", window_id, new_name)
@@ -710,14 +728,8 @@ class TmuxManager:
         if not path.is_dir():
             return False, f"Not a directory: {work_dir}", "", ""
 
-        # Create window name, adding suffix if name already exists
-        final_window_name = window_name if window_name else path.name
-        base_name = final_window_name
-        counter = 2
         try:
-            while await self.find_window_by_name(final_window_name):
-                final_window_name = f"{base_name}-{counter}"
-                counter += 1
+            final_window_name = await self.unique_window_name(window_name or path.name)
             sid = await asyncio.to_thread(self.ensure_session)
         except TmuxReadError as e:
             logger.error("Failed to create window: %s", e)

@@ -2,7 +2,7 @@
 
 import json
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1870,6 +1870,64 @@ class TestSubAgentTopics:
     def test_docker_main_agent_is_not_deletable(self, mgr: SessionManager) -> None:
         mgr.bind_thread(100, 42, "docker:assistant")
         assert mgr.can_delete_agent("docker:assistant") is False
+
+
+class TestTopicWindowName:
+    """A ➕/🌳 agent's window goes by its topic's title without the mark."""
+
+    def test_sibling_takes_its_recorded_name(self, mgr: SessionManager) -> None:
+        mgr.set_topic_agent_name(100, 42, "app-tick-tick")
+        assert mgr.topic_window_name(100, 42) == "app-tick-tick"
+
+    def test_worktree_name_comes_from_its_meta(self, mgr: SessionManager) -> None:
+        from kikubot.worktrees import WorktreeMeta
+
+        mgr.set_worktree_meta(
+            100,
+            42,
+            WorktreeMeta(
+                repo="/r/app",
+                repo_name="app",
+                branch="wt/dizain",
+                base_branch="main",
+                path="/wt/app/dizain",
+                task_title="дизайн  страницы\nпрогресса",
+            ),
+        )
+        # Collapsed whitespace: a newline must never reach a tmux listing.
+        assert mgr.topic_window_name(100, 42) == "app · дизайн страницы прогресса"
+
+    def test_main_topic_keeps_the_folder_name(self, mgr: SessionManager) -> None:
+        assert mgr.topic_window_name(100, 42) is None
+        assert mgr.topic_window_name(100, None) is None
+
+    async def test_kept_while_the_topic_lives(self, mgr: SessionManager) -> None:
+        # A dead window clears the topic's state, but the topic is still there
+        # and 🔄 brings its agent back — under the same name.
+        from kikubot.handlers import cleanup
+
+        mgr.set_topic_agent_name(100, 42, "app-x")
+        with (
+            patch.object(cleanup, "session_manager", mgr),
+            patch.object(cleanup, "clear_interactive_msg", AsyncMock()),
+        ):
+            await cleanup.clear_topic_state(100, 42, bot=MagicMock())
+        assert mgr.topic_window_name(100, 42) == "app-x"
+
+    async def test_forgotten_when_the_topic_is_gone(self, mgr: SessionManager) -> None:
+        from kikubot.handlers import cleanup, siblings
+
+        mgr.set_topic_agent_name(100, 42, "app-x")
+        mgr.bind_thread(100, 42, "@7")
+        tmux = MagicMock(find_window_by_id=AsyncMock(return_value=None))
+        with (
+            patch.object(cleanup, "session_manager", mgr),
+            patch.object(cleanup, "tmux_manager", tmux),
+            patch.object(cleanup, "clear_interactive_msg", AsyncMock()),
+            patch.object(siblings, "teardown_sibling", AsyncMock()),
+        ):
+            await cleanup.purge_deleted_topic(MagicMock(), 100, 42, "@7")
+        assert mgr.topic_window_name(100, 42) is None
 
 
 class TestLiveWindowForSession:

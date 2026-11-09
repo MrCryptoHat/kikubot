@@ -1578,6 +1578,32 @@ async def _handle_dv_list(
     )
 
 
+async def _adopt_topic_name(window_id: str, current: str) -> str:
+    """Rename a ➕/🌳 agent's window to its topic's name; return the name to use.
+
+    Windows made before agents took their topic's name carry the folder name
+    plus -2. A restart relaunches the CLI anyway, so its `--name` follows the
+    window here. Anything that fails keeps the current name.
+    """
+    from ..tmux_manager import TmuxReadError
+
+    for user_id, thread_id, wid in session_manager.iter_thread_bindings():
+        if wid != window_id:
+            continue
+        wanted = session_manager.topic_window_name(user_id, thread_id)
+        if not wanted or wanted == current:
+            return current
+        try:
+            name = await tmux_manager.unique_window_name(wanted, own_id=window_id)
+        except TmuxReadError:
+            return current
+        if name != current and await tmux_manager.rename_window(window_id, name):
+            session_manager.update_display_name(window_id, name)
+            return name
+        return current
+    return current
+
+
 async def _restart_agent(
     query: CallbackQuery, window_id: str, *, fresh: bool, update: Update | None = None
 ) -> None:
@@ -1658,7 +1684,8 @@ async def _restart_agent(
         if not await _wait_agent_exited(window_id):
             await tmux_manager.send_keys(window_id, "Enter", enter=False, literal=False)
             await _wait_agent_exited(window_id, timeout=5.0)
-        cmd = runtime.launch_command(w.window_name, resume_id or None)
+        window_name = await _adopt_topic_name(window_id, w.window_name)
+        cmd = runtime.launch_command(window_name, resume_id or None)
         await tmux_manager.send_keys(window_id, cmd)
     await _wait_pane_ready(window_id)
     await _cmd_refresh_photo(query, window_id, tab="ses")

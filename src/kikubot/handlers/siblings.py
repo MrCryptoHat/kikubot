@@ -289,6 +289,7 @@ async def _provision_tmux_sibling(
         # Flags this topic as an EXTRA agent, which is what makes the panel offer
         # 🗑 here (a main topic has no delete button — see can_delete_agent).
         session_manager.mark_sub_agent_topic(user_id, new_thread)
+        session_manager.set_topic_agent_name(user_id, new_thread, display)
         await safe_send(
             bot,
             chat_id,

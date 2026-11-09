@@ -483,3 +483,18 @@ class TestOwnSessionOutsideTheShortlist:
         with patch.object(ar, "session_manager", sm):
             last, _ = await ar.docker_revive_options(self.WID)
         assert last is None
+
+
+@pytest.mark.asyncio
+async def test_revived_under_the_topics_name(tmp_path):
+    # A ➕/🌳 topic's agent comes back as «app-tick», not as the folder's «app-2».
+    sm, tm, rt = _mocks(tmp_path, sessions=[NEWEST])
+    sm.topic_window_name.return_value = "app-tick"
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        await ar.revive_topic_agent(1, 42)
+    sm.topic_window_name.assert_called_once_with(1, 42)
+    assert tm.create_window.await_args.kwargs["window_name"] == "app-tick"
