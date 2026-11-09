@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kikubot.config import DockerAgentConfig
-from kikubot.handlers.commands import bind_command, menu_keyboard, start_command
+from kikubot.handlers.commands import (
+    bind_command,
+    build_bot_commands,
+    pending_menu_removal,
+    start_command,
+)
 from kikubot.i18n import tr
 
 
@@ -235,8 +240,19 @@ class TestKillForgetsRuntime:
             mock_sm.forget_thread_runtime.assert_called_once_with(1, 42)
 
 
-def test_menu_keyboard_collapses() -> None:
-    # is_persistent made Telegram reopen the menu after every sent message.
-    kb = menu_keyboard()
-    assert not kb.is_persistent
-    assert [b.text for b in kb.keyboard[0]] == [tr("menu.server"), tr("menu.agent")]
+def test_agent_and_server_lead_the_command_list() -> None:
+    # No bottom menu: "/" is the way to the panel and the summary.
+    names = [c.command for c in build_bot_commands()]
+    assert names[:2] == ["agent", "server"]
+    # Aliases still work but stay off the list.
+    assert not {"commands", "status", "menu", "screenshot"} & set(names)
+
+
+def test_menu_removal_only_where_the_old_menu_may_be() -> None:
+    from telegram import ReplyKeyboardRemove
+
+    with patch("kikubot.handlers.commands.session_manager") as sm:
+        sm.menu_needs_clearing.return_value = True
+        assert isinstance(pending_menu_removal(100, 42), ReplyKeyboardRemove)
+        sm.menu_needs_clearing.return_value = False
+        assert pending_menu_removal(100, 42) is None

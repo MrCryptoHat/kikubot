@@ -118,9 +118,9 @@ To run in the foreground instead: `uv run kikubot`.
    forwarded.
 4. From then on, text/voice in that topic goes to Claude; its replies come
    back to the topic. Closing the topic kills the window.
-5. The persistent menu keyboard (🖥️ Server / 👾 Agent) appears automatically
-   with the bind confirmation or the first reply — Telegram scopes reply
-   keyboards per topic. If you ever dismiss it, `/menu` brings it back.
+5. Type `/` in the topic for the command list: `/agent` opens the control
+   panel (live terminal screenshot, keys, restart…), `/server` the server
+   summary.
 
 ## 8. Start on boot (optional)
 

@@ -14,9 +14,12 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   read any more: an existing install upgrades through commit `aeed5005d18f`,
   which moves it over by itself on its first start while agents keep running.
   See [docs/upgrading-from-ccbot.md](docs/upgrading-from-ccbot.md).
-- The 🖥️ Server / 👾 Agent menu no longer opens after every sent message: it
-  stays collapsed behind the keyboard icon in the input field. Each topic gets
-  the new menu once, with the bot's next reply there.
+- **No bottom menu any more.** The 🖥️ Server / 👾 Agent keyboard opened by
+  itself, after every sent message or on entering the topic, so it is gone:
+  each topic that may hold it gets it removed with the bot's next message
+  there. Type `/` instead: `/agent` (the control panel, was `/commands`) and
+  `/server` (the summary, was `/status`) lead the command list. `/commands`,
+  `/status` and `/menu` still work, unlisted.
 
 ### Fixed
 

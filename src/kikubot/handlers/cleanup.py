@@ -47,11 +47,10 @@ async def clear_topic_state(
     # Clear interactive UI state (also deletes message from chat)
     await clear_interactive_msg(user_id, bot, thread_id)
 
-    # Clear voice mode, task-pin override, menu-keyboard and extra-agent flags
+    # Clear voice mode, task-pin override and extra-agent flags
     key = f"{user_id}:{thread_id}"
     session_manager.voice_mode_topics.discard(key)
     session_manager.pin_topic_overrides.pop(key, None)
-    session_manager.menu_shown_topics.discard(key)
     session_manager.sub_agent_topics.discard(key)
 
     # Clear pending thread state from user_data
@@ -96,8 +95,10 @@ async def purge_deleted_topic(bot: Bot, user_id: int, thread_id: int, wid: str) 
     session_manager.unbind_thread(user_id, thread_id)
     await clear_topic_state(user_id, thread_id, bot)
     # Only here, with the topic itself gone: a dead window or an ended session
-    # leaves the topic, and its revived agent must come back under its name.
+    # leaves the topic, and its revived agent must come back under its name —
+    # and the old menu keyboard in it must still be removed.
     session_manager.topic_agent_names.pop(f"{user_id}:{thread_id}", None)
+    session_manager.menu_clear_topics.discard(f"{user_id}:{thread_id}")
     logger.info(
         "Topic gone — unbound thread %d, cleaned up (window_id=%s) for user %d",
         thread_id,

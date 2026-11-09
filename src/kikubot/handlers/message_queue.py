@@ -852,8 +852,8 @@ async def _send_part_with_tables(
     was out-of-band/empty only.
 
     With no placeholders this is exactly one ``send_with_fallback`` — the
-    common case is unchanged. ``reply_markup`` (the persistent menu keyboard
-    backstop) is attached to the first text send only.
+    common case is unchanged. ``reply_markup`` (the old menu keyboard's
+    removal) is attached to the first text send only.
     """
     last_msg_id: int | None = None
     # PLACEHOLDER_RE has two capture groups, so re.split yields
@@ -1126,19 +1126,13 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
     # 3. Send content messages
     silent = _is_silent_content_type(task.content_type)
-    # Menu-keyboard backstop: Telegram scopes reply keyboards per forum topic,
-    # so a topic whose bind path couldn't carry the markup (picker flows edit
-    # an inline-keyboard message; worktree welcome carries its own inline
-    # keyboard) gets it attached to the first delivered text reply instead.
+    # A topic that may still hold the old bottom menu keyboard gets it removed
+    # by its first delivered text reply (commands.pending_menu_removal).
     menu_markup = None
-    if (
-        task.content_type == "text"
-        and task.thread_id
-        and not session_manager.is_menu_shown(user_id, task.thread_id)
-    ):
-        from .commands import menu_keyboard
+    if task.content_type == "text" and task.thread_id:
+        from .commands import pending_menu_removal
 
-        menu_markup = menu_keyboard()
+        menu_markup = pending_menu_removal(user_id, task.thread_id)
 
     # Rich-first delivery: one native sendRichMessage with the original
     # markdown (real table/heading/code rendering, no [i/N] pages). Any
@@ -1158,7 +1152,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         if rich_id is not None:
             note_topic_message(chat_id, rich_id, user_id, tid)
             if menu_markup is not None and task.thread_id:
-                session_manager.mark_menu_shown(user_id, task.thread_id)
+                session_manager.mark_menu_cleared(user_id, task.thread_id)
             task.parts = []
             task.rich_markdown = ""
             await _send_task_images(bot, chat_id, task)
@@ -1183,7 +1177,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             if sent_id is not None:
                 last_msg_id = sent_id
                 if menu_markup is not None and task.thread_id:
-                    session_manager.mark_menu_shown(user_id, task.thread_id)
+                    session_manager.mark_menu_cleared(user_id, task.thread_id)
                     menu_markup = None
     except BadRequest:
         # Incl. topic-gone — not transport trouble; the worker's generic

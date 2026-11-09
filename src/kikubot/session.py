@@ -71,11 +71,12 @@ UNSENT_IN_COMPOSER = (
 # How long a window unbound as gone may still be handed back to its topic.
 LOST_WINDOW_TTL = 600.0  # seconds
 
-# Bump when handlers.commands.menu_keyboard() changes. A keyboard already in a
-# topic never updates by itself, so a state.json saved under another version
-# forgets which topics hold the menu, and each gets the new one with its next
-# reply. 2: no longer is_persistent.
-MENU_KEYBOARD_VERSION = 2
+# What the bottom menu keyboard (ReplyKeyboard) in topics looks like. One stays
+# in a topic until a message replaces or removes it, so a state.json saved
+# under another version re-plans the topics. 2: no longer is_persistent.
+# 3: no menu at all — every topic known at that load gets a ReplyKeyboardRemove
+# with its next reply (menu_clear_topics).
+MENU_KEYBOARD_VERSION = 3
 
 # Sent back when tmux couldn't be read: the window may well be alive, so this
 # must not read as "the agent is gone".
@@ -215,14 +216,13 @@ class SessionManager:
     # only per-topic /pin overrides, keyed "user_id:thread_id" → bool.
     # See handlers/task_pin.py.
     pin_topic_overrides: dict[str, bool] = field(default_factory=dict)
-    # Topics that already received the menu ReplyKeyboard
-    # ("user_id:thread_id" keys). Telegram scopes reply keyboards per forum
-    # topic, so each topic needs one message carrying the markup; this set
-    # makes that exactly-once — bind confirmations and the first delivered
-    # reply (message_queue backstop) attach the keyboard only when the
-    # topic isn't marked yet. /menu re-attaches unconditionally. Loaded empty
-    # when state.json was written under another MENU_KEYBOARD_VERSION.
-    menu_shown_topics: set[str] = field(default_factory=set)
+    # Topics that may still hold the old bottom menu keyboard
+    # ("user_id:thread_id" keys). Only a message can remove a reply keyboard,
+    # so the next agent reply or reaction notice in such a topic carries
+    # ReplyKeyboardRemove and drops the key; a topic created later never had
+    # a keyboard and never enters. Filled once, when a state.json from before
+    # MENU_KEYBOARD_VERSION 3 loads.
+    menu_clear_topics: set[str] = field(default_factory=set)
     # Docker bindings whose agent the user stopped on purpose (⏹). A dead
     # agent NOT in here died with its container, and is brought back silently
     # (KIKUBOT_AUTO_RESUME_AGENTS); one in here stays down until started again.
@@ -401,7 +401,7 @@ class SessionManager:
             "voice_mode_topics": sorted(self.voice_mode_topics),
             "diff_mode_topics": sorted(self.diff_mode_topics),
             "pin_topic_overrides": dict(sorted(self.pin_topic_overrides.items())),
-            "menu_shown_topics": sorted(self.menu_shown_topics),
+            "menu_clear_topics": sorted(self.menu_clear_topics),
             "menu_keyboard_version": MENU_KEYBOARD_VERSION,
             "stopped_docker_agents": sorted(self.stopped_docker_agents),
             "sub_agent_topics": sorted(self.sub_agent_topics),
@@ -620,11 +620,19 @@ class SessionManager:
                 # Legacy shape (pre default-on): a list of opted-in topics.
                 for key in state.get("pin_mode_topics", []):
                     self.pin_topic_overrides.setdefault(str(key), True)
-                self.menu_shown_topics = (
-                    set(state.get("menu_shown_topics", []))
-                    if state.get("menu_keyboard_version", 1) == MENU_KEYBOARD_VERSION
-                    else set()
-                )
+                if state.get("menu_keyboard_version", 1) == MENU_KEYBOARD_VERSION:
+                    self.menu_clear_topics = set(state.get("menu_clear_topics", []))
+                else:
+                    # Saved while topics got a menu: any topic we know may hold
+                    # one. menu_shown_topics alone misses some — version 2
+                    # started it empty while the old keyboards stayed put.
+                    self.menu_clear_topics = set(state.get("menu_shown_topics", []))
+                    for per_user in (
+                        self.thread_bindings,
+                        self.thread_directory_memory,
+                    ):
+                        for uid, threads in per_user.items():
+                            self.menu_clear_topics.update(f"{uid}:{t}" for t in threads)
                 self.stopped_docker_agents = set(state.get("stopped_docker_agents", []))
                 self.sub_agent_topics = set(state.get("sub_agent_topics", []))
                 self.topic_agent_names = {
@@ -704,7 +712,7 @@ class SessionManager:
                 self.voice_mode_topics = set()
                 self.diff_mode_topics = set()
                 self.pin_topic_overrides = {}
-                self.menu_shown_topics = set()
+                self.menu_clear_topics = set()
                 self.stopped_docker_agents = set()
                 self.sub_agent_topics = set()
                 self.topic_agent_names = {}
@@ -1079,24 +1087,17 @@ class SessionManager:
         self._save_state()
         return new_state
 
-    def is_menu_shown(self, user_id: int, thread_id: int | None) -> bool:
-        """Has this topic already received the menu keyboard?"""
+    def menu_needs_clearing(self, user_id: int, thread_id: int | None) -> bool:
+        """May this topic still hold the old bottom menu keyboard?"""
         if thread_id is None:
             return False
-        return f"{user_id}:{thread_id}" in self.menu_shown_topics
+        return f"{user_id}:{thread_id}" in self.menu_clear_topics
 
-    def mark_menu_shown(self, user_id: int, thread_id: int) -> None:
-        """Record that the menu keyboard was delivered to this topic."""
+    def mark_menu_cleared(self, user_id: int, thread_id: int) -> None:
+        """Record that a message removing the menu keyboard reached this topic."""
         key = f"{user_id}:{thread_id}"
-        if key not in self.menu_shown_topics:
-            self.menu_shown_topics.add(key)
-            self._save_state()
-
-    def clear_menu_shown(self, user_id: int, thread_id: int) -> None:
-        """Forget the menu-keyboard flag (topic closed/deleted)."""
-        key = f"{user_id}:{thread_id}"
-        if key in self.menu_shown_topics:
-            self.menu_shown_topics.discard(key)
+        if key in self.menu_clear_topics:
+            self.menu_clear_topics.discard(key)
             self._save_state()
 
     def mark_sub_agent_topic(self, user_id: int, thread_id: int) -> None:

@@ -377,7 +377,7 @@ async def safe_send(
 
     Returns the sent Message, or None when both attempts failed — callers that
     only fire-and-forget can keep ignoring it; callers that record something
-    per delivered message (e.g. "this topic now has the menu keyboard") need
+    per delivered message (e.g. "this topic's old menu keyboard is removed now") need
     to know whether anything actually landed.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)

@@ -62,7 +62,6 @@ from .handlers.commands import (
     kill_command,
     menu_button_dispatcher,
     bind_command,
-    menu_command,
     react_command,
     tables_command,
     restart_command,
@@ -1475,8 +1474,13 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("kill", kill_command))
+    # /agent and /server are the published names; /commands, /menu and
+    # /status are their older spellings, kept working off the list.
+    application.add_handler(CommandHandler("agent", commands_command))
+    application.add_handler(CommandHandler("server", status_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("commands", commands_command))
+    application.add_handler(CommandHandler("menu", commands_command))
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("voice", voice_command))
     application.add_handler(CommandHandler("react", react_command))
@@ -1484,7 +1488,6 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("diff", diff_command))
     application.add_handler(CommandHandler("pin", pin_command))
     application.add_handler(CommandHandler("bind", bind_command))
-    application.add_handler(CommandHandler("menu", menu_command))
     plugins.register_handlers(application)
     application.add_handler(CallbackQueryHandler(callback_handler))
     if config.reaction_confirm_enabled:
@@ -1516,8 +1519,9 @@ def create_bot() -> Application:
         )
     )
     application.add_handler(MessageHandler(filters.COMMAND, forward_command_handler))
-    # Persistent ReplyKeyboard buttons — taps arrive as plain text labels, so
-    # the dispatcher matches the catalog's labels (fixed at registration).
+    # The old menu keyboard's buttons, still on screen in a topic until its
+    # removal arrives — taps arrive as plain text labels, so the dispatcher
+    # matches the catalog's labels (fixed at registration).
     _menu_labels = [i18n.tr("menu.server"), i18n.tr("menu.agent")]
     _menu_regex = "^(" + "|".join(re.escape(lbl) for lbl in _menu_labels) + ")$"
     application.add_handler(

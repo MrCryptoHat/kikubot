@@ -172,13 +172,13 @@ def test_grok_approval_confirms_yes_once_not_always_approve():
     assert rc.decide_confirm_action(pane, "grok") == ("confirm", ("Down", "Enter"))
 
 
-# ── menu keyboard on the reaction path ───────────────────────────────────
+# ── old menu keyboard's removal on the reaction path ─────────────────────
 # A 👍 can be the only thing a user ever sends in a topic (agent answers with
 # a photo, user confirms, repeat). Reply keyboards ride on messages, so the
-# reaction path's notices carry the menu backstop too.
+# reaction path's notices carry the old menu's removal too.
 
 
-class TestMenuBackstopOnConfirm:
+class TestMenuRemovalOnConfirm:
     @staticmethod
     def _context():
         from unittest.mock import MagicMock
@@ -188,14 +188,16 @@ class TestMenuBackstopOnConfirm:
         return context
 
     @pytest.mark.asyncio
-    async def test_notice_carries_the_menu_and_marks_it_shown(self, monkeypatch):
+    async def test_notice_removes_the_menu_and_marks_it_cleared(self, monkeypatch):
         from unittest.mock import AsyncMock, MagicMock, patch
 
         sent = AsyncMock(return_value=MagicMock())  # a delivered Message
         with (
             patch.object(rc, "safe_send", sent),
             patch.object(rc, "session_manager") as sm,
-            patch("kikubot.handlers.commands.pending_menu_markup", return_value="MENU"),
+            patch(
+                "kikubot.handlers.commands.pending_menu_removal", return_value="MENU"
+            ),
         ):
             sm.get_window_for_thread.return_value = "@12"
             sm.resolve_chat_id.return_value = -100123
@@ -207,19 +209,21 @@ class TestMenuBackstopOnConfirm:
             )
             await rc._do_confirm(self._context(), 100, 42, message_id=7)
         assert sent.await_args.kwargs["reply_markup"] == "MENU"
-        sm.mark_menu_shown.assert_called_once_with(100, 42)
+        sm.mark_menu_cleared.assert_called_once_with(100, 42)
 
     @pytest.mark.asyncio
-    async def test_undelivered_notice_does_not_mark_shown(self, monkeypatch):
+    async def test_undelivered_notice_does_not_mark_cleared(self, monkeypatch):
         """safe_send swallows send failures — marking optimistically would
-        disable the queue worker's backstop and the topic would never get the
-        menu at all."""
+        disable the queue worker's removal and the topic would keep the old
+        menu for good."""
         from unittest.mock import AsyncMock, patch
 
         with (
             patch.object(rc, "safe_send", AsyncMock(return_value=None)),
             patch.object(rc, "session_manager") as sm,
-            patch("kikubot.handlers.commands.pending_menu_markup", return_value="MENU"),
+            patch(
+                "kikubot.handlers.commands.pending_menu_removal", return_value="MENU"
+            ),
         ):
             sm.get_window_for_thread.return_value = "@12"
             sm.resolve_chat_id.return_value = -100123
@@ -230,17 +234,17 @@ class TestMenuBackstopOnConfirm:
                 rc, "decide_confirm_action", lambda *a, **k: ("type_yes", ())
             )
             await rc._do_confirm(self._context(), 100, 42, message_id=7)
-        sm.mark_menu_shown.assert_not_called()
+        sm.mark_menu_cleared.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_topic_that_already_has_the_menu_gets_no_markup(self, monkeypatch):
+    async def test_topic_without_the_old_menu_gets_no_markup(self, monkeypatch):
         from unittest.mock import AsyncMock, MagicMock, patch
 
         sent = AsyncMock(return_value=MagicMock())
         with (
             patch.object(rc, "safe_send", sent),
             patch.object(rc, "session_manager") as sm,
-            patch("kikubot.handlers.commands.pending_menu_markup", return_value=None),
+            patch("kikubot.handlers.commands.pending_menu_removal", return_value=None),
         ):
             sm.get_window_for_thread.return_value = "@12"
             sm.resolve_chat_id.return_value = -100123
@@ -252,4 +256,4 @@ class TestMenuBackstopOnConfirm:
             )
             await rc._do_confirm(self._context(), 100, 42, message_id=7)
         assert sent.await_args.kwargs["reply_markup"] is None
-        sm.mark_menu_shown.assert_not_called()
+        sm.mark_menu_cleared.assert_not_called()

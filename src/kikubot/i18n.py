@@ -13,7 +13,7 @@ directives) are NOT translated here.
 `STRINGS[key] = "text"`. `tr` falls back to the key itself, so a missing
 entry is visible in the UI rather than a crash.
 
-Key naming: dotted, namespaced by area (`menu.server`, `cmd.status`,
+Key naming: dotted, namespaced by area (`menu.server`, `cmd.server`,
 `ctx.alert`, `panel.refresh`, …) so additions
 from different modules never collide.
 """
@@ -53,10 +53,9 @@ def tr(key: str, /, **fmt: object) -> str:
 # grouped by namespace so it's obvious which module owns which keys.
 # ---------------------------------------------------------------------------
 STRINGS: dict[str, str] = {
-    # -- Persistent menu (ReplyKeyboard) --------------------------------
+    # -- Old bottom menu (ReplyKeyboard): labels its taps still arrive as --
     "menu.server": "🖥️ Server",
     "menu.agent": "👾 Agent",
-    "menu.pinned": "👾 Menu pinned",
     # -- Common --------------------------------------------------------
     "common.topics_only": "⚠ Topics only.",
     # Shown to strangers AND to the owner with a misconfigured ALLOWED_USERS —
@@ -71,11 +70,10 @@ STRINGS: dict[str, str] = {
     # -- Context-fill alert (session_monitor) --------------------------
     "ctx.alert": "📈 Context: {k}k tokens (~{pct}% of 1M)",
     # -- BotCommand descriptions (set_my_commands) ---------------------
+    "cmd.agent": "agent panel: screen, keys, actions",
+    "cmd.server": "server, agents, disk, RAM",
     "cmd.start": "getting started & setup check",
     "cmd.help": "what this bot can do",
-    "cmd.status": "server, agents, disk, RAM",
-    "cmd.commands": "agent panel (terminal + actions)",
-    "cmd.screenshot": "same as /commands",
     "cmd.restart": "restart the agent",
     "cmd.esc": "interrupt agent (Esc + Ctrl+C)",
     "cmd.kill": "end the agent session",
@@ -84,7 +82,6 @@ STRINGS: dict[str, str] = {
     "cmd.tables": "tables: native or screenshots",
     "cmd.diff": "show edits as images: on/off",
     "cmd.pin": "pin big task messages: on/off",
-    "cmd.menu": "show the menu keyboard",
 }
 
 
@@ -101,7 +98,7 @@ STRINGS.update(
         "bot.private_start": "👋 I bridge Telegram and terminal AI agents (Claude Code, Codex, …), and I work in a group with topics.\n\n1. Create a group and enable *Topics* in its settings.\n2. Add me to the group and make me an admin.\n3. Create a topic named after a project folder — and just write.\n\nFull walkthrough — SETUP.md in the repository.",
         "bot.help": "🤖 *How I work*\n"
         "One topic = one terminal agent: Claude Code, Codex — the session picker has a tab per installed CLI, with more runtimes to come. Create a topic (name it after a project folder — it binds itself), send a message — it goes to the agent, and its replies come back here.\n\n"
-        "*Bottom buttons:* 🖥️ Server — server summary · 👾 Agent — control panel (live terminal screenshot, keys, mode, model, restart…).\n\n"
+        "*Type / for the list:* /agent — control panel (live terminal screenshot, keys, mode, model, restart…) · /server — server summary.\n\n"
         "*Toggles:*\n"
         "/voice — spoken replies (needs a TTS key)\n"
         "/diff — send screenshots of code edits\n"
@@ -114,7 +111,7 @@ STRINGS.update(
         "• Unknown /commands (/clear, /compact, /review…) go straight to the agent\n"
         "• 🌳 in the panel — a parallel agent in a git worktree\n"
         "• Closing a topic ends its session\n\n"
-        "*If the agent is silent:* check the hook (`uv run kikubot hook --install` on the server), then /status and the 👾 Agent panel → 📸.",
+        "*If the agent is silent:* check the hook (`uv run kikubot hook --install` on the server), then /server and /agent → 📸.",
         "bot.enable_topics_hint": "⚠️ Topics are not enabled in this group, and I can't work without them. Group settings → Topics → enable, then create a topic.",
         "bot.make_me_admin": "⚠️ Make me a group administrator — without admin rights Telegram doesn't deliver regular messages to me, so I can't respond.\nGroup settings → Administrators → Add administrator.",
         "bot.docker_agent_down": "⏳ The `{name}` container isn't running right now, so your message wasn't delivered.\nThe topic stays connected — send it again in a minute.",
@@ -151,7 +148,7 @@ STRINGS.update(
         "cb.agent_header": "👾 *Agent:* {name}",
         "cb.agent_unavailable": "Agent unavailable",
         "cb.cancelled": "Cancelled",
-        "cb.stale_panel": "This panel is stale and points at a different agent. Open a fresh one: 👾 Agent button.",
+        "cb.stale_panel": "This panel is stale and points at a different agent. Open a fresh one: /agent.",
         "cb.confirm_action": "Confirm the action",
         "cb.container_not_running": "Container not running",
         "cb.done": "Done",
@@ -247,7 +244,7 @@ STRINGS.update(
         "commands.refresh": "📸 Refresh",
         "commands.tables_rich": "📊 Tables are now native — Telegram draws them, text is selectable and copyable\\.\nSend /tables again to switch back to screenshots\\.",
         "commands.tables_image": "🖼 Tables now arrive as grid screenshots\\.\nSend /tables again to switch back to native tables\\.",
-        "commands.restart_busy": "⚠️ {name} is working right now — a restart would type the commands into its input line. Stop it (⎋ in the 👾 Agent panel), then restart.",
+        "commands.restart_busy": "⚠️ {name} is working right now — a restart would type the commands into its input line. Stop it (⎋ in the /agent panel), then restart.",
         "commands.restart_maybe_failed": "⚠️ {name} may not have started. Check /screenshot.",
         "commands.restart_no_tmux": "⚠️ {name}: failed to create a tmux session in the container.",
         "commands.restarted": "✅ {name} restarted.",
@@ -324,7 +321,7 @@ STRINGS.update(
         "dirb.back": "← Back",
         # -- fwd --
         "fwd.no_session": "❌ No session bound to this topic. Send a regular message and I'll offer to pick a folder and start one.",
-        "fwd.sent": "⚡ [{name}] Sent: {cmd}\nSee the result in the 👾 Agent panel.",
+        "fwd.sent": "⚡ [{name}] Sent: {cmd}\nSee the result in the /agent panel.",
         # -- hist --
         "hist.older": "◀ Older",
         "hist.newer": "Newer ▶",
@@ -360,7 +357,7 @@ STRINGS.update(
         "media.download_failed": "❌ Couldn't download the file from Telegram.",
         "media.download_failed_too_big": " Looks like it's over 20 MB — split the archive into parts or send the files separately.",
         "media.file_too_big": "❌ File too large (~{mb} MB). Telegram only lets a bot download files up to 20 MB — that's a Telegram limit, not the bot's.\n\nSplit the archive into ≤20 MB parts or send the files separately.",
-        "media.voice_blocked_no_text_option": '🎤 "{text}"\n\n⚠️ The agent\'s question has no free text field — pick an option with ↑↓⏎ in the 👾 Agent panel\\.',
+        "media.voice_blocked_no_text_option": '🎤 "{text}"\n\n⚠️ The agent\'s question has no free text field — pick an option with ↑↓⏎ in the /agent panel\\.',
         "media.voice_blocked_widget": '🎤 "{text}"\n\n⚠️ The agent is waiting for a reply in the dialog\\. First pick an option with the ↑↓⏎ buttons, then dictate again\\.',
         # -- mq --
         "mq.agent_looking": "👀 Agent is looking",

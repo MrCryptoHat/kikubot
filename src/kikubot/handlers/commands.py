@@ -21,9 +21,8 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ChatAction, KeyboardButtonStyle
@@ -311,39 +310,22 @@ def _format_cron_groups(
     return out
 
 
-def menu_keyboard() -> ReplyKeyboardMarkup:
-    """Build the menu ReplyKeyboard that stays in a topic.
-
-    A function (not a module constant) so a catalog edit takes effect on the
-    next send. One row — compact, everything under the thumb. «👾 Agent»
-    opens the panel with Nav/Actions tabs inside. /voice and friends stay
-    slash-only (too rare for the main keyboard).
-
-    Not ``is_persistent``: that makes Telegram open the keyboard every time
-    the letter keyboard hides — after each sent message, which the operator
-    found irritating. Collapsed, it waits behind the icon in the input field.
-    A change to this markup reaches topics that already hold the old one only
-    if ``session.MENU_KEYBOARD_VERSION`` is bumped.
-    """
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton(tr("menu.server")), KeyboardButton(tr("menu.agent"))]],
-        resize_keyboard=True,
-    )
-
-
-def pending_menu_markup(
+def pending_menu_removal(
     user_id: int, thread_id: int | None
-) -> ReplyKeyboardMarkup | None:
-    """The menu keyboard iff this topic hasn't been given it yet, else None.
+) -> ReplyKeyboardRemove | None:
+    """A ReplyKeyboardRemove iff this topic may still hold the old menu keyboard.
 
-    Telegram scopes reply keyboards per forum topic and only a *message* can
-    carry one, so every path that may be the first thing kikubot posts into a
-    topic attaches this (agent replies, reaction-confirm notices). Callers
-    ``mark_menu_shown`` once the message is actually out.
+    The bottom menu (🖥️ Server / 👾 Agent) is gone: Telegram opened it by
+    itself, on entering the topic or after every sent message depending on
+    ``is_persistent``, and the owner wanted neither. /agent and /server lead
+    the command list instead. A keyboard stays until a message removes it, so
+    the first message kikubot posts into such a topic carries this (agent
+    replies, reaction-confirm notices); callers ``mark_menu_cleared`` once it
+    is out.
     """
-    if not thread_id or session_manager.is_menu_shown(user_id, thread_id):
+    if not session_manager.menu_needs_clearing(user_id, thread_id):
         return None
-    return menu_keyboard()
+    return ReplyKeyboardRemove()
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -399,10 +381,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 text = tr("bot.make_me_admin")
             elif not getattr(chat, "is_forum", False):
                 text = tr("bot.enable_topics_hint")
-        await safe_reply(update.message, text, reply_markup=menu_keyboard())
-        thread_id = get_thread_id(update)
-        if thread_id is not None:
-            session_manager.mark_menu_shown(user.id, thread_id)
+        await safe_reply(update.message, text)
 
 
 async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -464,12 +443,7 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             session_manager.set_group_chat_id(
                 user.id, thread_id, update.effective_chat.id
             )
-        await safe_reply(
-            update.message,
-            tr("commands.bind_done", name=display),
-            reply_markup=menu_keyboard(),
-        )
-        session_manager.mark_menu_shown(user.id, thread_id)
+        await safe_reply(update.message, tr("commands.bind_done", name=display))
         return
     if not agent:
         available = ", ".join(a.name for a in config.docker_agents) or tr(
@@ -494,12 +468,7 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Remember the group chat_id so outbound messages land in this topic.
     if update.effective_chat and update.effective_chat.id != user.id:
         session_manager.set_group_chat_id(user.id, thread_id, update.effective_chat.id)
-    await safe_reply(
-        update.message,
-        tr("commands.bind_done", name=agent.name),
-        reply_markup=menu_keyboard(),
-    )
-    session_manager.mark_menu_shown(user.id, thread_id)
+    await safe_reply(update.message, tr("commands.bind_done", name=agent.name))
 
 
 async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -570,14 +539,16 @@ def build_bot_commands() -> list[BotCommand]:
     catalog edit — keep this list in sync with the CommandHandler
     registrations in bot.py.
     """
-    # /screenshot (alias of /commands) still works but is deliberately NOT
-    # published — an alias row is noise in the menu new users read as a
-    # feature map.
+    # /agent and /server come first: typing "/" in a topic is the way to the
+    # panel and the summary (no bottom menu, and no "/" button in forum topics
+    # on iOS). Their aliases /commands, /screenshot, /menu and /status still
+    # work but are deliberately NOT published — an alias row is noise in the
+    # list new users read as a feature map.
     return [
+        BotCommand("agent", tr("cmd.agent")),
+        BotCommand("server", tr("cmd.server")),
         BotCommand("help", tr("cmd.help")),
         BotCommand("start", tr("cmd.start")),
-        BotCommand("status", tr("cmd.status")),
-        BotCommand("commands", tr("cmd.commands")),
         BotCommand("restart", tr("cmd.restart")),
         BotCommand("esc", tr("cmd.esc")),
         BotCommand("kill", tr("cmd.kill")),
@@ -586,7 +557,6 @@ def build_bot_commands() -> list[BotCommand]:
         BotCommand("tables", tr("cmd.tables")),
         BotCommand("diff", tr("cmd.diff")),
         BotCommand("pin", tr("cmd.pin")),
-        BotCommand("menu", tr("cmd.menu")),
         *plugins.bot_commands(),
     ]
 
@@ -1668,23 +1638,6 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pane_cache.set_hash(sent.message_id, pane_h)
 
 
-async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Re-attach the persistent command keyboard to the current chat."""
-    user = effective_user(update)
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-    await safe_reply(
-        update.message,
-        tr("menu.pinned"),
-        reply_markup=menu_keyboard(),
-    )
-    thread_id = get_thread_id(update)
-    if thread_id is not None:
-        session_manager.mark_menu_shown(user.id, thread_id)
-
-
 async def _revive_and_report(msg: Message, user_id: int, thread_id: int) -> bool:
     """Rebuild this topic's agent (same folder/CLI/session) and say so.
 
@@ -2034,12 +1987,7 @@ async def _try_auto_bind_topic(
                 thread_id,
             )
             try:
-                await safe_reply(
-                    msg,
-                    tr("commands.autobind_docker", name=agent_name),
-                    reply_markup=menu_keyboard(),
-                )
-                session_manager.mark_menu_shown(user_id, thread_id)
+                await safe_reply(msg, tr("commands.autobind_docker", name=agent_name))
             except Exception as e:
                 logger.debug("auto-bind reply failed: %s", e)
             return True
@@ -2283,9 +2231,12 @@ async def unsupported_content_handler(
 async def menu_button_dispatcher(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Route taps on the persistent ReplyKeyboard buttons to slash commands.
+    """Route taps on the old menu keyboard's buttons to slash commands.
 
-    Buttons send their visible label as plain text (e.g. "🖥️ Server").
+    That keyboard is gone (``pending_menu_removal``), but stays on screen in a
+    topic until kikubot's next message there removes it; a tap meanwhile must
+    not reach the agent as text. Buttons send their visible label as plain
+    text (e.g. "🖥️ Server").
     Target commands must be resilient to plain text — restart_command
     ignores text that doesn't start with a slash, the rest don't parse it.
     """

@@ -16,56 +16,67 @@ def mgr(monkeypatch) -> SessionManager:
     return SessionManager()
 
 
-class TestMenuShownTopics:
-    """Per-topic menu-keyboard exactly-once flag (see menu_shown_topics)."""
+class TestMenuClearTopics:
+    """Topics that may still hold the old bottom menu keyboard."""
 
-    def test_default_not_shown(self, mgr: SessionManager) -> None:
-        assert mgr.is_menu_shown(100, 42) is False
+    def test_unknown_topic_needs_nothing(self, mgr: SessionManager) -> None:
+        assert mgr.menu_needs_clearing(100, 42) is False
+        assert mgr.menu_needs_clearing(100, None) is False
 
-    def test_none_thread_not_shown(self, mgr: SessionManager) -> None:
-        assert mgr.is_menu_shown(100, None) is False
+    def test_marked_cleared_once_removed(self, mgr: SessionManager) -> None:
+        mgr.menu_clear_topics = {"100:42", "100:43"}
+        assert mgr.menu_needs_clearing(100, 42) is True
+        mgr.mark_menu_cleared(100, 42)
+        assert mgr.menu_needs_clearing(100, 42) is False
+        assert mgr.menu_needs_clearing(100, 43) is True
 
-    def test_mark_and_check(self, mgr: SessionManager) -> None:
-        mgr.mark_menu_shown(100, 42)
-        assert mgr.is_menu_shown(100, 42) is True
-        # A different topic of the same user stays unmarked.
-        assert mgr.is_menu_shown(100, 43) is False
+    @staticmethod
+    def _load(monkeypatch, tmp_path, state: dict) -> SessionManager:
+        from kikubot import session as session_mod
 
-    def test_mark_is_idempotent(self, mgr: SessionManager) -> None:
-        mgr.mark_menu_shown(100, 42)
-        mgr.mark_menu_shown(100, 42)
-        assert mgr.menu_shown_topics == {"100:42"}
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps(state))
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        return SessionManager()
 
-    def test_clear(self, mgr: SessionManager) -> None:
-        mgr.mark_menu_shown(100, 42)
-        mgr.clear_menu_shown(100, 42)
-        assert mgr.is_menu_shown(100, 42) is False
-
-    @pytest.mark.parametrize(
-        ("saved", "kept"),
-        [({}, False), ({"menu_keyboard_version": 1}, False), (None, True)],
-    )
-    def test_load_keeps_marks_only_from_same_keyboard_version(
-        self, monkeypatch, tmp_path, saved, kept
+    @pytest.mark.parametrize("old_version", [{}, {"menu_keyboard_version": 2}])
+    def test_state_from_menu_days_plans_every_known_topic(
+        self, monkeypatch, tmp_path, old_version
     ) -> None:
-        # A topic holding an older keyboard must be sent the current one.
-        from kikubot import session as session_mod
-
-        version = (
-            {"menu_keyboard_version": session_mod.MENU_KEYBOARD_VERSION}
-            if saved is None
-            else saved
+        # Version 2 restarted menu_shown_topics empty while the version 1
+        # keyboards stayed in their topics: bound and remembered topics may
+        # hold one too.
+        mgr = self._load(
+            monkeypatch,
+            tmp_path,
+            {
+                "menu_shown_topics": ["100:1"],
+                "thread_bindings": {"100": {"2": "@5"}},
+                "thread_directory_memory": {"100": {"3": "/w"}},
+                **old_version,
+            },
         )
-        state_file = tmp_path / "state.json"
-        state_file.write_text(json.dumps({"menu_shown_topics": ["100:42"], **version}))
-        monkeypatch.setattr(session_mod.config, "state_file", state_file)
-        assert SessionManager().is_menu_shown(100, 42) is kept
+        assert mgr.menu_clear_topics == {"100:1", "100:2", "100:3"}
 
-    def test_save_records_keyboard_version(self, monkeypatch, tmp_path) -> None:
+    def test_current_state_keeps_its_own_list(self, monkeypatch, tmp_path) -> None:
         from kikubot import session as session_mod
 
-        state_file = tmp_path / "state.json"
-        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        mgr = self._load(
+            monkeypatch,
+            tmp_path,
+            {
+                "menu_keyboard_version": session_mod.MENU_KEYBOARD_VERSION,
+                "menu_clear_topics": ["100:1"],
+                "thread_bindings": {"100": {"2": "@5"}},
+            },
+        )
+        # A topic bound after the upgrade never had a keyboard.
+        assert mgr.menu_clear_topics == {"100:1"}
+
+    def test_save_records_version_and_list(self, monkeypatch, tmp_path) -> None:
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(session_mod.config, "state_file", tmp_path / "s.json")
         written: list[dict] = []
         monkeypatch.setattr(
             session_mod,
@@ -73,8 +84,11 @@ class TestMenuShownTopics:
             lambda path, data, **kw: written.append(data),
         )
         mgr = SessionManager()
-        mgr.mark_menu_shown(100, 42)
+        mgr.menu_clear_topics = {"100:42", "100:43"}
+        mgr.mark_menu_cleared(100, 42)
         assert written[-1]["menu_keyboard_version"] == session_mod.MENU_KEYBOARD_VERSION
+        assert written[-1]["menu_clear_topics"] == ["100:43"]
+        assert "menu_shown_topics" not in written[-1]
 
 
 class TestThreadDirectoryMemory:

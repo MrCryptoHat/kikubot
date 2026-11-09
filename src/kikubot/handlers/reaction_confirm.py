@@ -176,19 +176,19 @@ async def _do_confirm(
     chat_id = session_manager.resolve_chat_id(user_id, tid)
     # A 👍 can be the user's ONLY interaction in a topic (confirm, agent works,
     # answers with a photo) — and a reply keyboard rides on messages, not on
-    # reactions. These notices are the reaction path's only messages, so the
-    # menu backstop hangs off them too, otherwise such a topic never gets it.
-    from .commands import pending_menu_markup
+    # reactions. These notices are the reaction path's only messages, so they
+    # carry the old menu keyboard's removal too, or such a topic keeps it.
+    from .commands import pending_menu_removal
 
     async def _notice(text: str) -> None:
         # Resolved at send time: the pane capture and keypress above take
-        # seconds, and the queue worker may have delivered the menu meanwhile.
-        menu = pending_menu_markup(user_id, thread_id)
+        # seconds, and the queue worker may have removed the menu meanwhile.
+        menu = pending_menu_removal(user_id, thread_id)
         sent = await safe_send(
             bot, chat_id, text, message_thread_id=tid, reply_markup=menu
         )
         if sent is not None and menu is not None:
-            session_manager.mark_menu_shown(user_id, thread_id)
+            session_manager.mark_menu_cleared(user_id, thread_id)
 
     pane = await session_manager.capture_pane(binding)
     action, keys = decide_confirm_action(pane, session_manager.window_runtime(binding))
