@@ -116,7 +116,7 @@ def test_json_v1_shape(env):
         "session",
         "commands",
     ]
-    assert data["summary"] == ["model", "effort", "context"]
+    assert data["summary"] == ["model", "effort", "context", "limits"]
     assert secs["model"]["selected"] == "opus"
     assert secs["model"]["command"] == "/model {id}"
     assert {"id": "opus", "label": "Opus 5.5"} in secs["model"]["options"]

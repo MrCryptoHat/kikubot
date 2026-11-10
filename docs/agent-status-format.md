@@ -51,7 +51,7 @@ from the results without sending anything.
     {"id": "5h", "label": "5 h", "pct_used": 62, "resets_at": 1794306400, "window_minutes": 300},
     {"id": "7d_fable", "label": "7 days · Fable", "pct_used": 4, "resets_at": 1794510000, "window_minutes": 10080}
   ],
-  "summary": ["model", "effort", "mode", "context"],
+  "summary": ["model", "effort", "mode", "context", "limits"],
   "sections": [ … ]
 }
 ```

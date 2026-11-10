@@ -58,7 +58,7 @@ def _claude_limit(name: str) -> tuple[str, int | None]:
 
 # Sections a client shows first (in this order, those present); the rest go
 # behind a «more» step. What changes often and matters now.
-SUMMARY_IDS = ("model", "effort", "mode", "context")
+SUMMARY_IDS = ("model", "effort", "mode", "context", "limits")
 
 # Icon names of the permission modes (docs/agent-status-format.md lists them).
 MODE_ICONS = {
