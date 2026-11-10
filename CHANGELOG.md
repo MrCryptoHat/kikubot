@@ -90,6 +90,9 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   refuses rather than types when it can't read the pane.
 - A 🔄 tap while the agent's screen couldn't be read raised an error and left
   the tap unanswered; it now says so.
+- A container agent stopped with ⏹ and later started by its container (not by
+  the bot) stayed marked as stopped, so its next real death was taken for a
+  deliberate stop: no revive, no notice. Seeing it run now clears the mark.
 - A long message (3800+ characters) that arrived as a single piece was lost:
   the bot held it for a second in case Telegram had split it, then cancelled
   its own delivery without a trace. It now reaches the agent.

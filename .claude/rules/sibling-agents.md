@@ -61,7 +61,8 @@ the failed pane capture. Which way depends on WHY it is dead, and that is
 recorded, not guessed: a deliberate stop (⏹, or `POST /stop` on the inject
 socket — both `session_manager.stop_docker_agent`) lands in the persisted
 `stopped_docker_agents` and stays down and silent until something starts it
-(`start_docker_agent` clears the mark). Anything else died with its container:
+(`start_docker_agent` clears the mark, and so does the 1 s poll seeing it run:
+`note_docker_agent_running`, for a session the container started itself). Anything else died with its container:
 with `KIKUBOT_AUTO_RESUME_AGENTS` it is relaunched silently on its own last
 session (one try per `AUTO_REVIVE_RETRY`; nothing is said while the container
 itself is still down), and a message to a not-running agent wakes it and is

@@ -327,8 +327,11 @@ async def update_status_message(
     # docker agent never produced a Telegram notification — the JSONL only
     # records the tool_use after the user answers, and host-side
     # tmux_manager has no window for a docker binding.
+    captured_at = time.monotonic()
     pane_text = await session_manager.capture_pane(window_id)
     agent_status.note_pane(window_id, pane_text)
+    if pane_text and session_manager._is_docker_binding(window_id):
+        session_manager.note_docker_agent_running(window_id, captured_at)
     if not pane_text:
         # Tmux window gone, docker container down, or transient capture
         # failure — nothing to inspect this tick. For a SIBLING agent this is

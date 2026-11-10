@@ -2339,3 +2339,21 @@ class TestSendKeyTokens:
             await asyncio.sleep(0.05)
         assert pane.count("héllo wörld") >= 2
         assert "pwned" not in pane
+
+
+class TestStopMarkClearedWhenRunning:
+    """A docker agent marked stopped but seen running loses the mark, so its
+    next real death is revived/reported, not taken for a deliberate stop."""
+
+    def test_running_agent_loses_its_stop_mark(self, mgr):
+        mgr.stopped_docker_agents.add("docker:ideas")  # from an earlier run
+        mgr.note_docker_agent_running("docker:ideas", time.monotonic())
+        assert "docker:ideas" not in mgr.stopped_docker_agents
+
+    def test_capture_begun_before_the_stop_keeps_the_mark(self, mgr):
+        seen_at = time.monotonic()  # a capture already in flight…
+        mgr.mark_docker_agent_stopped("docker:ideas")  # …when ⏹ lands
+        mgr.note_docker_agent_running("docker:ideas", seen_at)
+        assert "docker:ideas" in mgr.stopped_docker_agents
+        mgr.note_docker_agent_running("docker:ideas", time.monotonic() + 1)
+        assert "docker:ideas" not in mgr.stopped_docker_agents

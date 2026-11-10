@@ -315,6 +315,9 @@ class SessionManager:
     # and keys typed meanwhile wait in the tty for the shell; the next writer
     # waits FINAL_SETTLE_SEC out before its agent-running check.
     _final_key_at: dict[str, float] = field(default_factory=dict)
+    # binding -> monotonic time of its deliberate stop mark, this process only
+    # (see note_docker_agent_running).
+    _stopped_at: dict[str, float] = field(default_factory=dict)
     # Live-dashboard message_ids per docker-agent (agent_name → telegram
     # message_id in the shared LIVE_DASHBOARD_THREAD_ID topic). Persisted
     # so a bot restart edits the existing message instead of leaving a
@@ -3026,9 +3029,28 @@ class SessionManager:
 
     def mark_docker_agent_stopped(self, binding_value: str) -> None:
         """Record a deliberate stop (⏹) so auto-resume leaves it down."""
+        self._stopped_at[binding_value] = time.monotonic()
         if binding_value not in self.stopped_docker_agents:
             self.stopped_docker_agents.add(binding_value)
             self._save_state()
+
+    def note_docker_agent_running(self, binding_value: str, seen_at: float) -> None:
+        """Drop the stop mark of an agent seen running in a capture from ``seen_at``.
+
+        A session the container (or someone by hand) started after a ⏹ never
+        went through ``start_docker_agent``, so its mark stayed, and the next
+        real death read as a deliberate stop: no revive, no notice. Only a
+        capture begun after the mark counts; one in flight while ⏹ killed the
+        session may still show it alive.
+        """
+        if binding_value not in self.stopped_docker_agents:
+            return
+        if self._stopped_at.get(binding_value, float("-inf")) >= seen_at:
+            return
+        self.stopped_docker_agents.discard(binding_value)
+        self._stopped_at.pop(binding_value, None)
+        self._save_state()
+        logger.info("%s is running: its stop mark is cleared", binding_value)
 
     async def docker_agent_running(self, binding_value: str) -> bool:
         """True iff this docker binding's container AND tmux session are up.
