@@ -27,6 +27,7 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    InlineQueryHandler,
     ContextTypes,
     MessageHandler,
     MessageReactionHandler,
@@ -51,6 +52,8 @@ from .handlers.delivery import (
     report_delivery_failure,
 )
 from .handlers.callbacks import callback_handler
+from .handlers.inline_status import inline_status_handler
+from .handlers.mode_command import mode_command
 from .handlers.commands import (
     _auto_bind_to_directory,
     _try_auto_bind_topic,
@@ -211,6 +214,11 @@ async def text_handler(
         return
 
     if not update.message or not (text_override or update.message.text):
+        return
+    # A status card picked from our own inline results lands in the topic as
+    # the user's message: it is for reading, not a prompt for the agent.
+    via = update.message.via_bot
+    if via is not None and via.id == context.bot.id:
         return
 
     thread_id = get_thread_id(update)
@@ -1487,9 +1495,12 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("tables", tables_command))
     application.add_handler(CommandHandler("diff", diff_command))
     application.add_handler(CommandHandler("pin", pin_command))
+    application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("bind", bind_command))
     plugins.register_handlers(application)
     application.add_handler(CallbackQueryHandler(callback_handler))
+    # Inline `status` — inert until inline mode is on in @BotFather.
+    application.add_handler(InlineQueryHandler(inline_status_handler))
     if config.reaction_confirm_enabled:
         application.add_handler(MessageReactionHandler(handle_message_reaction))
     application.add_handler(

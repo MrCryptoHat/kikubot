@@ -23,6 +23,8 @@ The interface a runtime implements:
                                    the output type does not).
   - ``latest_context_tokens``   — context-window fill for the context alert
                                    (runtime-specific usage shape; None to skip).
+  - ``latest_usage``            — context, model and usage limits for the
+                                   agent status card (agent_status.py).
   - ``list_sessions``           — resumable sessions for a directory, for the
                                    picker's per-runtime tab (Claude: project
                                    glob; Codex: rollout-by-cwd; → ``AgentSession``).
@@ -58,6 +60,7 @@ import shutil
 import subprocess
 import time
 import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +69,7 @@ from .codex_transcript_parser import CodexTranscriptParser
 from .config import config
 from .grok_transcript_parser import GrokTranscriptParser
 from .terminal_parser import (
+    _is_chrome_separator,
     composer_holds_text,
     has_codex_queued_messages,
     has_grok_queued_messages,
@@ -73,6 +77,7 @@ from .terminal_parser import (
     is_claude_working,
     is_codex_working,
     is_grok_working,
+    is_interactive_ui,
 )
 from .transcript_parser import ParsedEntry, TranscriptParser
 from .utils import is_valid_session_id, same_dir as _same_dir
@@ -206,6 +211,73 @@ def _entry_context_tokens(entry: dict) -> int | None:
         + usage.get("cache_creation_input_tokens", 0)
         + usage.get("cache_read_input_tokens", 0)
     )
+
+
+@dataclass(frozen=True)
+class UsageLimit:
+    """One usage-limit window as an agent CLI reports it."""
+
+    id: str  # "5h", "7d", or the CLI's own name for an odd window
+    pct_used: float
+    resets_at: int | None = None  # unix seconds
+    window_minutes: int | None = None
+
+
+@dataclass(frozen=True)
+class AgentUsage:
+    """What a transcript batch says about the session (None = not reported)."""
+
+    context_tokens: int | None = None
+    context_window: int | None = None
+    model: str | None = None  # the model that actually answered, CLI's id
+    limits: tuple[UsageLimit, ...] = ()
+
+
+_WINDOW_IDS = {300: "5h", 10080: "7d"}
+
+# Claude Code's footer under the input box: «⏵⏵ auto mode on · 2 shells · …».
+# No mode marker there means the default (ask before changes).
+_CLAUDE_MODE_RE = re.compile(
+    r"(?:⏵⏵|⏸)\s+(auto mode|plan mode|accept edits|bypass permissions) on"
+)
+_CLAUDE_MODES = {
+    "auto mode": "auto",
+    "plan mode": "plan",
+    "accept edits": "accept_edits",
+    "bypass permissions": "bypass",
+}
+_CLAUDE_SHELLS_RE = re.compile(r"(\d+) shells?\b")
+
+
+def _claude_footer(pane_text: str) -> str | None:
+    """The lines below Claude Code's input box, or None when none is drawn.
+
+    The box is the region between the last two chrome rules and starts with
+    the ❯ prompt; under it come the user's own status line (if any) and then
+    the mode / shells line, so every line there is searched. A dialog or a
+    shell owning the pane has no box — None, so nothing reads it as a mode.
+    """
+    if not pane_text or is_interactive_ui(pane_text):
+        return None
+    lines = pane_text.split("\n")
+    seps = [
+        i
+        for i in range(max(0, len(lines) - 40), len(lines))
+        if _is_chrome_separator(lines[i].strip())
+    ]
+    if len(seps) < 2:
+        return None
+    box = lines[seps[-2] + 1 : seps[-1]]
+    if not box or box[0].lstrip()[:1] not in ("❯", ">", "›"):
+        return None
+    return "\n".join(ln for ln in lines[seps[-1] + 1 :] if ln.strip())
+
+
+def limit_id(window_minutes: int | None, fallback: str) -> str:
+    """Stable id of a limit window: "5h"/"7d" for the common ones."""
+    if window_minutes in _WINDOW_IDS:
+        return _WINDOW_IDS[window_minutes]
+    return f"{window_minutes}m" if window_minutes else fallback
 
 
 class AgentRuntime(abc.ABC):
@@ -455,6 +527,39 @@ class AgentRuntime(abc.ABC):
         """
         return None
 
+    def latest_usage(self, raw_entries: list[dict]) -> AgentUsage | None:
+        """Context, model and limits ``raw_entries`` report (None → nothing).
+
+        Feeds the agent status card. Default: the context fill alone.
+        """
+        tokens = self.latest_context_tokens(raw_entries)
+        return AgentUsage(context_tokens=tokens) if tokens is not None else None
+
+    def permission_mode(self, pane_text: str) -> str | None:
+        """The permission mode the pane's footer shows, as a stable id.
+
+        For the agent status card. Default: unknown (None).
+        """
+        return None
+
+    def background_shells(self, pane_text: str) -> int | None:
+        """How many background shells the pane's footer reports (None: unknown)."""
+        return None
+
+    # Permission modes `/mode` can switch between (ids as permission_mode
+    # returns them); () = no modes.
+    permission_modes: tuple[str, ...] = ()
+
+    # Model aliases the CLI's `/model <alias>` accepts, (alias, label), for the
+    # status sheet's model picker; () = no picker, `/model` opens the CLI's own.
+    model_aliases: tuple[tuple[str, str], ...] = ()
+    # Levels `/effort <level>` accepts; () = no effort picker.
+    effort_levels: tuple[str, ...] = ()
+
+    # Launched with kikubot's status-line tap (`kikubot statusline`) when
+    # KIKUBOT_USAGE_LIMITS is on — Claude Code only: the tap reads its stdin.
+    statusline_tap = False
+
     def is_working(self, pane_text: str) -> bool:
         """True iff the pane shows a turn actively running (interruptible).
 
@@ -525,8 +630,41 @@ class ClaudeRuntime(AgentRuntime):
     def cli_command(self) -> str:
         return config.claude_command
 
+    statusline_tap = True
+    permission_modes = ("manual", "accept_edits", "plan", "auto")
+    model_aliases = (
+        ("opus", "Opus"),
+        ("fable", "Fable"),
+        ("sonnet", "Sonnet"),
+        ("haiku", "Haiku"),
+    )
+    # `claude --help`: --effort <level> (low, medium, high, xhigh, max). The
+    # slash form SAVES the level for that model in ~/.claude/settings.json, so
+    # it reaches every session on the machine, not just this one.
+    effort_levels = ("low", "medium", "high", "xhigh", "max")
+
+    def permission_mode(self, pane_text: str) -> str | None:
+        footer = _claude_footer(pane_text)
+        if footer is None:
+            return None
+        m = _CLAUDE_MODE_RE.search(footer)
+        return _CLAUDE_MODES[m.group(1)] if m else "manual"
+
+    def background_shells(self, pane_text: str) -> int | None:
+        footer = _claude_footer(pane_text)
+        if footer is None:
+            return None
+        m = _CLAUDE_SHELLS_RE.search(footer)
+        return int(m.group(1)) if m else 0
+
     def _claude_invocation(self) -> str:
         """The ``claude`` command line that ``launch_command`` extends."""
+        if config.usage_limits_enabled:
+            from .agent_status import write_statusline_settings
+
+            path = write_statusline_settings()
+            if path is not None:
+                return f"{config.claude_command} --settings {shlex.quote(str(path))}"
         return config.claude_command
 
     def launch_command(
@@ -574,6 +712,20 @@ class ClaudeRuntime(AgentRuntime):
             if t is not None:
                 latest = t
         return latest
+
+    def latest_usage(self, raw_entries: list[dict]) -> AgentUsage | None:
+        tokens: int | None = None
+        model: str | None = None
+        for raw in raw_entries:
+            t = _entry_context_tokens(raw)
+            if t is not None:
+                tokens = t
+                m = (raw.get("message") or {}).get("model")
+                if isinstance(m, str) and m and not m.startswith("<"):
+                    model = m
+        if tokens is None and model is None:
+            return None
+        return AgentUsage(context_tokens=tokens, model=model)
 
 
 class CodexRuntime(AgentRuntime):
@@ -705,6 +857,57 @@ class CodexRuntime(AgentRuntime):
     # per-model window (e.g. 258k for gpt-5.5), not the fixed 1M the alert
     # thresholds assume — so context alerts are skipped for now (base returns
     # None). Wire per-model windows before enabling.
+
+    def latest_usage(self, raw_entries: list[dict]) -> AgentUsage | None:
+        # event_msg/token_count carries the context fill, the model's window
+        # and the account's rate limits; turn_context names the model.
+        found = False
+        tokens = window = None
+        model: str | None = None
+        limits: tuple[UsageLimit, ...] = ()
+        for raw in raw_entries:
+            payload = raw.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if raw.get("type") == "turn_context" and isinstance(
+                payload.get("model"), str
+            ):
+                model, found = payload["model"], True
+            if payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            if isinstance(info, dict):
+                last = info.get("last_token_usage")
+                if isinstance(last, dict) and isinstance(last.get("total_tokens"), int):
+                    tokens, found = last["total_tokens"], True
+                if isinstance(info.get("model_context_window"), int):
+                    window = info["model_context_window"]
+            rl = payload.get("rate_limits")
+            if isinstance(rl, dict):
+                got = []
+                for name in ("primary", "secondary"):
+                    b = rl.get(name)
+                    if isinstance(b, dict) and isinstance(
+                        b.get("used_percent"), int | float
+                    ):
+                        mins = b.get("window_minutes")
+                        mins = mins if isinstance(mins, int) else None
+                        resets = b.get("resets_at")
+                        got.append(
+                            UsageLimit(
+                                id=limit_id(mins, name),
+                                pct_used=float(b["used_percent"]),
+                                resets_at=resets if isinstance(resets, int) else None,
+                                window_minutes=mins,
+                            )
+                        )
+                if got:
+                    limits, found = tuple(got), True
+        if not found:
+            return None
+        return AgentUsage(
+            context_tokens=tokens, context_window=window, model=model, limits=limits
+        )
 
     def _rollout_cwd(self, rollout: Path) -> str | None:
         """session_meta.cwd of a codex rollout (cached; the header is immutable)."""
@@ -1200,6 +1403,11 @@ class GlmRuntime(ClaudeRuntime):
     name = GLM_RUNTIME
     display_name = "GLM"
     picker_icon = "🟢"
+    # Its own --settings carries the z.ai env; and Claude's account limits
+    # would be the wrong limits for a z.ai agent anyway.
+    statusline_tap = False
+    # The aliases map onto z.ai models there; Claude's names would mislead.
+    model_aliases = ()
 
     def is_available(self) -> bool:
         return super().is_available() and config.glm_settings_path.is_file()

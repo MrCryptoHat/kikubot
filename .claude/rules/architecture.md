@@ -61,6 +61,7 @@ Interactive-UI detection, dead-window cleanup (30 s grace; liveness = the pane's
 ## Extension points
 
 - **Post-slash renderers** (`callbacks._POST_SLASH_HANDLERS`) — for TUI-only slash commands that leave no JSONL trace (`/context`, `/status`). The hook captures the pane, parses it, posts a message before the default photo refresh; a parse miss silently falls back to the photo. Another data renderer = one parser module + one dict entry.
+- **Agent status** (`agent_status.py`, inline `status`) — built only from caches (the 1 s poll's pane note, the monitor's `latest_usage`, the `kikubot statusline` snapshot), never by capturing or typing into a pane on the query path: a client polls it every few seconds while its sheet is open. A «label: value» fact is one `ITEM_PROVIDERS` entry; the JSON is a contract other apps code against (docs/agent-status-format.md) — a breaking change bumps `v`.
 - **Plugins** (`plugins.py`) — the rclone mount stack (`drive`) and preview fleet + live dashboards (`fleet`) live in kikubot-plugins. Core keeps only the seams they consume: `notifications_chat_id`, `preview_bin`/`preview_registry_path`, `session.live_dashboard_message_ids`, per-agent `vnc_url`, and the hooks `status_sections`/`status_buttons`/`callback_dispatch`/`on_agent_retired` (a docker sub-agent torn down with its topic — fired from `teardown_sibling`, never for a stop it can come back from). Contract in the module docstring.
 
 ## State files

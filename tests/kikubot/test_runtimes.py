@@ -221,7 +221,11 @@ class TestGlmRuntime:
         monkeypatch.setattr(
             rt,
             "config",
-            MagicMock(claude_command="claude", glm_settings_path=Path(settings)),
+            MagicMock(
+                claude_command="claude",
+                glm_settings_path=Path(settings),
+                usage_limits_enabled=False,
+            ),
         )
 
     def test_launch_adds_settings_overlay(self, monkeypatch):
@@ -913,3 +917,98 @@ class TestHistoryTranscript:
         from pathlib import Path as _P
 
         assert await CLAUDE.history_transcript(sm, "@1") == _P("/tmp/x.jsonl")
+
+
+class TestLatestUsage:
+    """What each runtime's transcript says for the agent status card."""
+
+    def test_claude_tokens_and_model(self):
+        from kikubot.runtimes import CLAUDE
+
+        entries = [
+            {
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-5-5",
+                    "usage": {"input_tokens": 10, "cache_read_input_tokens": 990},
+                },
+            }
+        ]
+        usage = CLAUDE.latest_usage(entries)
+        assert usage is not None
+        assert (usage.context_tokens, usage.model) == (1000, "claude-opus-5-5")
+
+    def test_codex_token_count_and_limits(self):
+        from kikubot.runtimes import CODEX
+
+        entries = [
+            {"type": "turn_context", "payload": {"model": "gpt-5.5"}},
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"total_tokens": 19695},
+                        "model_context_window": 258400,
+                    },
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 1.0,
+                            "window_minutes": 300,
+                            "resets_at": 1779371071,
+                        },
+                        "secondary": {
+                            "used_percent": 0.0,
+                            "window_minutes": 10080,
+                            "resets_at": 1779907358,
+                        },
+                    },
+                },
+            },
+        ]
+        usage = CODEX.latest_usage(entries)
+        assert usage is not None
+        assert (usage.context_tokens, usage.context_window, usage.model) == (
+            19695,
+            258400,
+            "gpt-5.5",
+        )
+        assert [(lim.id, lim.pct_used) for lim in usage.limits] == [
+            ("5h", 1.0),
+            ("7d", 0.0),
+        ]
+
+    def test_nothing_reported(self):
+        from kikubot.runtimes import CODEX
+
+        assert CODEX.latest_usage([{"type": "response_item", "payload": {}}]) is None
+
+
+class TestStatuslineLaunch:
+    def test_flag_on_adds_the_tap_settings(self, monkeypatch):
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        import kikubot.agent_status as ast
+        import kikubot.runtimes as rt
+        from kikubot.runtimes import CLAUDE, GLM
+
+        monkeypatch.setattr(
+            rt,
+            "config",
+            MagicMock(
+                claude_command="claude",
+                usage_limits_enabled=True,
+                glm_settings_path=Path("/cfg/glm.json"),
+            ),
+        )
+        monkeypatch.setattr(
+            ast, "write_statusline_settings", lambda: Path("/k/agent-settings.json")
+        )
+        assert CLAUDE.launch_command("proj") == (
+            "claude --settings /k/agent-settings.json --name proj"
+        )
+        # GLM keeps its own --settings (z.ai env) and no Claude limits.
+        assert (
+            GLM.launch_command("proj") == "claude --settings /cfg/glm.json --name proj"
+        )

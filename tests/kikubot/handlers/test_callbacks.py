@@ -100,6 +100,7 @@ class TestRestartBusyGuard:
             patch("kikubot.handlers.callbacks._cmd_refresh_photo", new=AsyncMock()),
         ):
             rcfg.claude_command = "claude"
+            rcfg.usage_limits_enabled = False
             sm._is_docker_binding.return_value = False
             sm.is_agent_working.return_value = False
             sm.get_window_state.return_value = MagicMock(
@@ -145,6 +146,7 @@ class TestRestartBusyGuard:
             patch("kikubot.handlers.callbacks._cmd_refresh_photo", new=AsyncMock()),
         ):
             rcfg.claude_command = "claude"
+            rcfg.usage_limits_enabled = False
             sm._is_docker_binding.return_value = False
             sm.is_agent_working.return_value = False
             sm.get_window_state.return_value = MagicMock(
@@ -228,6 +230,7 @@ class TestRestartBusyGuard:
             ),
         ):
             rcfg.claude_command = "claude"
+            rcfg.usage_limits_enabled = False
             sm._is_docker_binding.return_value = False
             sm.is_agent_working.return_value = False
             sm.get_window_state.return_value = MagicMock(

@@ -20,7 +20,7 @@ from typing import Any, Callable, Awaitable
 
 import aiofiles
 
-from . import i18n
+from . import agent_status, i18n
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .runtimes import monitored_runtimes
@@ -498,6 +498,12 @@ class SessionMonitor:
             # Context-fill threshold alerts — the token extraction is
             # runtime-specific (usage shape differs); the threshold bookkeeping
             # is generic. None → runtime opts out (e.g. Codex, for now).
+            try:
+                usage = runtime.latest_usage(new_entries)
+                if usage is not None:
+                    agent_status.note_usage(session_id, usage)
+            except Exception as e:  # noqa: BLE001 — status is extra, delivery isn't
+                logger.debug("usage for status failed (%s): %s", session_id, e)
             latest_tokens = runtime.latest_context_tokens(new_entries)
             if latest_tokens is not None:
                 alert = self._check_context_thresholds(session_id, latest_tokens)

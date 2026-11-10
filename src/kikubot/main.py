@@ -1,8 +1,10 @@
 """Application entry point — CLI dispatcher and bot bootstrap.
 
-Handles two execution modes:
+Handles three execution modes:
   1. `kikubot hook` — delegates to hook.hook_main() for Claude Code hook processing.
-  2. Default — configures logging (stderr + rotating file in
+  2. `kikubot statusline` — the status-line tap (statusline.py) that kikubot's
+     own Claude windows run when KIKUBOT_USAGE_LIMITS is on.
+  3. Default — configures logging (stderr + rotating file in
      ~/.kikubot/logs/), initializes tmux session, and starts the Telegram
      bot polling loop via bot.create_bot().
 """
@@ -18,6 +20,8 @@ Usage:
   kikubot                     start the Telegram bot
   kikubot hook [--install]    Claude Code SessionStart hook (--install: add it
                             to Claude Code's settings.json)
+  kikubot statusline DIR SESSION
+                              status-line tap (set up by kikubot itself)
   kikubot --help              show this message
   kikubot --version           show version
 
@@ -39,6 +43,10 @@ def main() -> None:
 
             hook_main()
             return
+        if arg == "statusline":
+            from .statusline import statusline_main
+
+            sys.exit(statusline_main(sys.argv[2:]))
         if arg in ("-h", "--help"):
             print(_USAGE)
             return
@@ -173,7 +181,7 @@ def main() -> None:
     from .bot import create_bot
 
     application = create_bot()
-    allowed_updates = ["message", "callback_query"]
+    allowed_updates = ["message", "callback_query", "inline_query"]
     if config.reaction_confirm_enabled:
         # Telegram only delivers message_reaction updates when explicitly
         # listed here (and the bot is a chat admin). See reaction_confirm.py.

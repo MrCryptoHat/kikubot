@@ -37,6 +37,7 @@ import time
 from telegram import Bot
 from telegram.error import BadRequest, RetryAfter
 
+from .. import agent_status
 from ..config import config
 from ..i18n import tr
 from ..rate_limiter import background_context
@@ -306,6 +307,7 @@ async def update_status_message(
     # records the tool_use after the user answers, and host-side
     # tmux_manager has no window for a docker binding.
     pane_text = await session_manager.capture_pane(window_id)
+    agent_status.note_pane(window_id, pane_text)
     if not pane_text:
         # Tmux window gone, docker container down, or transient capture
         # failure — nothing to inspect this tick. For a SIBLING agent this is

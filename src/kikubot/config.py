@@ -352,6 +352,15 @@ class Config:
         self.rich_messages_enabled = (
             os.getenv("KIKUBOT_RICH_MESSAGES", "true").lower() == "true"
         )
+        # Usage limits for the agent status card (inline `status`): Claude
+        # Code reports them only to its statusLine command, so kikubot
+        # launches ITS windows with `--settings` whose statusLine is
+        # `kikubot statusline` — a tap that records them, then runs the
+        # user's own status line unchanged. Opt-in: it changes the launch line.
+        self.usage_limits_enabled = (
+            os.getenv("KIKUBOT_USAGE_LIMITS", "false").lower() == "true"
+        )
+        self.agent_status_dir = self.config_dir / "agent_status"
         # Root of Codex's rollout transcripts (~/.codex/sessions/YYYY/MM/DD/
         # rollout-*.jsonl). The monitor resolves a codex window's transcript by
         # matching a rollout's session_meta.cwd to the window's cwd (newest).
