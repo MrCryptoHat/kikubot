@@ -13,6 +13,9 @@ Key functions: create_bot(), handle_new_message().
 """
 
 import asyncio
+import time
+
+import httpx
 import logging
 import re
 from pathlib import Path
@@ -23,6 +26,7 @@ from telegram import (
 )
 from telegram.constants import ChatAction
 from telegram.error import NetworkError
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1286,6 +1290,28 @@ quiet_turn.set_deliver(handle_new_message)
 # --- App lifecycle ---
 
 
+# Below the ~75 s after which servers commonly drop an idle keep-alive.
+KEEPALIVE_SEC = 60.0
+
+_loop_watch_task: asyncio.Task[None] | None = None
+LOOP_LAG_WARN_SEC = 0.5
+
+
+async def _watch_event_loop() -> None:
+    """Log when the event loop was blocked: every handler waits behind it.
+
+    Wakes every 0.25 s; a wake-up that comes LOOP_LAG_WARN_SEC late means
+    something ran synchronously that long (a stalled inline answer with no
+    slow tmux line points here).
+    """
+    while True:
+        t = time.monotonic()
+        await asyncio.sleep(0.25)
+        lag = time.monotonic() - t - 0.25
+        if lag > LOOP_LAG_WARN_SEC:
+            logger.warning("event loop was blocked for %.0f ms", lag * 1000)
+
+
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task
 
@@ -1339,6 +1365,8 @@ async def post_init(application: Application) -> None:
     logger.info("Session monitor started")
 
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
+    global _loop_watch_task
+    _loop_watch_task = asyncio.create_task(_watch_event_loop())
     logger.info("Status polling task started")
 
     # Windows lost with the previous tmux server come back on their sessions
@@ -1382,6 +1410,8 @@ async def post_shutdown(application: Application) -> None:
             pass
         _status_poll_task = None
         logger.info("Status polling stopped")
+    if _loop_watch_task is not None:
+        _loop_watch_task.cancel()
 
     global _inject_runner
     if _inject_runner is not None:
@@ -1466,10 +1496,27 @@ def create_bot() -> Application:
         # upload server-side, producing a duplicate when status_polling's
         # next tick retried. Bumping read/write to 30s and media_write to 60s
         # absorbs slow uploads without changing fast-path latency.
-        .read_timeout(30)
-        .write_timeout(30)
-        .connect_timeout(15)
-        .media_write_timeout(60)
+        #
+        # Idle connections live KEEPALIVE_SEC, not httpx's 5 s: on a far link
+        # each new connection costs a TCP + TLS setup (~0.4 s on a far link), and
+        # with connections dropped after 5 s idle, about every other inline
+        # answer paid it (answerInlineQuery 0.8–1.1 s instead of ~0.2 s).
+        .request(
+            HTTPXRequest(
+                connection_pool_size=256,
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=15,
+                media_write_timeout=60,
+                httpx_kwargs={
+                    "limits": httpx.Limits(
+                        max_connections=256,
+                        max_keepalive_connections=32,
+                        keepalive_expiry=KEEPALIVE_SEC,
+                    )
+                },
+            )
+        )
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
