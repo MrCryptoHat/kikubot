@@ -180,8 +180,8 @@ def test_model_running_differs_from_selected(env):
     agent_status.note_usage("sid-claude", AgentUsage(model="claude-sonnet-5-5"))
     st = agent_status.build_status("@5", now=NOW)
     assert st.model == "Opus 5.5"
-    assert st.model_running == "claude-sonnet-5-5"
-    assert "Answering now: claude-sonnet-5-5" in st.card(now=NOW)
+    assert st.model_running == "Sonnet 5.5"
+    assert "Answering now: Sonnet 5.5" in st.card(now=NOW)
 
 
 def test_codex_limits_from_transcript_and_reserved_slash(env):
@@ -372,3 +372,17 @@ def test_json_never_exceeds_the_inline_cap(env, monkeypatch):
     text = agent_status.build_status("@5", now=NOW).to_json()
     assert len(text) <= agent_status.MAX_JSON_CHARS
     assert json.loads(text)["v"] == 1
+
+
+def test_old_window_without_snapshot_reads_well(env):
+    agent_status.note_usage(
+        "sid-claude", AgentUsage(context_tokens=720000, model="claude-opus-5-5")
+    )
+    st = agent_status.build_status("@5", now=NOW)
+    assert st.model == "Opus 5.5"
+    assert (st.context_pct, st.context_window) == (72, 1_000_000)
+    # Below 200k the window could be either size: no guess.
+    agent_status._usage.clear()
+    agent_status.note_usage("sid-claude", AgentUsage(context_tokens=150000))
+    st = agent_status.build_status("@5", now=NOW)
+    assert st.context_pct is None and st.context_window is None

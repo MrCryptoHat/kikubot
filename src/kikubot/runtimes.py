@@ -550,6 +550,14 @@ class AgentRuntime(abc.ABC):
     # returns them); () = no modes.
     permission_modes: tuple[str, ...] = ()
 
+    def infer_context_window(self, used_tokens: int) -> int | None:
+        """The context window size when nothing reports it (None: unknown)."""
+        return None
+
+    def pretty_model(self, model_id: str) -> str:
+        """A model id as a person reads it. Default: as it is."""
+        return model_id
+
     # Model aliases the CLI's `/model <alias>` accepts, (alias, label), for the
     # status sheet's model picker; () = no picker, `/model` opens the CLI's own.
     model_aliases: tuple[tuple[str, str], ...] = ()
@@ -642,6 +650,18 @@ class ClaudeRuntime(AgentRuntime):
     # slash form SAVES the level for that model in ~/.claude/settings.json, so
     # it reaches every session on the machine, not just this one.
     effort_levels = ("low", "medium", "high", "xhigh", "max")
+
+    def infer_context_window(self, used_tokens: int) -> int | None:
+        # Claude's windows are 200k or 1M: a fill past 200k can only be 1M.
+        return 1_000_000 if used_tokens > 200_000 else None
+
+    def pretty_model(self, model_id: str) -> str:
+        # «claude-opus-5-5[1m]» → «Opus 5.5», the way the status line names it.
+        m = re.fullmatch(r"claude-([a-z]+)-(\d+)(?:-(\d+))?(?:\[.*\])?", model_id)
+        if not m:
+            return model_id
+        version = m.group(2) + (f".{m.group(3)}" if m.group(3) else "")
+        return f"{m.group(1).title()} {version}"
 
     def permission_mode(self, pane_text: str) -> str | None:
         footer = _claude_footer(pane_text)

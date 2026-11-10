@@ -716,9 +716,9 @@ def build_status(
         st.effort = effort
     if usage and usage.model:
         if st.model is None:
-            st.model = usage.model
+            st.model = rt.pretty_model(usage.model)
         elif _base_model(usage.model) != _base_model(snap_model.get("id") or ""):
-            st.model_running = usage.model
+            st.model_running = rt.pretty_model(usage.model)
 
     ctx = (snap or {}).get("context_window") or {}
     st.context_window = ctx.get("context_window_size") or (
@@ -732,8 +732,12 @@ def build_status(
         st.context_pct = round(pct)
         if st.context_window:
             st.context_used = round(pct * st.context_window / 100)
-    elif st.context_used is not None and st.context_window:
-        st.context_pct = round(100 * st.context_used / st.context_window)
+    elif st.context_used is not None:
+        st.context_window = st.context_window or rt.infer_context_window(
+            st.context_used
+        )
+        if st.context_window:
+            st.context_pct = round(100 * st.context_used / st.context_window)
 
     if tapped:
         # Limits belong to the account: the freshest report of any window
