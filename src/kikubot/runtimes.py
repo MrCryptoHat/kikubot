@@ -558,6 +558,10 @@ class AgentRuntime(abc.ABC):
         """A model id as a person reads it. Default: as it is."""
         return model_id
 
+    def configured_effort(self, model_id: str | None) -> str | None:
+        """The effort level the CLI is set to use for ``model_id`` (None: unknown)."""
+        return None
+
     # Model aliases the CLI's `/model <alias>` accepts, (alias, label), for the
     # status sheet's model picker; () = no picker, `/model` opens the CLI's own.
     model_aliases: tuple[tuple[str, str], ...] = ()
@@ -654,6 +658,26 @@ class ClaudeRuntime(AgentRuntime):
     def infer_context_window(self, used_tokens: int) -> int | None:
         # Claude's windows are 200k or 1M: a fill past 200k can only be 1M.
         return 1_000_000 if used_tokens > 200_000 else None
+
+    def configured_effort(self, model_id: str | None) -> str | None:
+        # Claude Code keeps it in ~/.claude/settings.json: per model under
+        # modelSettings (what `/effort` writes), else the global effortLevel.
+        from .hook import _claude_settings_file
+
+        try:
+            data = json.loads(_claude_settings_file().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        per_model = data.get("modelSettings")
+        if model_id and isinstance(per_model, dict):
+            entry = per_model.get(model_id.split("[", 1)[0])
+            level = entry.get("effortLevel") if isinstance(entry, dict) else None
+            if isinstance(level, str):
+                return level
+        level = data.get("effortLevel")
+        return level if isinstance(level, str) else None
 
     def pretty_model(self, model_id: str) -> str:
         # «claude-opus-5-5[1m]» → «Opus 5.5», the way the status line names it.

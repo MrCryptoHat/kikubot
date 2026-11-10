@@ -139,6 +139,9 @@ class AgentStatus:
     mode: str | None = None  # permission mode id, when the runtime has modes
     effort: str | None = None
     model_id: str | None = None  # the CLI's id of the selected model
+    branch: str | None = None
+    # alias → readable name with version, from models seen on this machine
+    alias_names: dict[str, str] = field(default_factory=dict)
     items: list[Item] = field(default_factory=list)
     commands: list[tuple[str, str]] = field(default_factory=list)
 
@@ -234,6 +237,8 @@ class AgentStatus:
             out["model"] = self.model
         if self.model_running:
             out["model_running"] = self.model_running
+        if self.branch:
+            out["branch"] = self.branch
         ctx = {
             k: v
             for k, v in (
@@ -325,7 +330,10 @@ def _model_section(st: AgentStatus, aliases: tuple[tuple[str, str], ...]) -> dic
         selected=selected,
         command="/model {id}",
         options=[
-            {"id": a, "label": st.model if a == selected else label}
+            {
+                "id": a,
+                "label": st.model if a == selected else st.alias_names.get(a, label),
+            }
             for a, label in aliases
         ],
     )
@@ -448,6 +456,46 @@ def window_snapshot(window_id: str, tracked_sid: str = "") -> dict | None:
     if not sid or sid not in {tracked_sid, _session_map_sid(window_id)}:
         return None
     return snap
+
+
+def observed_models() -> dict[str, tuple[str, int | None]]:
+    """Model id → (readable name, context window) from every window's report.
+
+    What this machine's Claude actually ran, so the model picker can name
+    each alias with its current version and an old window can learn its
+    model's window size — without a hardcoded model table that goes stale.
+    """
+    seen: dict[str, tuple[str, int | None]] = {}
+    try:
+        paths = list(config.agent_status_dir.glob("@*.json"))
+    except OSError:
+        return seen
+    for path in paths:
+        snap = _read_snapshot(path) or {}
+        model = snap.get("model") or {}
+        mid = model.get("id")
+        if not isinstance(mid, str):
+            continue
+        window = (snap.get("context_window") or {}).get("context_window_size")
+        seen[_base_model(mid)] = (
+            model.get("display_name") or mid,
+            window if isinstance(window, int) else None,
+        )
+    return seen
+
+
+def _alias_names(
+    aliases: tuple[tuple[str, str], ...],
+    ids: Iterable[str],
+    pretty: Callable[[str], str],
+) -> dict[str, str]:
+    """alias → the newest version of it among ``ids``, readably named."""
+    out: dict[str, tuple[str, str]] = {}
+    for mid in ids:
+        for alias, _ in aliases:
+            if alias in mid and (alias not in out or mid > out[alias][0]):
+                out[alias] = (mid, pretty(mid))
+    return {a: name for a, (_, name) in out.items()}
 
 
 def _snapshot_limits(snap: dict | None, now: float) -> list[UsageLimit]:
@@ -714,11 +762,21 @@ def build_status(
     effort = (snap or {}).get("effort")
     if isinstance(effort, str):
         st.effort = effort
+    elif rt.effort_levels:
+        st.effort = rt.configured_effort(st.model_id)
     if usage and usage.model:
         if st.model is None:
             st.model = rt.pretty_model(usage.model)
         elif _base_model(usage.model) != _base_model(snap_model.get("id") or ""):
             st.model_running = rt.pretty_model(usage.model)
+
+    observed = observed_models() if rt.model_aliases else {}
+    if rt.model_aliases:
+        ids = set(observed) | {u.model for u in _usage.values() if u.model}
+        names = {mid: name for mid, (name, _) in observed.items()}
+        st.alias_names = _alias_names(
+            rt.model_aliases, ids, lambda m: names.get(m) or rt.pretty_model(m)
+        )
 
     ctx = (snap or {}).get("context_window") or {}
     st.context_window = ctx.get("context_window_size") or (
@@ -733,8 +791,9 @@ def build_status(
         if st.context_window:
             st.context_used = round(pct * st.context_window / 100)
     elif st.context_used is not None:
-        st.context_window = st.context_window or rt.infer_context_window(
-            st.context_used
+        known = observed.get(_base_model(st.model_id or ""), ("", None))[1]
+        st.context_window = (
+            st.context_window or known or rt.infer_context_window(st.context_used)
         )
         if st.context_window:
             st.context_pct = round(100 * st.context_used / st.context_window)
@@ -748,6 +807,9 @@ def build_status(
         st.limits = [
             lim for lim in usage.limits if not lim.resets_at or lim.resets_at >= now
         ]
+
+    if ws and getattr(ws, "cwd", "") and binding.startswith("@"):
+        st.branch = git_branch(ws.cwd)
 
     if pane and rt.permission_modes and state != "waiting":
         st.mode = rt.permission_mode(pane)

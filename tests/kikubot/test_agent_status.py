@@ -55,11 +55,15 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "agent_status_dir", tmp_path)
     monkeypatch.setattr(config, "usage_limits_enabled", True)
     monkeypatch.setattr(config, "session_map_file", tmp_path / "no-session-map.json")
+    from kikubot import hook
+
+    claude_settings = tmp_path / "claude-settings.json"
+    monkeypatch.setattr(hook, "_claude_settings_file", lambda: claude_settings)
     agent_status._panes.clear()
     agent_status._usage.clear()
     sm = _FakeSM()
     monkeypatch.setattr(session_mod, "session_manager", sm)
-    yield SimpleNamespace(dir=tmp_path, sm=sm)
+    yield SimpleNamespace(dir=tmp_path, sm=sm, claude_settings=claude_settings)
     agent_status._panes.clear()
     agent_status._usage.clear()
 
@@ -386,3 +390,68 @@ def test_old_window_without_snapshot_reads_well(env):
     agent_status.note_usage("sid-claude", AgentUsage(context_tokens=150000))
     st = agent_status.build_status("@5", now=NOW)
     assert st.context_pct is None and st.context_window is None
+
+
+def test_effort_from_claude_settings_for_an_old_window(env):
+    env.claude_settings.write_text(
+        json.dumps(
+            {
+                "effortLevel": "high",
+                "modelSettings": {"claude-opus-5-5": {"effortLevel": "xhigh"}},
+            }
+        )
+    )
+    agent_status.note_usage("sid-claude", AgentUsage(model="claude-opus-5-5"))
+    st = agent_status.build_status("@5", now=NOW)
+    assert st.effort == "xhigh"
+    data = json.loads(st.to_json())
+    assert data["summary"][:2] == ["model", "effort"]
+
+
+def test_every_alias_named_with_its_version(env):
+    # Another window ran Fable 5.2: the picker names the alias with it.
+    _write(
+        env.dir,
+        "@9",
+        {
+            **_SNAP,
+            "session_id": "x",
+            "model": {"id": "claude-fable-5-2", "display_name": "Fable 5.2"},
+        },
+    )
+    agent_status.note_usage("sid-claude", AgentUsage(model="claude-opus-5-5"))
+    data = json.loads(agent_status.build_status("@5", now=NOW).to_json())
+    model = next(s for s in data["sections"] if s["id"] == "model")
+    labels = {o["id"]: o["label"] for o in model["options"]}
+    assert labels["opus"] == "Opus 5.5" and model["selected"] == "opus"
+    assert labels["fable"] == "Fable 5.2"
+    assert labels["haiku"] == "Haiku"  # never seen here: no version to claim
+
+
+def test_branch_at_top_level(env, tmp_path):
+    repo = tmp_path / "r"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    env.sm.window_states["@5"] = SimpleNamespace(session_id="sid-claude", cwd=str(repo))
+    assert (
+        json.loads(agent_status.build_status("@5", now=NOW).to_json())["branch"]
+        == "main"
+    )
+
+
+def test_old_window_learns_its_window_from_a_snapshot(env):
+    _write(
+        env.dir,
+        "@9",
+        {
+            **_SNAP,
+            "session_id": "x",
+            "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"},
+            "context_window": {"context_window_size": 200000},
+        },
+    )
+    agent_status.note_usage(
+        "sid-claude", AgentUsage(context_tokens=150000, model="claude-opus-5-5")
+    )
+    st = agent_status.build_status("@5", now=NOW)
+    assert (st.context_pct, st.context_window) == (75, 200000)
