@@ -231,9 +231,78 @@ class AgentUsage:
     context_window: int | None = None
     model: str | None = None  # the model that actually answered, CLI's id
     limits: tuple[UsageLimit, ...] = ()
+    # Files the agent's edit tools touched in this batch (as the CLI wrote them).
+    edited_files: tuple[str, ...] = ()
+    # Subagent lifecycle, in order: ("start", key, description) / ("done", key, "").
+    agent_events: tuple[tuple[str, str, str], ...] = ()
 
 
 _WINDOW_IDS = {300: "5h", 10080: "7d"}
+
+# A subagent the Agent tool launched in the background reports back later in
+# a <task-notification> carrying the launching tool_use id and its status.
+_NOTIFY_RE = re.compile(
+    r"<tool-use-id>([^<]+)</tool-use-id>.*?<status>(completed|failed|killed|stopped|cancelled)</status>",
+    re.DOTALL,
+)
+_CLAUDE_AGENT_TOOLS = frozenset({"Agent", "Task"})
+
+
+def _block_text(content: object) -> str:
+    """Text of a message/tool_result content (a str or a list of blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def _claude_activity(
+    raw_entries: list[dict], edit_tools: frozenset[str]
+) -> tuple[tuple[str, ...], tuple[tuple[str, str, str], ...]]:
+    """(edited files, subagent events) in a batch of Claude transcript entries."""
+    files: list[str] = []
+    events: list[tuple[str, str, str]] = []
+    agent_ids: set[str] = set()
+    for raw in raw_entries:
+        content = (raw.get("message") or {}).get("content")
+        if raw.get("type") == "assistant" and isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict) or b.get("type") != "tool_use":
+                    continue
+                inp = b.get("input")
+                if not isinstance(inp, dict):
+                    inp = {}
+                if b.get("name") in edit_tools:
+                    path = inp.get("file_path") or inp.get("notebook_path")
+                    if isinstance(path, str) and path:
+                        files.append(path)
+                elif b.get("name") in _CLAUDE_AGENT_TOOLS and isinstance(
+                    b.get("id"), str
+                ):
+                    agent_ids.add(b["id"])
+                    desc = inp.get("description") or inp.get("subagent_type") or ""
+                    events.append(("start", b["id"], str(desc)))
+        elif raw.get("type") == "user":
+            if isinstance(content, list):
+                for b in content:
+                    if (
+                        isinstance(b, dict)
+                        and b.get("type") == "tool_result"
+                        and b.get("tool_use_id") in agent_ids
+                        and "launched" not in _block_text(b.get("content")).lower()
+                    ):
+                        events.append(("done", b["tool_use_id"], ""))
+            text = _block_text(content)
+            if "<task-notification>" in text:
+                for m in _NOTIFY_RE.finditer(text):
+                    events.append(("done", m.group(1), ""))
+    return tuple(files), tuple(events)
+
 
 # Claude Code's footer under the input box: «⏵⏵ auto mode on · 2 shells · …».
 # No mode marker there means the default (ask before changes).
@@ -546,6 +615,10 @@ class AgentRuntime(abc.ABC):
         """How many background shells the pane's footer reports (None: unknown)."""
         return None
 
+    def remote_control(self, pane_text: str) -> str | None:
+        """ "connected" / "available" / None (off or unknown) off the pane."""
+        return None
+
     # Permission modes `/mode` can switch between (ids as permission_mode
     # returns them); () = no modes.
     permission_modes: tuple[str, ...] = ()
@@ -694,6 +767,17 @@ class ClaudeRuntime(AgentRuntime):
         m = _CLAUDE_MODE_RE.search(footer)
         return _CLAUDE_MODES[m.group(1)] if m else "manual"
 
+    def remote_control(self, pane_text: str) -> str | None:
+        # A connected session labels the input box's top rule «/rc active»;
+        # with Remote Control merely enabled, the footer ends in «/rc».
+        tail = pane_text.split("\n")[-40:]
+        if any("/rc active" in ln and _is_chrome_separator(ln.strip()) for ln in tail):
+            return "connected"
+        footer = _claude_footer(pane_text)
+        if footer and any(ln.rstrip().endswith("/rc") for ln in footer.split("\n")):
+            return "available"
+        return None
+
     def background_shells(self, pane_text: str) -> int | None:
         footer = _claude_footer(pane_text)
         if footer is None:
@@ -758,6 +842,7 @@ class ClaudeRuntime(AgentRuntime):
         return latest
 
     def latest_usage(self, raw_entries: list[dict]) -> AgentUsage | None:
+        files, events = _claude_activity(raw_entries, self.edit_tool_names)
         tokens: int | None = None
         model: str | None = None
         for raw in raw_entries:
@@ -767,9 +852,11 @@ class ClaudeRuntime(AgentRuntime):
                 m = (raw.get("message") or {}).get("model")
                 if isinstance(m, str) and m and not m.startswith("<"):
                     model = m
-        if tokens is None and model is None:
+        if tokens is None and model is None and not files and not events:
             return None
-        return AgentUsage(context_tokens=tokens, model=model)
+        return AgentUsage(
+            context_tokens=tokens, model=model, edited_files=files, agent_events=events
+        )
 
 
 class CodexRuntime(AgentRuntime):

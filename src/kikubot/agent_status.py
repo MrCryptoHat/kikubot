@@ -85,6 +85,11 @@ _QUICK_ACTIONS = ("compact", "context", "model")
 
 _panes: dict[str, tuple[float, str | None]] = {}
 _usage: dict[str, AgentUsage] = {}
+# Per session, since the bot started reading it: files the edit tools touched
+# (in order) and subagents running now (launch key → description).
+_files: dict[str, list[str]] = {}
+_agents: dict[str, dict[str, str]] = {}
+MAX_FILES = 200
 
 
 def note_pane(binding: str, pane_text: str | None) -> None:
@@ -94,6 +99,16 @@ def note_pane(binding: str, pane_text: str | None) -> None:
 
 def note_usage(session_id: str, usage: AgentUsage) -> None:
     """Merge a transcript batch's usage into the session's (newer fields win)."""
+    files = _files.setdefault(session_id, [])
+    for path in usage.edited_files:
+        if path not in files and len(files) < MAX_FILES:
+            files.append(path)
+    agents = _agents.setdefault(session_id, {})
+    for kind, key, desc in usage.agent_events:
+        if kind == "start":
+            agents[key] = desc
+        else:
+            agents.pop(key, None)
     old = _usage.get(session_id)
     if old is None:
         _usage[session_id] = usage
@@ -140,6 +155,8 @@ class AgentStatus:
     effort: str | None = None
     model_id: str | None = None  # the CLI's id of the selected model
     branch: str | None = None
+    files: list[str] = field(default_factory=list)  # project-relative
+    agents: list[tuple[str, str]] = field(default_factory=list)  # (key, description)
     # alias → readable name with version, from models seen on this machine
     alias_names: dict[str, str] = field(default_factory=dict)
     items: list[Item] = field(default_factory=list)
@@ -216,6 +233,31 @@ class AgentStatus:
                         {"id": i.id, "label": i.label, "value": i.value}
                         for i in self.items
                     ],
+                }
+            )
+        if self.agents:
+            out.append(
+                {
+                    "type": "rows",
+                    "id": "agents",
+                    "title": tr("astatus.sec.agents"),
+                    "items": [
+                        {
+                            "id": key,
+                            "label": desc or tr("astatus.agent_unnamed"),
+                            "value": tr("astatus.running"),
+                        }
+                        for key, desc in self.agents
+                    ],
+                }
+            )
+        if self.files:
+            out.append(
+                {
+                    "type": "rows",
+                    "id": "files",
+                    "title": tr("astatus.sec.files", n=len(self.files)),
+                    "items": [{"id": f, "label": f, "value": ""} for f in self.files],
                 }
             )
         if self.commands:
@@ -308,6 +350,10 @@ class AgentStatus:
                 f"{tr('astatus.item.mode')}: {tr(f'astatus.mode.{self.mode}')}"
             )
         lines += [f"{i.label}: {i.value}" for i in self.items]
+        if self.agents:
+            lines.append(tr("astatus.card_agents", n=len(self.agents)))
+        if self.files:
+            lines.append(tr("astatus.card_files", n=len(self.files)))
         return "\n".join(lines)
 
 
@@ -643,7 +689,31 @@ def _pane_items(src: Sources) -> list[Item]:
     shells = rt.background_shells(src.pane)
     if shells:
         out.append(Item("shells", tr("astatus.item.shells"), str(shells)))
+    rc = rt.remote_control(src.pane)
+    if rc:
+        out.append(
+            Item("remote_control", tr("astatus.item.rc"), tr(f"astatus.rc.{rc}"))
+        )
     return out
+
+
+def _cli_items(src: Sources) -> list[Item]:
+    """The CLI's version and output style, from its status-line report."""
+    snap = src.snapshot or {}
+    out = []
+    if isinstance(snap.get("version"), str):
+        out.append(Item("version", tr("astatus.item.version"), snap["version"]))
+    if isinstance(snap.get("output_style"), str):
+        out.append(Item("output_style", tr("astatus.item.style"), snap["output_style"]))
+    return out
+
+
+def _project_relative(path: str, cwd: str) -> str:
+    """A file inside the project as its relative path, else its bare name —
+    never an absolute path in the payload."""
+    if cwd and path.startswith(cwd + "/"):
+        return path[len(cwd) + 1 :]
+    return Path(path).name
 
 
 def git_branch(cwd: str) -> str | None:
@@ -692,6 +762,7 @@ ITEM_PROVIDERS: list[ItemProvider] = [
     _branch_items,
     _session_items,
     _queue_items,
+    _cli_items,
 ]
 
 
@@ -811,6 +882,10 @@ def build_status(
 
     if ws and getattr(ws, "cwd", "") and binding.startswith("@"):
         st.branch = git_branch(ws.cwd)
+    sid = ws.session_id if ws else ""
+    cwd = (getattr(ws, "cwd", "") or "").rstrip("/") if ws else ""
+    st.files = [_project_relative(p, cwd) for p in _files.get(sid, [])]
+    st.agents = list(_agents.get(sid, {}).items())
 
     if pane and rt.permission_modes and state != "waiting":
         st.mode = rt.permission_mode(pane)

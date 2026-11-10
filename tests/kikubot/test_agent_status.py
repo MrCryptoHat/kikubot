@@ -59,8 +59,13 @@ def env(tmp_path, monkeypatch):
 
     claude_settings = tmp_path / "claude-settings.json"
     monkeypatch.setattr(hook, "_claude_settings_file", lambda: claude_settings)
-    agent_status._panes.clear()
-    agent_status._usage.clear()
+    for cache in (
+        agent_status._panes,
+        agent_status._usage,
+        agent_status._files,
+        agent_status._agents,
+    ):
+        cache.clear()
     sm = _FakeSM()
     monkeypatch.setattr(session_mod, "session_manager", sm)
     yield SimpleNamespace(dir=tmp_path, sm=sm, claude_settings=claude_settings)
@@ -461,3 +466,97 @@ def test_docker_binding_gets_no_host_effort(env):
     env.claude_settings.write_text(json.dumps({"effortLevel": "max"}))
     env.sm.window_states["docker:a"] = SimpleNamespace(session_id="x")
     assert agent_status.build_status("docker:a", now=NOW).effort is None
+
+
+def _assistant(*blocks):
+    return {"type": "assistant", "message": {"content": list(blocks)}}
+
+
+def _user(content):
+    return {"type": "user", "message": {"content": content}}
+
+
+def test_files_and_subagents_from_the_transcript(env, tmp_path):
+    from kikubot.runtimes import CLAUDE
+
+    env.sm.window_states["@5"] = SimpleNamespace(session_id="sid-claude", cwd="/p/proj")
+    batch1 = [
+        _assistant(
+            {
+                "type": "tool_use",
+                "id": "e1",
+                "name": "Edit",
+                "input": {"file_path": "/p/proj/src/a.py"},
+            },
+            {
+                "type": "tool_use",
+                "id": "e2",
+                "name": "Write",
+                "input": {"file_path": "/elsewhere/notes.md"},
+            },
+            {
+                "type": "tool_use",
+                "id": "ag1",
+                "name": "Agent",
+                "input": {"description": "Review the diff"},
+            },
+            {
+                "type": "tool_use",
+                "id": "ag2",
+                "name": "Agent",
+                "input": {"description": "Quick lookup"},
+            },
+        ),
+        _user(
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "ag1",
+                    "content": "Async agent launched successfully.",
+                }
+            ]
+        ),
+        _user(
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "ag2",
+                    "content": [{"type": "text", "text": "Found it."}],
+                }
+            ]
+        ),
+    ]
+    agent_status.note_usage("sid-claude", CLAUDE.latest_usage(batch1))
+    st = agent_status.build_status("@5", now=NOW)
+    assert st.files == ["src/a.py", "notes.md"]  # never an absolute path
+    assert st.agents == [("ag1", "Review the diff")]  # ag2 finished in the foreground
+    data = json.loads(st.to_json())
+    secs = {s["id"]: s for s in data["sections"]}
+    assert secs["files"]["title"] == "Files changed (2)"
+    assert secs["agents"]["items"][0]["label"] == "Review the diff"
+
+    done = _user(
+        "<task-notification>\n<task-id>x</task-id>\n<tool-use-id>ag1</tool-use-id>\n<status>completed</status>"
+    )
+    agent_status.note_usage("sid-claude", CLAUDE.latest_usage([done]))
+    assert agent_status.build_status("@5", now=NOW).agents == []
+
+
+def test_remote_control_from_the_pane():
+    from kikubot.runtimes import CLAUDE
+
+    rule = "─" * 40
+    connected = (
+        f"x\n{'─' * 30} /rc active ─\n❯ \n{rule}\n  ⏵⏵ auto mode on · ← 1 agent /rc\n"
+    )
+    available = f"x\n{rule}\n❯ \n{rule}\n  ⏵⏵ auto mode on · ← 1 agent /rc\n"
+    off = f"x\n{rule}\n❯ \n{rule}\n  ⏵⏵ auto mode on\n"
+    assert CLAUDE.remote_control(connected) == "connected"
+    assert CLAUDE.remote_control(available) == "available"
+    assert CLAUDE.remote_control(off) is None
+
+
+def test_version_and_output_style_rows(env):
+    _write(env.dir, "@5", {**_SNAP, "version": "2.1.322", "output_style": "default"})
+    items = {i.id: i.value for i in agent_status.build_status("@5", now=NOW).items}
+    assert items["version"] == "2.1.322" and items["output_style"] == "default"

@@ -59,6 +59,11 @@ def _snapshot(data: dict) -> dict:
         out["context_window"] = {
             k: ctx[k] for k in _CONTEXT_FIELDS if isinstance(ctx.get(k), int | float)
         }
+    if isinstance(data.get("version"), str):
+        out["version"] = data["version"]
+    style = data.get("output_style")
+    if isinstance(style, dict) and isinstance(style.get("name"), str):
+        out["output_style"] = style["name"]
     effort = data.get("effort")
     if isinstance(effort, dict) and isinstance(effort.get("level"), str):
         out["effort"] = effort["level"]

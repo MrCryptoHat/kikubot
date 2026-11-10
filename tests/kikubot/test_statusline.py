@@ -22,6 +22,8 @@ _STDIN = {
     "effort": {"level": "high"},
     "thinking": {"enabled": True},
     "fast_mode": False,
+    "version": "2.1.322",
+    "output_style": {"name": "default"},
     "cost": {
         "total_cost_usd": 1.5,
         "total_duration_ms": 60000,
@@ -53,6 +55,7 @@ def test_snapshot_keeps_only_non_private_fields():
     assert snap["effort"] == "high"
     assert snap["thinking"] is True
     assert snap["cost"]["total_lines_added"] == 12
+    assert (snap["version"], snap["output_style"]) == ("2.1.322", "default")
 
 
 def test_snapshot_written_for_own_session_window(tmp_path, monkeypatch):

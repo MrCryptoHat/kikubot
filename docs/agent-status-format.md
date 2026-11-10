@@ -62,7 +62,8 @@ Rules:
   only when known. Clients ignore fields and section types they don't know.
 - `v` changes only on a breaking change.
 - Labels and titles are ready to show (the bot's language).
-- No paths, cwd, e-mail addresses or message text, ever.
+- No absolute paths, cwd, e-mail addresses or message text, ever. Changed
+  files are named relative to the project (a file outside it: bare name).
 
 ### Typed core
 
@@ -105,7 +106,9 @@ Sections sent today, in this order:
 | `context` | meter | |
 | `limits` | meters | the account's limits: the freshest report of any agent on that machine |
 | `mode` | choice | `manual` / `accept_edits` / `plan` / `auto` (+ `bypass` when the agent runs in it), command `/mode {id}`; left out while a dialog waits for an answer |
-| `session` | rows | background shells, thinking, fast mode, branch, lines changed, session time, cost at API prices, queued messages |
+| `session` | rows | background shells, Remote Control (connected / on, not connected), thinking, fast mode, branch, lines changed, session time, cost at API prices, queued messages, Claude Code version, output style |
+| `agents` | rows | subagents running now: `label` = their task, `value` = «running» |
+| `files` | rows | files the agent edited, project-relative (`label`; `value` empty); the title carries the count |
 | `commands` | actions | `/compact`, `/context`, `/model` |
 
 Icons are names from this list; a client draws its own glyph or none:
@@ -127,8 +130,10 @@ never sends keystrokes or callback data of its own.
   `/context` read of the agent's screen, so it will come as a section with
   `"lazy": true`, fetched by `status <chat_id>:<thread_id> <section_id>` when
   the user opens it, and only while the agent is idle.
-- Connected MCP servers / connectors, Remote Control on or off, files the
-  session changed.
+- Connected MCP servers / connectors.
+
+Changed files and subagents are counted from when the bot started reading
+the session (a bot restart starts them over).
 
 ## Extending (bot side)
 
