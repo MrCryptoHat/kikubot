@@ -455,3 +455,9 @@ def test_old_window_learns_its_window_from_a_snapshot(env):
     )
     st = agent_status.build_status("@5", now=NOW)
     assert (st.context_pct, st.context_window) == (75, 200000)
+
+
+def test_docker_binding_gets_no_host_effort(env):
+    env.claude_settings.write_text(json.dumps({"effortLevel": "max"}))
+    env.sm.window_states["docker:a"] = SimpleNamespace(session_id="x")
+    assert agent_status.build_status("docker:a", now=NOW).effort is None

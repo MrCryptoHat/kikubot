@@ -762,7 +762,8 @@ def build_status(
     effort = (snap or {}).get("effort")
     if isinstance(effort, str):
         st.effort = effort
-    elif rt.effort_levels:
+    elif rt.effort_levels and binding.startswith("@"):
+        # The host's Claude settings; a container has its own claude-home.
         st.effort = rt.configured_effort(st.model_id)
     if usage and usage.model:
         if st.model is None:
