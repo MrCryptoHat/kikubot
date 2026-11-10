@@ -560,3 +560,29 @@ def test_version_and_output_style_rows(env):
     _write(env.dir, "@5", {**_SNAP, "version": "2.1.322", "output_style": "default"})
     items = {i.id: i.value for i in agent_status.build_status("@5", now=NOW).items}
     assert items["version"] == "2.1.322" and items["output_style"] == "default"
+
+
+def test_a_report_mentioning_launched_still_ends_the_subagent(env):
+    from kikubot.runtimes import CLAUDE
+
+    batch = [
+        _assistant(
+            {
+                "type": "tool_use",
+                "id": "ag3",
+                "name": "Agent",
+                "input": {"description": "Start it"},
+            }
+        ),
+        _user(
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "ag3",
+                    "content": "I launched the server on :8080.",
+                }
+            ]
+        ),
+    ]
+    agent_status.note_usage("sid-claude", CLAUDE.latest_usage(batch))
+    assert agent_status.build_status("@5", now=NOW).agents == []

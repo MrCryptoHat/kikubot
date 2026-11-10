@@ -246,6 +246,10 @@ _NOTIFY_RE = re.compile(
     re.DOTALL,
 )
 _CLAUDE_AGENT_TOOLS = frozenset({"Agent", "Task"})
+# How Claude Code opens the tool_result of a subagent it runs in the
+# background (no run_in_background flag needed: 2.1.3xx launches them async by
+# default). Any other result is a foreground subagent's report — it is done.
+_ASYNC_AGENT_PREFIX = "Async agent launched"
 
 
 def _block_text(content: object) -> str:
@@ -294,7 +298,9 @@ def _claude_activity(
                         isinstance(b, dict)
                         and b.get("type") == "tool_result"
                         and b.get("tool_use_id") in agent_ids
-                        and "launched" not in _block_text(b.get("content")).lower()
+                        and not _block_text(b.get("content"))
+                        .lstrip()
+                        .startswith(_ASYNC_AGENT_PREFIX)
                     ):
                         events.append(("done", b["tool_use_id"], ""))
             text = _block_text(content)
