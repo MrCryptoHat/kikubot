@@ -104,7 +104,7 @@ Sections sent today, in this order:
 | `model` | choice | Claude Code: `opus` / `fable` / `sonnet` / `haiku`, command `/model {id}`; the selected option's label is the full name («Opus 5.5»). The choice also becomes the default for new sessions. A runtime without aliases (Codex…) sends one option `current` and the command `/model`, which opens the CLI's own picker. |
 | `effort` | choice | `low` / `medium` / `high` / `xhigh` / `max`, command `/effort {id}`. Claude Code **saves** the level for that model on the machine, so it applies to every session using the model. Sent only when the level is known (needs `KIKUBOT_USAGE_LIMITS`). |
 | `context` | meter | |
-| `limits` | meters | the account's limits: the freshest report of any agent on that machine |
+| `limits` | meters | the account's limits: the freshest report of any agent on that machine. A docker agent gets them only when its container is signed in to the host's account (`DOCKER_AGENT_<NAME>_HOST_ACCOUNT=true`, siblings included) |
 | `mode` | choice | `manual` / `accept_edits` / `plan` / `auto` (+ `bypass` when the agent runs in it), command `/mode {id}`; left out while a dialog waits for an answer |
 | `session` | rows | background shells, Remote Control (connected / on, not connected), thinking, fast mode, branch, lines changed, session time, cost at API prices, queued messages, Claude Code version, output style |
 | `agents` | rows | subagents running now: `label` = their task, `value` = «running» |

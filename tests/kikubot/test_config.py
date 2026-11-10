@@ -240,6 +240,18 @@ class TestParseDockerAgents:
         # Untouched fields fall back to derived defaults.
         assert a.ipc_dir == home / ".local" / "share" / "assistant" / "ipc"
 
+    def test_host_account_is_opt_in_per_agent(self) -> None:
+        from kikubot.config import _parse_docker_agents
+
+        env = {
+            "DOCKER_AGENTS": "assistant,scout,pilot",
+            "DOCKER_AGENT_ASSISTANT_HOST_ACCOUNT": "true",
+            "DOCKER_AGENT_PILOT_HOST_ACCOUNT": "yes",
+        }
+        agents = _parse_docker_agents(env, Path("/h"))
+        # Only an explicit "true": a container is assumed to have its own login.
+        assert [a.host_account for a in agents] == [True, False, False]
+
     def test_multiple_agents(self) -> None:
         from kikubot.config import _parse_docker_agents
 

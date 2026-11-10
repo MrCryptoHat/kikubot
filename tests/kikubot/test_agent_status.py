@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -48,6 +49,11 @@ class _FakeSM:
 
     def agent_has_queued_input(self, binding, pane):
         return self.queued
+
+    # The real resolver: siblings (docker:<agent>/<slug>) must resolve to
+    # their configured agent exactly as in production.
+    split_docker_binding = staticmethod(session_mod.SessionManager.split_docker_binding)
+    resolve_docker_target = session_mod.SessionManager.resolve_docker_target
 
 
 @pytest.fixture
@@ -358,6 +364,47 @@ def test_docker_binding_gets_no_host_limits(env):
     _write(env.dir, "@9", _SNAP)
     env.sm.window_states["docker:a"] = SimpleNamespace(session_id="x")
     assert agent_status.build_status("docker:a", now=NOW).limits == []
+
+
+def _docker_agent(name, host_account):
+    from kikubot.config import DockerAgentConfig
+
+    return DockerAgentConfig(
+        name=name,
+        container=name,
+        workspace_host_path=Path("/w"),
+        claude_home_host_path=Path("/c"),
+        ipc_dir=Path("/i"),
+        session_map_path=Path("/s"),
+        host_account=host_account,
+    )
+
+
+@pytest.mark.parametrize(
+    ("binding", "has_limits"),
+    [
+        ("docker:shared", True),
+        ("docker:shared/two", True),  # a sibling shares its container's login
+        ("docker:own", False),
+        ("docker:own/two", False),
+    ],
+)
+def test_docker_limits_follow_the_host_account_flag(
+    env, monkeypatch, binding, has_limits
+):
+    monkeypatch.setattr(
+        config,
+        "docker_agents",
+        [_docker_agent("shared", True), _docker_agent("own", False)],
+    )
+    _write(env.dir, "@9", _SNAP)
+    env.sm.window_states[binding] = SimpleNamespace(session_id="x")
+    st = agent_status.build_status(binding, now=NOW)
+    assert bool(st.limits) is has_limits
+    if has_limits:
+        assert [lim.id for lim in st.limits] == ["5h", "7d"]
+    # The flag is about the account, not the settings: no host effort.
+    assert st.effort is None
 
 
 def test_no_mode_picker_while_a_dialog_waits(env, monkeypatch):

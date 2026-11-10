@@ -14,6 +14,8 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   `KIKUBOT_USAGE_LIMITS=true` Claude Code's usage limits with their reset
   times. `status <chat_id>:<thread_id>` also returns JSON for apps that draw
   their own screen — [docs/agent-status-format.md](docs/agent-status-format.md).
+  A docker agent signed in to the host's account shows them too, once
+  `DOCKER_AGENT_<NAME>_HOST_ACCOUNT=true` says so.
 - **`/mode`** shows the agent's permission mode; `/mode plan` (or `manual`,
   `accept_edits`, `auto`) switches it.
 

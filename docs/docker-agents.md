@@ -116,7 +116,13 @@ DOCKER_AGENTS=assistant
 ```
 
 Per-agent paths default to the layout below; override any of them with
-`DOCKER_AGENT_<NAME>_{CONTAINER,WORKSPACE,CLAUDE_HOME,IPC,SESSION_MAP,VNC_URL}`:
+`DOCKER_AGENT_<NAME>_{CONTAINER,WORKSPACE,CLAUDE_HOME,IPC,SESSION_MAP,VNC_URL}`.
+`DOCKER_AGENT_<NAME>_HOST_ACCOUNT=true` declares that the container's Claude
+Code is signed in to the same account as the host, so the agent's status card
+shows the host's usage limits (they belong to the account). Off by default: a
+container is assumed to have its own login, and kikubot never reads the
+container's own files to decide it. Effort and other settings stay off for
+docker agents either way, since the container has its own claude-home.
 
 | Setting     | Default host path                          | Container side          |
 | ----------- | ------------------------------------------ | ----------------------- |

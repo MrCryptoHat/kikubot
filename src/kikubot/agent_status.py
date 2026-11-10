@@ -806,6 +806,23 @@ def quick_commands(runtime: str, reserved: Iterable[str]) -> list[tuple[str, str
     return out
 
 
+def spends_host_account(binding: str) -> bool:
+    """Whether the agent behind ``binding`` draws on the host's Claude account.
+
+    A host window does. A container is signed in on its own unless its
+    operator declares it shares the host's account
+    (``DOCKER_AGENT_<NAME>_HOST_ACCOUNT``); a sibling
+    (``docker:<agent>/<slug>``) shares its container's login, so it resolves
+    through ``resolve_docker_target`` like every docker call site.
+    """
+    if binding.startswith("@"):
+        return True
+    from .session import session_manager
+
+    target = session_manager.resolve_docker_target(binding)
+    return bool(target and target.agent.host_account)
+
+
 def build_status(
     binding: str, reserved_commands: Iterable[str] = (), now: float | None = None
 ) -> AgentStatus:
@@ -872,8 +889,8 @@ def build_status(
 
     if tapped:
         # Limits belong to the account: the freshest report of any window
-        # wins. A container logs in with its own account — no host figures.
-        if binding.startswith("@"):
+        # wins. A container has its own login unless declared otherwise.
+        if spends_host_account(binding):
             st.limits = account_limits(now)
     elif usage:
         st.limits = [

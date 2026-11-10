@@ -60,6 +60,10 @@ class DockerAgentConfig:
         vnc_url: Optional URL the live-dashboard renders as a "📺 VNC"
             button under each screenshot. Typically ``vnc://<host>:5900``
             so a tap on iOS hands off to RealVNC Viewer. ``None`` → no button.
+        host_account: The container's Claude Code is signed in to the same
+            account as the host, so the host's usage limits are its limits
+            too (the agent status card shows them). Off by default: a
+            container is assumed to have its own login.
     """
 
     name: str
@@ -69,6 +73,7 @@ class DockerAgentConfig:
     ipc_dir: Path
     session_map_path: Path
     vnc_url: str | None = None
+    host_account: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,7 +164,8 @@ def _parse_docker_agents(env: Mapping[str, str], home: Path) -> list[DockerAgent
 
     Optional ``DOCKER_AGENT_<NAME>_VNC_URL`` adds a "📺 VNC" button under
     every live-dashboard frame for that agent. No default — unset means
-    no button.
+    no button. ``DOCKER_AGENT_<NAME>_HOST_ACCOUNT=true`` says the container
+    is signed in to the host's Claude account (see ``host_account``).
 
     Factored out of ``Config._load_docker_agents`` so tests can exercise
     it without booting the full Config (which requires a telegram token).
@@ -187,6 +193,9 @@ def _parse_docker_agents(env: Mapping[str, str], home: Path) -> list[DockerAgent
             home / ".local" / "share" / name / "hostmap" / "session-map.json"
         )
         vnc_url = env.get(f"DOCKER_AGENT_{key}_VNC_URL", "").strip() or None
+        host_account = (
+            env.get(f"DOCKER_AGENT_{key}_HOST_ACCOUNT", "").strip().lower() == "true"
+        )
         agents.append(
             DockerAgentConfig(
                 name=name,
@@ -196,6 +205,7 @@ def _parse_docker_agents(env: Mapping[str, str], home: Path) -> list[DockerAgent
                 ipc_dir=Path(ipc).expanduser(),
                 session_map_path=Path(session_map).expanduser(),
                 vnc_url=vnc_url,
+                host_account=host_account,
             )
         )
     return agents
