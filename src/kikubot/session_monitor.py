@@ -28,6 +28,10 @@ from .transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
 
+# How much of a transcript's end seeds the agent status of a session the
+# monitor meets for the first time (it holds the last few turns).
+STATUS_TAIL_BYTES = 512 * 1024
+
 # Context-fill notifications. When an assistant turn's input-side context
 # (input + cache-read + cache-creation tokens) crosses one of these absolute
 # token counts, the monitor emits one "context_alert" NewMessage to the bound
@@ -123,6 +127,8 @@ class SessionMonitor:
         # session. In-memory (like _pending_tools): a restart re-evaluates
         # against the current fill and announces at most the current band once.
         self._context_fired: dict[str, set[int]] = {}
+        # Sessions whose agent status was seeded from the transcript's tail.
+        self._status_backfilled: set[str] = set()
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -419,6 +425,9 @@ class SessionMonitor:
         ``runtime.parse_entries`` / ``latest_context_tokens`` differ per runtime.
         """
         new_messages: list[NewMessage] = []
+        if session_id not in self._status_backfilled:
+            self._status_backfilled.add(session_id)
+            await self._backfill_status(runtime, session_id, file_path)
         try:
             tracked = self.state.get_session(session_id)
             if tracked is None:
@@ -522,6 +531,38 @@ class SessionMonitor:
             # Per-transcript catch: one unreadable file must not abort the tick.
             logger.debug("Error processing session %s: %s", session_id, e)
         return new_messages
+
+    async def _backfill_status(
+        self, runtime: Any, session_id: str, file_path: Path
+    ) -> None:
+        """Seed the agent status from the transcript's tail, once per session.
+
+        The monitor reads only lines written after it started, so without this
+        an idle agent shows no model, context or effort-free facts until its
+        next reply — after every bot restart. Lines it re-reads later are
+        harmless: usage takes the newest, files dedupe, agent events repeat.
+        """
+        try:
+            size = file_path.stat().st_size
+            async with aiofiles.open(file_path, "rb") as fh:
+                await fh.seek(max(0, size - STATUS_TAIL_BYTES))
+                data = await fh.read()
+            lines = data.split(b"\n")
+            if size > STATUS_TAIL_BYTES:
+                lines = lines[1:]  # the first one is cut mid-line
+            entries = []
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+            usage = runtime.latest_usage(entries)
+            if usage is not None:
+                agent_status.note_usage(session_id, usage)
+        except Exception as e:  # noqa: BLE001 — status is extra, delivery isn't
+            logger.debug("status backfill failed (%s): %s", session_id, e)
 
     def _check_context_thresholds(self, session_id: str, tokens: int) -> str | None:
         """Return an alert string iff `tokens` newly crossed a threshold.

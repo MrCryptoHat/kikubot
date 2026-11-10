@@ -486,3 +486,37 @@ class TestDuplicateSessionIdAcrossDirs:
             )
         msgs = await monitor._process_transcript(CLAUDE, "dup-sid", new)
         assert any("reply after switch" in m.text for m in msgs)
+
+
+async def test_status_seeded_from_the_tail_once(tmp_path, monkeypatch):
+    """An idle agent shows its model and context right after a bot restart:
+    the first sight of a session reads the transcript's tail into the status
+    cache (once), without delivering anything."""
+    import json as _json
+
+    from kikubot import agent_status
+    from kikubot import session_monitor as sm_mod
+    from kikubot.runtimes import CLAUDE
+    from kikubot.session_monitor import SessionMonitor
+
+    monkeypatch.setattr(sm_mod, "STATUS_TAIL_BYTES", 300)
+    agent_status._usage.clear()
+    lines = [{"type": "user", "message": {"content": "x" * 400}}] + [
+        {
+            "type": "assistant",
+            "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": n}},
+        }
+        for n in (10, 20)
+    ]
+    f = tmp_path / "s.jsonl"
+    f.write_text("\n".join(_json.dumps(e) for e in lines) + "\n")
+    monitor = SessionMonitor(projects_path=tmp_path, state_file=tmp_path / "st.json")
+
+    out = await monitor._process_transcript(CLAUDE, "sid-x", f)
+    assert out == []  # nothing delivered: the tail only seeds the status
+    usage = agent_status._usage["sid-x"]
+    assert (usage.context_tokens, usage.model) == (20, "claude-opus-5-5")
+
+    agent_status._usage.clear()
+    await monitor._process_transcript(CLAUDE, "sid-x", f)
+    assert "sid-x" not in agent_status._usage  # once per session per run
