@@ -111,10 +111,47 @@ Sections sent today, in this order:
 | `session` | rows | background shells, Remote Control (connected / on, not connected), thinking, fast mode, branch, lines changed, session time, cost at API prices, queued messages, Claude Code version, output style |
 | `agents` | rows | subagents running now: `label` = their task, `value` = «running» |
 | `files` | rows | files the agent edited, project-relative (`label`; `value` empty); the title carries the count |
-| `commands` | actions | `/compact`, `/context`, `/model` |
+| `commands` | actions | the topic's session actions, see [Session actions](#session-actions) |
 
 Icons are names from this list; a client draws its own glyph or none:
-`hand`, `code`, `plan`, `bolt`, `warning`.
+`hand`, `code`, `plan`, `bolt`, `warning`, and for session actions `plus`,
+`branch`, `compress`, `context`, `model`, `trash`, `undo`, `history`,
+`background`, `diff`, `restart`, `stop`.
+
+### Session actions
+
+The `commands` section lists what can be done with the topic's session, for a
+client's menu. Each item is a command the topic accepts as an ordinary
+message, so it works from any Telegram app too. An item the agent's CLI
+can't do is left out (Codex has no `/rewind`), and the list comes only with
+a bound topic.
+
+| Field | Meaning |
+|---|---|
+| `id` | stable action id (below); a client may translate by it |
+| `label` | ready to show, in the bot's language |
+| `cmd` | the message to send |
+| `group` | `new` (makes a new topic), `session`, `danger` |
+| `confirm` | present when the client should ask this question first |
+| `terminal` | `true` when the result is a picker or dialog in the agent's terminal: open the terminal after sending |
+| `icon` | from the list above |
+
+| id | cmd | group | notes |
+|---|---|---|---|
+| `sibling` | `/sibling` | new | another agent on the same files; the bot asks for its name in the topic |
+| `worktree` | `/worktree` | new | an agent on its own branch (`git worktree`); the bot asks for the task name; only in a git project |
+| `compact` | `/compact` | session | confirm |
+| `context` | `/context` | session | terminal (Codex: `/status`, left out where that's the bot's own command) |
+| `model` | `/model` | session | terminal: the CLI's picker |
+| `clear` | `/clear` | session | confirm; the old conversation stays in the resume list |
+| `rewind` | `/rewind` | session | terminal: Claude Code's picker of points to go back to |
+| `resume` | `/resume` | session | terminal: the CLI's list of past conversations |
+| `background` | `/bgtask` | session | sends the running tool to the background (Ctrl+B); refused while idle or in a dialog. Not the CLI's own `/background`, which detaches the whole session |
+| `diff` | `/diff` | session | turns the per-edit screenshots on or off for the topic |
+| `restart` | `/restart` | danger | confirm; the same conversation continues |
+| `end` | `/kill` | danger | confirm |
+
+Items without `group` (older bots) belong under `session`.
 
 ### Acting
 
@@ -220,7 +257,8 @@ holds at most 256 characters, so split longer input over several queries.
   go of the terminal.
 - Keys aren't meant to end the agent (Restart and End stay on the panel), so
   those that visibly would are refused (`would-exit`). In Claude Code: an
-  Enter while the input box holds `/exit`, `/quit`, `/logout`, the start of
+  Enter while the input box holds `/exit`, `/quit`, `/logout`,
+  `/background` (`/bg`, which detaches the session), `/restart`, the start of
   one (`/ex`, which Enter completes) or the bare word `exit`/`quit`; an Enter
   while the slash menu highlights one of them; Enter or Esc on the
   folder-trust gate while it would quit; a Ctrl-C/Ctrl-D while the agent

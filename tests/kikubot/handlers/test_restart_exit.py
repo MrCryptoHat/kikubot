@@ -587,3 +587,21 @@ def test_stop_button_payload_fits_and_names_the_binding():
     assert keyboard is not None
     data = keyboard.inline_keyboard[0][0].callback_data
     assert data == f"cm:rstop:f:{wid[:CALLBACK_WID_MAX]}" and len(data) <= 64
+
+
+@pytest.mark.asyncio
+async def test_panel_tap_on_an_unreadable_pane_is_answered(monkeypatch):
+    """Every refusal reason maps to an alert: a tmux read failure used to
+    raise KeyError and leave the tap spinning."""
+    from kikubot.handlers import callbacks
+
+    query = MagicMock()
+    query.answer = AsyncMock()
+    with patch.object(
+        agent_restart,
+        "restart_precheck",
+        new=AsyncMock(return_value=ExitResult(False, refused="unreadable")),
+    ):
+        assert await callbacks._answer_restart_blocked(query, "@5", fresh=False)
+    assert query.answer.await_args.kwargs.get("show_alert") is True
+    assert "read" in query.answer.await_args.args[0]

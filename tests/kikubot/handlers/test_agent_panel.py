@@ -31,7 +31,7 @@ class TestPanelActions:
             "context",
             "mcp",
             "background",
-            "worktree",
+            "rewind",
         ):
             assert CLAUDE.supports_panel_action(a), a
 
@@ -98,15 +98,18 @@ class TestWrappers:
         # codex DOES support context (→ /status) and mode (→ Shift+Tab).
         assert session_manager.agent_supports(x, "context") is True
 
-    def test_can_offer_worktree_needs_repo_and_runtime(self, panel_window, tmp_path):
+    def test_can_offer_worktree_needs_a_repo_not_a_runtime(
+        self, panel_window, tmp_path
+    ):
         (tmp_path / ".git").mkdir()
         repo = panel_window("@3", "claude", cwd=tmp_path)
         plain = panel_window("@4", "claude", cwd=tmp_path.parent)  # no .git
         codex_repo = panel_window("@5", "codex", cwd=tmp_path)
         assert session_manager.can_offer_worktree(repo) is True
         assert session_manager.can_offer_worktree(plain) is False
-        # Even in a repo, codex worktrees aren't built → hidden.
-        assert session_manager.can_offer_worktree(codex_repo) is False
+        # The bot makes the worktree; the new topic picks its own CLI, so the
+        # one running here doesn't matter.
+        assert session_manager.can_offer_worktree(codex_repo) is True
 
 
 # ── the keyboard builder itself ───────────────────────────────────────────
@@ -175,8 +178,10 @@ class TestKeyboardGating:
         ):
             assert _has(p, sub), f"codex panel missing {sub}"
         # No codex equivalent → hidden.
-        for sub in ("cm:effort:", "kb:cb:", "wt:new:"):
+        for sub in ("cm:effort:", "kb:cb:"):
             assert not _has(p, sub), f"codex panel should not have {sub}"
+        # 🌳 is the bot's own (git worktree), offered in any CLI's repo topic.
+        assert _has(p, "wt:new:")
         # Universal keys survive.
         assert _has(p, "kb:esc:") and _has(p, "kb:ent:")
 

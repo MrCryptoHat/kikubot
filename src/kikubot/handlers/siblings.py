@@ -345,14 +345,22 @@ async def _handle_sib_new(
     if not session_manager.can_offer_sibling(wid):
         await query.answer(tr("sib.no_parent"), show_alert=True)
         return
-    chat_id = session_manager.resolve_chat_id(user.id, thread_id)
+    await query.answer()
+    await ask_sibling_name(context, user.id, thread_id, wid)
+
+
+async def ask_sibling_name(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, thread_id: int | None, wid: str
+) -> None:
+    """Post the «name the new agent» prompt; the next message in the topic is
+    the name (consume_sibling_name). Shared by ➕ and /sibling."""
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     if thread_id is not None:
         _pending(context.user_data)[thread_id] = (
             wid,
             chat_id,
             time.monotonic() + SIB_NAMING_TTL_SEC,
         )
-    await query.answer()
     await safe_send(
         context.bot,
         chat_id,

@@ -59,6 +59,9 @@ from .handlers.callbacks import callback_handler
 from .handlers.inline_status import inline_status_handler
 from .handlers.mode_command import mode_command
 from .handlers.commands import (
+    bgtask_command,
+    sibling_command,
+    worktree_command,
     _auto_bind_to_directory,
     _try_auto_bind_topic,
     commands_command,
@@ -1541,6 +1544,9 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("react", react_command))
     application.add_handler(CommandHandler("tables", tables_command))
     application.add_handler(CommandHandler("diff", diff_command))
+    application.add_handler(CommandHandler("sibling", sibling_command))
+    application.add_handler(CommandHandler("worktree", worktree_command))
+    application.add_handler(CommandHandler("bgtask", bgtask_command))
     application.add_handler(CommandHandler("pin", pin_command))
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("bind", bind_command))

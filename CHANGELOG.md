@@ -24,6 +24,15 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   answers with the screen after them, in one round trip; keys go only to a
   pane whose agent holds its terminal
   ([format](docs/agent-status-format.md#keys)).
+- **Session actions** in the status JSON (`commands`): new agent, worktree,
+  compact, clear, rewind, resume, background, edit screenshots, restart, end,
+  each a command the topic accepts, grouped and marked for confirmation, for
+  a client's menu ([format](docs/agent-status-format.md#session-actions)).
+  New commands behind them: `/sibling` and `/worktree` (the panel's ➕ and
+  🌳) and `/bgtask` (Ctrl+B on the running tool, only while one runs).
+- 🌳 (an agent on its own branch) is offered in any agent's git-project
+  topic, Codex and Grok included: the bot makes the worktree itself and the
+  new topic picks its own agent.
 - **`/mode`** shows the agent's permission mode; `/mode plan` (or `manual`,
   `accept_edits`, `auto`) switches it.
 
@@ -79,6 +88,8 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   restart's `/exit` as a prompt. The box is now emptied whole and checked.
 - A restart no longer types `/exit` into a pane whose agent already quit, and
   refuses rather than types when it can't read the pane.
+- A 🔄 tap while the agent's screen couldn't be read raised an error and left
+  the tap unanswered; it now says so.
 - A long message (3800+ characters) that arrived as a single piece was lost:
   the bot held it for a second in case Telegram had split it, then cancelled
   its own delivery without a trace. It now reaches the agent.

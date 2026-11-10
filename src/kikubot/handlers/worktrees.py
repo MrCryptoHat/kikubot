@@ -270,23 +270,40 @@ async def _handle_wt_new(
     """
     wid = data[len(CB_WT_NEW) :]
     thread_id = get_thread_id(update)
-    base_repo = _resolve_base_repo(user.id, thread_id, wid)
-    if base_repo is None:
-        await query.answer(tr("wt.no_project"), show_alert=True)
+    refusal = worktree_refusal(user.id, thread_id, wid)
+    if refusal:
+        await query.answer(refusal, show_alert=True)
         return
-    repo_name = base_repo.name
-    if not (base_repo / ".git").exists():
-        await query.answer(tr("wt.not_git_repo", repo=repo_name), show_alert=True)
-        return
+    await query.answer()
+    await ask_worktree_task(context, user.id, thread_id, wid)
 
-    chat_id = session_manager.resolve_chat_id(user.id, thread_id)
+
+def worktree_refusal(user_id: int, thread_id: int | None, wid: str) -> str:
+    """Why 🌳 can't fork this topic's project ("" = it can)."""
+    base_repo = _resolve_base_repo(user_id, thread_id, wid)
+    if base_repo is None:
+        return tr("wt.no_project")
+    if not (base_repo / ".git").exists():
+        return tr("wt.not_git_repo", repo=base_repo.name)
+    return ""
+
+
+async def ask_worktree_task(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, thread_id: int | None, wid: str
+) -> None:
+    """Post the «name the task» prompt for a new worktree agent; the next
+    message is the name. Shared by 🌳 and /worktree; check worktree_refusal
+    first."""
+    base_repo = _resolve_base_repo(user_id, thread_id, wid)
+    assert base_repo is not None
+    repo_name = base_repo.name
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     if context.user_data is not None:
         context.user_data["_wt_repo"] = str(base_repo)
         context.user_data["_wt_chat_id"] = chat_id
         context.user_data["_wt_source_thread"] = thread_id
         context.user_data["_wt_deadline"] = time.monotonic() + WT_NAMING_TTL_SEC
         context.user_data[STATE_KEY] = STATE_WT_NAMING
-    await query.answer()
     await safe_send(
         context.bot,
         chat_id,

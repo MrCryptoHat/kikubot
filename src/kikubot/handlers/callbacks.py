@@ -1715,11 +1715,14 @@ async def _answer_restart_blocked(
     if result is None or (stop_background and not result.refused):
         return False
     if result.refused:
+        # Every reason restart_blocker can give needs a line here; an unknown
+        # one still gets an answer rather than a KeyError and a spinning tap.
         key = {
             "busy": "cb.agent_busy_stop_first",
             "dialog": "cb.agent_dialog_answer_first",
             "restarting": "cb.restart_in_progress",
-        }[result.refused]
+            "unreadable": "cb.agent_screen_unreadable",
+        }.get(result.refused, "cb.agent_screen_unreadable")
         await query.answer(tr(key), show_alert=True)
         return True
     await query.answer()

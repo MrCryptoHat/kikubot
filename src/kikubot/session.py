@@ -1757,13 +1757,13 @@ class SessionManager:
     def can_offer_worktree(self, binding_value: str) -> bool:
         """True iff the 🌳 (new worktree agent) button should show for a window.
 
-        Requires BOTH: the runtime supports worktrees AND the topic can fork a
-        repo — it's already a worktree topic (base repo recorded) OR its cwd is
-        a git repo. A plain non-repo folder (e.g. a data-agent dir) has nothing
-        to fork, so the button is hidden rather than erroring on tap.
+        The topic must be able to fork a repo: it's already a worktree topic
+        (base repo recorded) or its cwd is a git repo. A plain non-repo folder
+        (e.g. a data-agent dir) has nothing to fork, so the button is hidden
+        rather than erroring on tap. The agent CLI in the topic doesn't matter:
+        the bot makes the worktree and branch itself, and the new topic picks
+        its own CLI on its first message.
         """
-        if not self.agent_supports(binding_value, "worktree"):
-            return False
         if self.is_worktree_window(binding_value):
             return True
         from .worktrees import is_git_repo

@@ -81,6 +81,7 @@ from .. import plugins
 from ..i18n import tr
 from ..runtimes import default_runtime, get_runtime
 from ..session import session_manager
+from ..terminal_parser import is_interactive_ui
 from ..tmux_manager import tmux_manager
 from ..transcript_parser import TranscriptParser
 from ..voice import providers as voice_providers
@@ -556,6 +557,9 @@ def build_bot_commands() -> list[BotCommand]:
         BotCommand("react", tr("cmd.react")),
         BotCommand("tables", tr("cmd.tables")),
         BotCommand("diff", tr("cmd.diff")),
+        BotCommand("sibling", tr("cmd.sibling")),
+        BotCommand("worktree", tr("cmd.worktree")),
+        BotCommand("bgtask", tr("cmd.bgtask")),
         BotCommand("pin", tr("cmd.pin")),
         *plugins.bot_commands(),
     ]
@@ -567,6 +571,87 @@ async def apply_bot_commands(bot: Bot) -> None:
     cmds = build_bot_commands()
     await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
     await bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats())
+
+
+async def sibling_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sibling — one more agent on this topic's files (the panel's ➕)."""
+    user = effective_user(update)
+    if not user or not is_user_allowed(user.id) or not update.message:
+        return
+    thread_id = get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, tr("commands.no_session_in_topic"))
+        return
+    if not session_manager.can_offer_sibling(wid):
+        await safe_reply(update.message, tr("sib.no_parent"))
+        return
+    from .siblings import ask_sibling_name
+
+    await ask_sibling_name(context, user.id, thread_id, wid)
+
+
+async def worktree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/worktree — an agent on its own branch of this project (the panel's 🌳)."""
+    user = effective_user(update)
+    if not user or not is_user_allowed(user.id) or not update.message:
+        return
+    thread_id = get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, tr("commands.no_session_in_topic"))
+        return
+    from .worktrees import ask_worktree_task, worktree_refusal
+
+    if not session_manager.can_offer_worktree(wid):
+        await safe_reply(update.message, tr("wt.no_project"))
+        return
+    refusal = worktree_refusal(user.id, thread_id, wid)
+    if refusal:
+        await safe_reply(update.message, refusal)
+        return
+    await ask_worktree_task(context, user.id, thread_id, wid)
+
+
+async def bgtask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/bgtask — send the agent's running tool to the background (Ctrl+B).
+
+    Not the CLI's own /background (/bg): that detaches the whole session from
+    its terminal and leaves the pane at the shell. Ctrl+B only while a turn
+    runs and no dialog waits: idle it has nothing to move, and in a dialog
+    the key would land in the dialog.
+    """
+    user = effective_user(update)
+    if not user or not is_user_allowed(user.id) or not update.message:
+        return
+    thread_id = get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, tr("commands.no_session_in_topic"))
+        return
+    name = session_manager.get_display_name(wid)
+    if not session_manager.agent_supports(wid, "background"):
+        await safe_reply(update.message, tr("bgtask.unsupported", name=name))
+        return
+    from .agent_restart import is_restarting
+
+    if is_restarting(wid):
+        await safe_reply(update.message, tr("restart.in_progress", name=name))
+        return
+    pane = await session_manager.capture_pane(wid)
+    if pane is None:
+        await safe_reply(update.message, tr("cb.agent_screen_unreadable"))
+        return
+    if is_interactive_ui(pane):
+        await safe_reply(update.message, tr("cb.agent_dialog_answer_first"))
+        return
+    if not session_manager.is_agent_working(wid, pane):
+        await safe_reply(update.message, tr("bgtask.nothing_running", name=name))
+        return
+    if not await session_manager.send_keys(wid, "C-b", enter=False, literal=False):
+        await safe_reply(update.message, tr("cb.agent_unavailable"))
+        return
+    await safe_reply(update.message, tr("bgtask.sent", name=name))
 
 
 async def diff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1531,8 +1616,8 @@ def _build_commands_keyboard(
             ]
         )
         # Parallel-agent buttons, ONE PER ROW. 🌳 forks a worktree agent (own
-        # branch+dir) — shown only when the runtime supports worktrees AND the
-        # topic can fork a repo (worktree topic, or cwd is a git repo). ➕
+        # branch+dir) — shown when the topic can fork a repo (worktree topic,
+        # or cwd is a git repo), whatever CLI runs in it. ➕
         # starts a sibling on the SAME files (same container / same directory)
         # — no repo needed, so it also shows for docker agents and plain
         # folders. Both hide rather than error on tap

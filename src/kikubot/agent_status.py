@@ -79,9 +79,11 @@ def _mode_ids(offered: tuple[str, ...], current: str | None) -> list[str]:
     return ids
 
 
-# The panel actions offered as quick commands, in this order. /clear is left
-# out on purpose: one tap in a sheet must not wipe the session.
-_QUICK_ACTIONS = ("compact", "context", "model")
+# Icons a session action may carry (docs/agent-status-format.md lists them).
+ACTION_ICONS = frozenset(
+    {"plus", "branch", "compress", "trash", "undo", "history", "background", "diff"}
+    | {"restart", "stop", "model", "context"}
+)
 
 _panes: dict[str, tuple[float, str | None]] = {}
 _usage: dict[str, AgentUsage] = {}
@@ -160,7 +162,9 @@ class AgentStatus:
     # alias → readable name with version, from models seen on this machine
     alias_names: dict[str, str] = field(default_factory=dict)
     items: list[Item] = field(default_factory=list)
-    commands: list[tuple[str, str]] = field(default_factory=list)
+    # Session actions (session_actions): dicts with id, label, cmd, group and
+    # the optional confirm / terminal / icon.
+    commands: list[dict] = field(default_factory=list)
 
     def sections(self) -> list[dict]:
         """The server-driven sheet: ordered sections a client renders by type."""
@@ -266,7 +270,7 @@ class AgentStatus:
                     "type": "actions",
                     "id": "commands",
                     "title": tr("astatus.sec.commands"),
-                    "items": [{"label": lbl, "cmd": c} for c, lbl in self.commands],
+                    "items": self.commands,
                 }
             )
         return out
@@ -787,22 +791,67 @@ def _state(binding: str, runtime: str) -> tuple[str | None, str | None]:
     return "idle", pane
 
 
-def quick_commands(runtime: str, reserved: Iterable[str]) -> list[tuple[str, str]]:
-    """(slash, label) the client may send as a message to reach the agent.
+def session_actions(binding: str, runtime: str, reserved: Iterable[str]) -> list[dict]:
+    """The topic's session actions, each one a command the topic accepts.
 
-    A slash the bot itself handles (``reserved`` — e.g. Codex's /status vs the
-    bot's /status) would never reach the agent, so it's left out.
+    A client sends ``cmd`` as an ordinary message, so every action also works
+    from any Telegram app. Agent commands (``/compact``…) come from the
+    runtime and only when it has them; a slash the bot handles itself
+    (``reserved``, e.g. Codex's /status vs the bot's /status) would never
+    reach the agent, so such an agent command is left out. Bot commands
+    (``/sibling``, ``/restart``…) are offered when the topic can do them.
+    ``group`` sorts them (new / session / danger); ``confirm`` is the question
+    to ask before sending; ``terminal`` says the result is a picker or dialog
+    in the agent's terminal.
     """
+    from .session import session_manager
+
     rt = get_runtime(runtime)
     taken = {r.lstrip("/").lower() for r in reserved}
-    out = []
-    for action in _QUICK_ACTIONS:
+    out: list[dict] = []
+
+    def add(action_id: str, cmd: str, group: str, **extra: object) -> None:
+        item: dict = {
+            "id": action_id,
+            "label": tr(f"astatus.cmd.{action_id}"),
+            "cmd": cmd,
+            "group": group,
+        }
+        item.update({k: v for k, v in extra.items() if v is not None})
+        out.append(item)
+
+    def agent(action: str, group: str, **extra: object) -> None:
         if not rt.supports_panel_action(action):
-            continue
+            return
         slash = rt.panel_slash(action)
         if not slash or slash.split()[0].lstrip("/").lower() in taken:
-            continue
-        out.append((slash, tr(f"astatus.cmd.{action}")))
+            return
+        add(action, slash, group, **extra)
+
+    if session_manager.can_offer_sibling(binding):
+        add("sibling", "/sibling", "new", icon="plus")
+    if session_manager.can_offer_worktree(binding):
+        add("worktree", "/worktree", "new", icon="branch")
+    agent("compact", "session", icon="compress", confirm=tr("astatus.confirm.compact"))
+    agent("context", "session", icon="context", terminal=True)
+    agent("model", "session", icon="model", terminal=True)
+    agent("clear", "session", icon="trash", confirm=tr("astatus.confirm.clear"))
+    agent("rewind", "session", icon="undo", terminal=True)
+    resume = rt.panel_slash("resume") or "/resume"
+    if resume.split()[0].lstrip("/").lower() not in taken:
+        add("resume", resume, "session", icon="history", terminal=True)
+    if rt.supports_panel_action("background"):
+        add("background", "/bgtask", "session", icon="background")
+    if rt.edit_tool_names:
+        add("diff", "/diff", "session", icon="diff")
+    add(
+        "restart",
+        "/restart",
+        "danger",
+        icon="restart",
+        confirm=tr("astatus.confirm.restart"),
+    )
+    add("end", "/kill", "danger", icon="stop", confirm=tr("astatus.confirm.end"))
     return out
 
 
@@ -913,5 +962,5 @@ def build_status(
             st.items += provider(src)
         except Exception as e:  # noqa: BLE001 — one bad row must not sink the card
             logger.debug("status item provider %s failed: %s", provider.__name__, e)
-    st.commands = quick_commands(runtime, reserved_commands)
+    st.commands = session_actions(binding, runtime, reserved_commands)
     return st

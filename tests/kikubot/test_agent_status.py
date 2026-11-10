@@ -50,6 +50,12 @@ class _FakeSM:
     def agent_has_queued_input(self, binding, pane):
         return self.queued
 
+    def can_offer_sibling(self, binding):
+        return True
+
+    def can_offer_worktree(self, binding):
+        return binding.startswith("@")
+
     # The real resolver: siblings (docker:<agent>/<slug>) must resolve to
     # their configured agent exactly as in production.
     split_docker_binding = staticmethod(session_mod.SessionManager.split_docker_binding)
@@ -97,7 +103,20 @@ def test_claude_status_from_snapshot(env):
     ids = [i.id for i in st.items]
     assert ids[:2] == ["thinking", "lines"]
     assert st.effort == "high"
-    assert [c for c, _ in st.commands] == ["/compact", "/context", "/model"]
+    assert [c["cmd"] for c in st.commands] == [
+        "/sibling",
+        "/worktree",
+        "/compact",
+        "/context",
+        "/model",
+        "/clear",
+        "/rewind",
+        "/resume",
+        "/bgtask",
+        "/diff",
+        "/restart",
+        "/kill",
+    ]
 
 
 def test_json_v1_shape(env):
@@ -144,7 +163,9 @@ def test_json_v1_shape(env):
     assert {"id": "thinking", "label": "Thinking", "value": "on"} in secs["session"][
         "items"
     ]
-    assert {"label": "Compact context", "cmd": "/compact"} in secs["commands"]["items"]
+    compact = next(i for i in secs["commands"]["items"] if i["id"] == "compact")
+    assert compact["cmd"] == "/compact" and compact["group"] == "session"
+    assert compact["label"] == "Compact context" and compact["confirm"]
     assert "/home" not in json.dumps(data)
 
 
@@ -215,7 +236,9 @@ def test_codex_limits_from_transcript_and_reserved_slash(env):
     assert st.context_pct == 8
     assert [lim.id for lim in st.limits] == ["5h"]
     # Codex's context command is /status — the bot's own command, never the agent's.
-    assert "/status" not in [c for c, _ in st.commands]
+    cmds = [c["cmd"] for c in st.commands]
+    assert "/status" not in cmds
+    assert "/rewind" not in cmds  # Claude Code's, not Codex's
 
 
 @pytest.mark.parametrize(
@@ -654,3 +677,24 @@ def test_a_foreground_subagent_ending_in_a_later_batch(env):
     later = [_user([{"type": "tool_result", "tool_use_id": "ag4", "content": "Done."}])]
     agent_status.note_usage("sid-claude", CLAUDE.latest_usage(later))
     assert agent_status.build_status("@5", now=NOW).agents == []
+
+
+def test_session_actions_shape(env):
+    """Every action is a command the topic accepts, grouped, and the ones a
+    client must confirm or show in the terminal say so."""
+    st = agent_status.build_status("@5", now=NOW)
+    by_id = {c["id"]: c for c in st.commands}
+    assert {c["group"] for c in st.commands} <= {"new", "session", "danger"}
+    assert by_id["sibling"]["group"] == by_id["worktree"]["group"] == "new"
+    assert by_id["restart"]["group"] == by_id["end"]["group"] == "danger"
+    for danger in ("restart", "end", "clear", "compact"):
+        assert by_id[danger]["confirm"]
+    assert by_id["rewind"]["terminal"] and by_id["resume"]["terminal"]
+    assert "confirm" not in by_id["rewind"] and "terminal" not in by_id["restart"]
+    assert by_id["background"]["cmd"] == "/bgtask"  # never the CLI's /bg
+    assert all(c["icon"] in agent_status.ACTION_ICONS for c in st.commands)
+
+
+def test_docker_topic_offers_no_worktree(env):
+    st = agent_status.build_status("docker:assistant", now=NOW)
+    assert "worktree" not in {c["id"] for c in st.commands}

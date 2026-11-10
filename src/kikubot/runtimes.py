@@ -90,8 +90,9 @@ from .utils import is_valid_session_id, same_dir as _same_dir
 logger = logging.getLogger(__name__)
 
 CLAUDE_RUNTIME = "claude"
-# Slash commands that end a Claude Code session.
-_CLAUDE_EXIT_COMMANDS = ("/exit", "/quit", "/logout")
+# Slash commands that take Claude Code off its terminal: quit, log out,
+# detach to a background session (/background, alias /bg), restart in place.
+_CLAUDE_EXIT_COMMANDS = ("/exit", "/quit", "/logout", "/background", "/bg", "/restart")
 CODEX_RUNTIME = "codex"
 GROK_RUNTIME = "grok"
 GLM_RUNTIME = "glm"
@@ -469,7 +470,8 @@ class AgentRuntime(abc.ABC):
     #: wipe) and lifecycle (resume/new/restart/end/refresh) are always shown and
     #: NOT listed here. Ids: "mode" (Shift+Tab plan/auto-accept cycle), "effort",
     #: "compact", "clear", "model", "context", "mcp", "background" (Ctrl+B →
-    #: background task), "worktree" (fork a sibling agent). A third agent = a new
+    #: background task), "rewind" (/rewind). 🌳 worktrees are not a runtime
+    #: action: the bot makes them (SessionManager.can_offer_worktree). A third agent = a new
     #: subclass declaring its own set; the panel builder never changes.
     panel_actions: frozenset[str] = frozenset()
 
@@ -486,6 +488,8 @@ class AgentRuntime(abc.ABC):
         "mcp": "/mcp",
         "context": "/context",
         "effort": "/effort",
+        "resume": "/resume",
+        "rewind": "/rewind",
     }
 
     def supports_panel_action(self, action: str) -> bool:
@@ -824,7 +828,7 @@ class ClaudeRuntime(AgentRuntime):
             "context",
             "mcp",
             "background",
-            "worktree",
+            "rewind",
         }
     )
 
@@ -1057,7 +1061,7 @@ class CodexRuntime(AgentRuntime):
     # mode" on back-tab, same key handler); "context" maps to /status (codex has
     # no /context — /status shows model/permissions/account/limits, parsed by
     # codex_status_parser). EXCLUDED: "effort" (folded into /model), "background"
-    # (no Ctrl+B background-task), "worktree" (codex worktree not built).
+    # (no Ctrl+B background-task), "rewind" (no /rewind).
     panel_actions = frozenset({"compact", "clear", "model", "mcp", "mode", "context"})
     panel_slash_commands = {
         **AgentRuntime.panel_slash_commands,
@@ -1399,8 +1403,7 @@ class GrokRuntime(AgentRuntime):
     interrupt_keys = ("Escape",)
     # Probed live on 0.2.111: Shift+Tab cycles Normal → Plan → Always-approve
     # ("mode"), /effort, /compact, /clear (alias of /new), /model, /context,
-    # Ctrl+B sends the running command to the background. EXCLUDED: "worktree"
-    # (grok worktree topics not built — fork them FROM claude topics).
+    # Ctrl+B sends the running command to the background. EXCLUDED: "rewind".
     panel_actions = frozenset(
         {"mode", "effort", "compact", "clear", "model", "context", "mcp", "background"}
     )

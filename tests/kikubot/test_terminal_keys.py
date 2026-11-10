@@ -72,6 +72,13 @@ def _claude_pane(box: str) -> str:
         ("/quit", True),
         ("/ex", True),  # Enter completes a partial slash command
         ("/q", True),
+        ("/background", True),  # detaches the session from its terminal
+        ("/bg", True),
+        ("/restart", True),
+        ("/logout", True),
+        ("exit", True),
+        ("/resume", False),
+        ("/rewind", False),
         ("/effort", False),
         ("/e x", False),
         ("hello /exit", False),

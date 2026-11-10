@@ -322,7 +322,7 @@ class TestBootstrapCapabilities:
     def test_grok_panel_set(self):
         # Probed live on 0.2.111 — /mcps is grok's MCP command (plural).
         assert GROK.supports_panel_action("background") is True
-        assert GROK.supports_panel_action("worktree") is False
+        assert GROK.supports_panel_action("rewind") is False
         assert GROK.panel_slash("mcp") == "/mcps"
         assert GROK.panel_slash("context") == "/context"
 
