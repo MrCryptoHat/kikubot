@@ -832,6 +832,33 @@ class TestSendToWindowRouting:
         ok, _msg = await mgr.send_to_window("@12", "hi")
         assert ok is True
 
+    async def test_tmux_agent_that_quit_gets_nothing_typed(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """A pane whose agent quit is a shell: user text would run as a host
+        command there, so nothing is typed."""
+        from kikubot import session as session_mod
+        from kikubot.session import AGENT_NOT_RUNNING
+        from kikubot.tmux_manager import TmuxWindow
+
+        async def fake_find(wid):
+            return TmuxWindow(window_id=wid, window_name="x", cwd="/tmp")
+
+        async def quit_(_window):
+            return False
+
+        async def forbidden(*a, **kw):
+            raise AssertionError("nothing may be typed into a shell")
+
+        monkeypatch.setattr(session_mod.tmux_manager, "find_window_by_id", fake_find)
+        monkeypatch.setattr(session_mod.tmux_manager, "is_agent_running", quit_)
+        monkeypatch.setattr(session_mod.tmux_manager, "send_keys", forbidden)
+
+        assert await mgr.send_to_window("@12", "rm -rf ~") == (
+            False,
+            AGENT_NOT_RUNNING,
+        )
+
 
 class TestResolveAgentBinding:
     """resolve_agent_binding maps a bare agent name → binding value for the
@@ -1324,8 +1351,12 @@ class TestSendLockSerialization:
             events.append(f"end:{window_id}:{text}")
             return True
 
+        async def running(_window):
+            return True
+
         monkeypatch.setattr(session_mod.tmux_manager, "find_window_by_id", fake_find)
         monkeypatch.setattr(session_mod.tmux_manager, "send_keys", fake_send)
+        monkeypatch.setattr(session_mod.tmux_manager, "is_agent_running", running)
 
     async def test_same_binding_serializes(self, mgr: SessionManager, monkeypatch):
         import asyncio as aio
@@ -2094,3 +2125,217 @@ class TestVoiceLedgerFile:
         (ledger_dir / "voice_ledger.json").write_text("{not json")
         with pytest.raises(ValueError):
             mgr.tts_reserve(0.01, 1)
+
+
+class TestSendKeyTokens:
+    """The inline `keys` write path: order, the running check, the exit guard."""
+
+    @pytest.fixture
+    def tmux(self, mgr, monkeypatch):
+        from kikubot import session as session_mod
+        from kikubot.tmux_manager import TmuxWindow
+
+        sent: list[tuple[str, bool]] = []
+        state = {"running": True, "pane": "idle pane\n"}
+
+        async def find(wid):
+            return TmuxWindow(window_id=wid, window_name="x", cwd="/tmp")
+
+        async def running(_w):
+            return state["running"]
+
+        async def batch(_wid, items):
+            sent.extend(items)
+            return True
+
+        async def capture(_wid, **_kw):
+            return state["pane"]
+
+        monkeypatch.setattr(session_mod.tmux_manager, "find_window_by_id", find)
+        monkeypatch.setattr(session_mod.tmux_manager, "is_agent_running", running)
+        monkeypatch.setattr(session_mod.tmux_manager, "send_key_batch", batch)
+        monkeypatch.setattr(session_mod.tmux_manager, "capture_pane", capture)
+        monkeypatch.setattr(session_mod, "_TEXT_ENTER_GAP", 0)
+        return sent, state
+
+    async def test_sends_in_order(self, mgr, tmux):
+        from kikubot.terminal_keys import KeyToken
+
+        sent, _ = tmux
+        tokens = [
+            KeyToken("Escape", False),
+            KeyToken("hi", True),
+            KeyToken("Enter", False),
+        ]
+        assert await mgr.send_key_tokens("@1", tokens) == (3, None)
+        assert sent == [("Escape", False), ("hi", True), ("Enter", False)]
+
+    async def test_agent_that_quit_gets_nothing(self, mgr, tmux):
+        from kikubot.terminal_keys import KeyToken
+
+        sent, state = tmux
+        state["running"] = False
+        tokens = [KeyToken("rm -rf ~", True), KeyToken("Enter", False)]
+        assert await mgr.send_key_tokens("@1", tokens) == (0, "not-running")
+        assert sent == []
+
+    async def test_agent_that_quits_mid_query_gets_no_enter(
+        self, mgr, tmux, monkeypatch
+    ):
+        """Re-checked right before the last key: text may have gone in, but
+        the Enter that would run it in the shell doesn't."""
+        from kikubot import session as session_mod
+        from kikubot.terminal_keys import KeyToken
+
+        sent, state = tmux
+        calls = {"n": 0}
+
+        async def running(_w):
+            calls["n"] += 1
+            return calls["n"] == 1
+
+        monkeypatch.setattr(session_mod.tmux_manager, "is_agent_running", running)
+        tokens = [KeyToken("ls", True), KeyToken("Enter", False)]
+        assert await mgr.send_key_tokens("@1", tokens) == (1, "not-running")
+        assert ("Enter", False) not in sent
+
+    async def test_second_ctrl_c_that_would_quit_is_refused(self, mgr, tmux):
+        from kikubot.terminal_keys import KeyToken
+
+        sent, state = tmux
+        state["pane"] = "…\n  \x1b[2mPress Ctrl-C again to exit\x1b[0m\n"
+        assert await mgr.send_key_tokens("@1", [KeyToken("C-c", False)]) == (
+            0,
+            "would-exit",
+        )
+        assert sent == []
+
+    async def test_enter_on_a_typed_exit_command_is_refused(self, mgr, tmux):
+        from kikubot.terminal_keys import KeyToken
+
+        sent, state = tmux
+        tokens = [KeyToken("/exit", True), KeyToken("Enter", False)]
+        assert await mgr.send_key_tokens("@1", tokens) == (1, "would-exit")
+        assert sent == [("/exit", True)]
+
+    async def test_escape_on_the_trust_gate_is_refused(self, mgr, tmux):
+        from kikubot.terminal_keys import KeyToken
+
+        sent, state = tmux
+        state["pane"] = (
+            " Quick safety check: Is this a project you trust?\n"
+            " ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n"
+        )
+        tokens = [KeyToken("Escape", False), KeyToken("Down", False)]
+        assert await mgr.send_key_tokens("@1", tokens) == (0, "would-exit")
+        assert await mgr.send_key_tokens("@1", [KeyToken("Enter", False)]) == (
+            0,
+            "would-exit",  # Enter would take the highlighted «No, exit»
+        )
+        assert sent == []
+
+    async def test_unreadable_screen_sends_no_final_key(self, mgr, tmux):
+        from kikubot.terminal_keys import KeyToken
+
+        sent, state = tmux
+        state["pane"] = None
+        assert await mgr.send_key_tokens("@1", [KeyToken("Enter", False)]) == (
+            0,
+            "unavailable",
+        )
+        assert sent == []
+
+    async def test_next_write_waits_out_the_settle_after_enter(
+        self, mgr, tmux, monkeypatch
+    ):
+        from kikubot import session as session_mod
+        from kikubot.terminal_keys import KeyToken
+
+        slept: list[float] = []
+
+        async def fake_sleep(sec):
+            slept.append(sec)
+
+        monkeypatch.setattr(session_mod.asyncio, "sleep", fake_sleep)
+        await mgr.send_key_tokens("@1", [KeyToken("Enter", False)])
+        await mgr.send_key_tokens("@1", [KeyToken("Up", False)])
+        assert slept and 0.9 < slept[-1] <= session_mod.FINAL_SETTLE_SEC
+
+    async def test_clear_empties_the_box_and_checks_it(self, mgr, tmux, monkeypatch):
+        from kikubot import session as session_mod
+        from kikubot.terminal_keys import CLEAR_KEY, KeyToken
+
+        sent, state = tmux
+        rule = "─" * 60
+        state["pane"] = f"x\n{rule}\n❯ line one\n  line two\n{rule}\n"
+        suggestion = f'x\n{rule}\n❯ \x1b[2mTry "fix lint"\x1b[0m\n{rule}\n'
+
+        async def batch(_wid, items):
+            sent.extend(items)
+            state["pane"] = suggestion  # emptied; the dimmed suggestion shows
+            return True
+
+        monkeypatch.setattr(session_mod.tmux_manager, "send_key_batch", batch)
+        monkeypatch.setattr(session_mod, "_CLEAR_REDRAW_SEC", 0)
+        assert await mgr.send_key_tokens("@1", [KeyToken(CLEAR_KEY, False)]) == (
+            1,
+            None,
+        )
+        keys = {k for k, _ in sent}
+        assert keys == {"C-k", "C-u"}  # never Esc or Ctrl-C: no interrupting
+
+    async def test_busy_lock_answers_busy(self, mgr, tmux):
+        from kikubot.terminal_keys import KeyToken
+
+        sent, _ = tmux
+        async with mgr.send_lock("@1"):
+            result = await mgr.send_key_tokens(
+                "@1", [KeyToken("Up", False)], lock_wait=0.05
+            )
+        assert result == (0, "busy") and sent == []
+        assert not mgr.send_lock("@1").locked()
+
+    @pytest.mark.skipif(
+        __import__("shutil").which("tmux") is None, reason="tmux not installed"
+    )
+    async def test_keys_reach_a_real_pane(
+        self, mgr, tmux_server, tmp_path, monkeypatch
+    ):
+        import asyncio
+
+        from kikubot import session as session_mod
+        from kikubot.terminal_keys import KeyToken
+
+        _tmux, manager, _signal = tmux_server
+        monkeypatch.setattr(session_mod, "tmux_manager", manager)
+        ok, _, _, wid = await manager.create_window(
+            str(tmp_path), window_name="k", start_claude=False
+        )
+        assert ok
+        # Nothing reaches a bare shell.
+        window = await manager.find_window_by_id(wid)
+        assert window is not None
+        for _ in range(100):
+            if not await manager.is_agent_running(window):
+                break
+            await asyncio.sleep(0.05)
+        assert await mgr.send_key_tokens(wid, [KeyToken("echo pwned", True)]) == (
+            0,
+            "not-running",
+        )
+        # A program holding the terminal (cat stands in for the agent) gets them.
+        assert await manager.send_keys(wid, "cat", enter=True)
+        for _ in range(100):
+            if await manager.is_agent_running(window):
+                break
+            await asyncio.sleep(0.05)
+        tokens = [KeyToken("héllo wörld", True), KeyToken("Enter", False)]
+        assert await mgr.send_key_tokens(wid, tokens) == (2, None)
+        pane = ""
+        for _ in range(100):
+            pane = await manager.capture_pane(wid) or ""
+            if pane.count("héllo wörld") >= 2:  # the echo and cat's copy
+                break
+            await asyncio.sleep(0.05)
+        assert pane.count("héllo wörld") >= 2
+        assert "pwned" not in pane

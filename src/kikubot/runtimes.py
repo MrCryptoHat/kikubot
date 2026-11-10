@@ -70,6 +70,10 @@ from .config import config
 from .grok_transcript_parser import GrokTranscriptParser
 from .terminal_parser import (
     _is_chrome_separator,
+    claude_composer_text,
+    claude_composer_typed,
+    claude_slash_menu_pick,
+    claude_trust_dialog,
     composer_holds_text,
     has_codex_queued_messages,
     has_grok_queued_messages,
@@ -78,6 +82,7 @@ from .terminal_parser import (
     is_codex_working,
     is_grok_working,
     is_interactive_ui,
+    strip_escapes,
 )
 from .transcript_parser import ParsedEntry, TranscriptParser
 from .utils import is_valid_session_id, same_dir as _same_dir
@@ -85,6 +90,8 @@ from .utils import is_valid_session_id, same_dir as _same_dir
 logger = logging.getLogger(__name__)
 
 CLAUDE_RUNTIME = "claude"
+# Slash commands that end a Claude Code session.
+_CLAUDE_EXIT_COMMANDS = ("/exit", "/quit", "/logout")
 CODEX_RUNTIME = "codex"
 GROK_RUNTIME = "grok"
 GLM_RUNTIME = "glm"
@@ -237,6 +244,21 @@ class AgentUsage:
     agent_events: tuple[tuple[str, str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class ExitPrompt:
+    """A screen an agent CLI drew on its exit command instead of quitting.
+
+    ``background``: running work would stop; ``items`` lists it as the CLI
+    does, and ``stop_selected`` says the highlighted answer is «stop it and
+    exit». ``notice``: an informational screen that Esc closes, after which
+    the exit goes on.
+    """
+
+    kind: str  # "background" | "notice"
+    items: tuple[str, ...] = ()
+    stop_selected: bool = False
+
+
 _WINDOW_IDS = {300: "5h", 10080: "7d"}
 
 # A subagent the Agent tool launched in the background reports back later in
@@ -324,6 +346,42 @@ _CLAUDE_MODES = {
     "bypass permissions": "bypass",
 }
 _CLAUDE_SHELLS_RE = re.compile(r"(\d+) shells?\b")
+
+
+_EXIT_OPTION_RE = re.compile(r"^(❯\s*)?\d+\.\s")
+
+
+def _claude_exit_prompt(pane_text: str) -> ExitPrompt | None:
+    """What Claude Code (2.1.31x+) drew on /exit instead of quitting.
+
+    Matched only as the block that owns the bottom of the pane, below the
+    last chrome rule and ending in its key hint: the same words turn up
+    quoted in transcripts, and a match there would stall every restart.
+    """
+    lines = [ln.strip() for ln in pane_text.split("\n")]
+    seps = [i for i, ln in enumerate(lines) if _is_chrome_separator(ln)]
+    if not seps:
+        return None
+    block = [ln for ln in lines[seps[-1] + 1 :] if ln]
+    if len(block) < 2:
+        return None
+    head, footer = block[0], block[-1]
+    if head == "Background work is running" and "Esc to cancel" in footer:
+        items: list[str] = []
+        listing = stop = False
+        for ln in block[1:-1]:
+            if _EXIT_OPTION_RE.match(ln):
+                listing = False
+                if ln.startswith("❯"):
+                    stop = "stop" in ln.lower()
+            elif listing:
+                items.append(ln)
+            elif ln.endswith("will stop when you exit:"):
+                listing = True
+        return ExitPrompt("background", tuple(items), stop)
+    if head == "Feedback drafts" and "Esc to close" in footer:
+        return ExitPrompt("notice")
+    return None
 
 
 def _claude_footer(pane_text: str) -> str | None:
@@ -623,6 +681,56 @@ class AgentRuntime(abc.ABC):
         """How many background shells the pane's footer reports (None: unknown)."""
         return None
 
+    def has_transcript(self, session_id: str) -> bool | None:
+        """Whether the CLI has a transcript to resume ``session_id`` from.
+
+        A resume of a session that never got one (started, then restarted
+        before its first message) makes the CLI quit at once, and a revive
+        loop follows. None = can't tell; callers then resume as asked.
+        """
+        return None
+
+    def typed_input(self, pane_ansi: str) -> str | None:
+        """What is typed in the input box, from ``capture-pane -e``.
+
+        A suggestion the CLI draws into an empty box doesn't count. "" is an
+        empty box; None means the box can't be read (the default), and callers
+        that must know (``SessionManager.clear_input``) then don't act blind.
+        """
+        return None
+
+    def clear_input_pass(self, pane_text: str) -> tuple[str, ...]:
+        """Keys for one pass of emptying the input box; () = no known way.
+
+        Must never interrupt a running turn, so no Esc or Ctrl-C.
+        ``SessionManager.clear_input`` repeats the pass until ``typed_input``
+        reads empty.
+        """
+        return ()
+
+    def would_exit_on_enter(self, pane_text: str) -> bool:
+        """Whether Enter now would quit the CLI.
+
+        The inline ``keys`` query refuses such an Enter, so a client can't end
+        the agent and leave its next keys to the shell. False when the CLI's
+        screen can't be read that way (the keys path still checks typed text
+        against ``exit_command``).
+        """
+        return False
+
+    def would_exit_on_escape(self, pane_text: str) -> bool:
+        """Whether Esc now would quit the CLI (a startup gate it cancels)."""
+        return False
+
+    def exit_prompt(self, pane_text: str) -> ExitPrompt | None:
+        """A screen the CLI drew on ``exit_command`` instead of quitting.
+
+        The restart reads it so it never confirms one blind: Enter there takes
+        whatever is preselected, and Claude Code preselects «stop background
+        work». Default: the CLI has no such screen.
+        """
+        return None
+
     def remote_control(self, pane_text: str) -> str | None:
         """ "connected" / "available" / None (off or unknown) off the pane."""
         return None
@@ -785,6 +893,56 @@ class ClaudeRuntime(AgentRuntime):
         if footer and any(ln.rstrip().endswith("/rc") for ln in footer.split("\n")):
             return "available"
         return None
+
+    def has_transcript(self, session_id: str) -> bool | None:
+        # Any project dir: a resume from another cwd copies the session there.
+        if not is_valid_session_id(session_id):
+            return None
+        try:
+            return any(config.claude_projects_path.glob(f"*/{session_id}.jsonl"))
+        except OSError:
+            return None
+
+    def typed_input(self, pane_ansi: str) -> str | None:
+        return claude_composer_typed(pane_ansi)
+
+    def clear_input_pass(self, pane_text: str) -> tuple[str, ...]:
+        # Measured on 2.1.322: Ctrl+K kills to the line end (at the end, the
+        # line break), Ctrl+U to the line start (at the start, the break
+        # before). Alternating them empties a multi-line draft from any cursor
+        # position in about two pairs per line; one call types them all.
+        box = claude_composer_text(strip_escapes(pane_text)) or ""
+        rows = box.count("\n") + 1
+        return ("C-k", "C-u") * min(2 * rows + 2, 80)
+
+    def would_exit_on_enter(self, pane_text: str) -> bool:
+        plain = strip_escapes(pane_text)
+        _, exit_picked = claude_trust_dialog(plain)
+        if exit_picked:
+            return True  # the folder-trust gate with «No, exit» highlighted
+        if claude_slash_menu_pick(plain) in _CLAUDE_EXIT_COMMANDS:
+            return True  # Enter runs the slash menu's highlighted command
+        box = claude_composer_text(plain)
+        if not box:
+            return False
+        text = box.replace("❯", "").replace("\xa0", " ").strip().lower()
+        if text in ("exit", "quit"):
+            return True
+        if not text.startswith("/"):
+            return False
+        first = text.split()[0]
+        # Enter completes a partial slash command: "/ex" runs /exit.
+        return any(
+            first == cmd or (len(text) >= 2 and cmd.startswith(text))
+            for cmd in _CLAUDE_EXIT_COMMANDS
+        )
+
+    def would_exit_on_escape(self, pane_text: str) -> bool:
+        trust_up, _ = claude_trust_dialog(pane_text)
+        return trust_up  # Esc cancels the trust gate, and the CLI quits
+
+    def exit_prompt(self, pane_text: str) -> ExitPrompt | None:
+        return _claude_exit_prompt(pane_text)
 
     def background_shells(self, pane_text: str) -> int | None:
         footer = _claude_footer(pane_text)

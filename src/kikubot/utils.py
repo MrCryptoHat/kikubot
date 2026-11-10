@@ -65,6 +65,18 @@ def kikubot_dir() -> Path:
     return Path.home() / ".kikubot"
 
 
+def tmux_literal_args(text: str) -> list[str]:
+    """``send-keys -l --`` arguments that type ``text`` exactly.
+
+    tmux reads an argument that ends in ``;`` as a command separator even
+    after ``--``: ``abc;`` types ``abc``, a lone ``;`` types nothing, and the
+    send still succeeds. So the trailing semicolons go as ``\\;`` each, which
+    tmux types as ``;``. A semicolon elsewhere in the text is typed as is.
+    """
+    base = text.rstrip(";")
+    return ([base] if base else []) + ["\\;"] * (len(text) - len(base))
+
+
 def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
     """Write JSON data to a file atomically.
 

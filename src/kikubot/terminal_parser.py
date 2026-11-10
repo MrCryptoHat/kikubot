@@ -797,10 +797,12 @@ def claude_composer_text(pane_text: str) -> str | None:
     The box is the region between the LAST two chrome separators at the bottom
     of the pane: typed text sits there until Enter submits it, after which the
     transcript echoes it ABOVE the top border and the box is empty again.
+    Blank rows below the drawing don't count toward the search window: in a
+    fresh session the box sits near the top of a mostly empty screen.
     """
     if not pane_text:
         return None
-    lines = pane_text.split("\n")
+    lines = pane_text.rstrip().split("\n")
     seps = [
         i
         for i in range(max(0, len(lines) - 40), len(lines))
@@ -809,6 +811,105 @@ def claude_composer_text(pane_text: str) -> str | None:
     if len(seps) < 2:
         return None
     return "\n".join(lines[seps[-2] + 1 : seps[-1]])
+
+
+_ESC_SEQ_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def strip_escapes(text: str) -> str:
+    """``text`` without terminal escape sequences (SGR, cursor, OSC links)."""
+    return _ESC_SEQ_RE.sub("", text)
+
+
+def _drop_dim(line: str) -> str:
+    """``line`` without its dimmed (SGR 2) runs and without escape codes."""
+    out: list[str] = []
+    dim = False
+    pos = 0
+    for m in _ESC_SEQ_RE.finditer(line):
+        if not dim:
+            out.append(line[pos : m.start()])
+        pos = m.end()
+        seq = m.group(0)
+        if not (seq.startswith("\x1b[") and seq.endswith("m")):
+            continue
+        params = seq[2:-1].split(";")
+        i = 0
+        while i < len(params):
+            p = params[i]
+            if p in ("38", "48", "58") and i + 1 < len(params):
+                # Extended colour: 38;5;n or 38;2;r;g;b — its "2" is no dim.
+                i += 3 if params[i + 1] == "5" else 5
+                continue
+            if p in ("", "0", "22"):
+                dim = False
+            elif p == "2":
+                dim = True
+            i += 1
+    if not dim:
+        out.append(line[pos:])
+    return "".join(out)
+
+
+def claude_composer_typed(pane_ansi: str) -> str | None:
+    """What was typed into Claude Code's input box, from ``capture-pane -e``.
+
+    The box ``claude_composer_text`` finds, minus dimmed text: an empty box
+    shows a dimmed suggested prompt (``Try "fix lint errors"``) that a plain
+    capture can't tell from typed text. The ``❯`` marker and edge spacing are
+    dropped; "" is an empty box, None means no box is drawn.
+    """
+    if not pane_ansi:
+        return None
+    rows = pane_ansi.split("\n")
+    plain = [strip_escapes(r) for r in rows]
+    while plain and not plain[-1].strip():
+        plain.pop()
+    seps = [
+        i
+        for i in range(max(0, len(plain) - 40), len(plain))
+        if _is_chrome_separator(plain[i].strip())
+    ]
+    if len(seps) < 2:
+        return None
+    box = "\n".join(_drop_dim(rows[i]) for i in range(seps[-2] + 1, seps[-1]))
+    return box.replace("❯", "").replace("\xa0", " ").strip()
+
+
+_SLASH_PICK_RE = re.compile(r"^\s*❯\s+(/\S+)")
+
+
+def claude_slash_menu_pick(pane_text: str) -> str | None:
+    """The command highlighted in Claude Code's slash menu (Enter runs it).
+
+    The menu opens under the input box while the box holds ``/…``; its
+    highlighted row starts with ``❯``. None when no menu is open.
+    """
+    lines = strip_escapes(pane_text).rstrip().split("\n")
+    seps = [
+        i
+        for i in range(max(0, len(lines) - 40), len(lines))
+        if _is_chrome_separator(lines[i].strip())
+    ]
+    if not seps:
+        return None
+    for line in lines[seps[-1] + 1 : seps[-1] + 16]:
+        m = _SLASH_PICK_RE.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+_TRUST_RE = re.compile(r"Yes, I trust this folder")
+_TRUST_EXIT_PICKED_RE = re.compile(r"^\s*❯\s*(?:\d\.\s*)?No, exit")
+
+
+def claude_trust_dialog(pane_text: str) -> tuple[bool, bool]:
+    """(the folder-trust dialog is up, its «No, exit» row is highlighted)."""
+    tail = strip_escapes(pane_text).rstrip().split("\n")[-25:]
+    if not any(_TRUST_RE.search(line) for line in tail):
+        return False, False
+    return True, any(_TRUST_EXIT_PICKED_RE.match(line) for line in tail)
 
 
 def composer_holds_text(pane_text: str, sent: str) -> bool:

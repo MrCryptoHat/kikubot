@@ -17,7 +17,6 @@ import asyncio
 import io
 import logging
 import time
-import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -25,6 +24,7 @@ from typing import Any
 from telegram import (
     CallbackQuery,
     InputMediaPhoto,
+    Message,
     Update,
     User,
 )
@@ -63,6 +63,7 @@ from .callback_data import (
     CB_CMD_MODEL,
     CB_CMD_REFRESH,
     CB_CMD_RESTART,
+    CB_CMD_RESTART_STOP,
     CB_CMD_RESUME,
     CB_CMD_TAB,
     CB_CMD_WIPE_INPUT,
@@ -135,7 +136,8 @@ from .interactive_ui import (
     get_interactive_msg_id,
     handle_interactive_ui,
 )
-from .message_sender import safe_edit, safe_send
+from .agent_restart import ExitResult
+from .message_sender import safe_edit, safe_reply, safe_send
 from .agent_delete import (
     _handle_agent_del,
     _handle_agent_delno,
@@ -1400,22 +1402,28 @@ async def _handle_cmd_wipe_input(
     context: ContextTypes.DEFAULT_TYPE,
     user: User,
 ) -> None:
-    """Wipe whatever is typed in Claude's prompt input via Ctrl+U.
+    """Wipe whatever is typed in the agent's input box, all of it.
 
-    Ctrl+U deletes from cursor to line start; repeating it clears
-    across lines in multiline input (documented Claude Code behavior).
-    Three presses cover the realistic worst case without the side
-    effects of the alternatives: Esc interrupts a running turn, Ctrl+C
-    exits Claude Code on a second press when the input is empty.
+    ``SessionManager.clear_input`` empties it the runtime's way and checks
+    the box afterwards (Claude Code: Ctrl+K/Ctrl+U pairs, which clear a
+    multi-line draft from any cursor position; the old three Ctrl+U only
+    erased up to the cursor). Never Esc or Ctrl+C: Esc interrupts a running
+    turn, Ctrl+C exits on a second press. A CLI whose box can't be read gets
+    the three Ctrl+U as before.
     """
     window_id = _parse_cmd_payload(data, CB_CMD_WIPE_INPUT)
-    for _ in range(3):
-        sent = await session_manager.send_keys(
-            window_id, "C-u", enter=False, literal=False
-        )
-        if not sent:
-            await query.answer(tr("cb.agent_unavailable"), show_alert=True)
-            return
+    async with session_manager.send_lock(window_id):
+        cleared = await session_manager.clear_input(window_id)
+    if cleared is None:
+        for _ in range(3):
+            cleared = await session_manager.send_keys(
+                window_id, "C-u", enter=False, literal=False
+            )
+            if not cleared:
+                break
+    if not cleared:
+        await query.answer(tr("cb.agent_unavailable"), show_alert=True)
+        return
     await query.answer(tr("cb.input_wiped"))
     await asyncio.sleep(0.3)
     await _cmd_refresh_photo(query, window_id, tab="nav")
@@ -1438,29 +1446,6 @@ async def _handle_cmd_refresh(
     await query.answer(
         tr("cb.refreshed") if ok else tr("cb.refresh_failed"), show_alert=not ok
     )
-
-
-async def _wait_agent_exited(window_id: str, *, timeout: float = 8.0) -> bool:
-    """Poll until the agent process has exited back to the shell.
-
-    Returns True once the pane's shell holds the terminal again
-    (``tmux_manager.is_agent_running``) — i.e. ``/exit`` (or ``/quit``) actually
-    took and a relaunch will land at the prompt. False at timeout.
-
-    Why this exists: the restart used a blind ``sleep(3)`` between the exit
-    command and the relaunch. When ``/exit``'s Enter didn't submit (Claude Code's
-    slash-command autocomplete can swallow the first Enter, or a slow exit), the
-    relaunch command was typed onto the lingering ``/exit`` → ``/exitclaude
-    --… --name x`` submitted as a bogus prompt («Unknown command: /exitclaude»).
-    Waiting for the real exit makes the relaunch land in the shell, not the CLI.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w and not await tmux_manager.is_agent_running(w):
-            return True
-        await asyncio.sleep(0.3)
-    return False
 
 
 async def _wait_pane_ready(window_id: str, *, timeout: float = 20.0) -> None:
@@ -1496,10 +1481,33 @@ async def _revive_from_panel(
     try:
         new_wid, _ = await revive_topic_agent(user.id, thread_id, fresh=fresh)
     except ReviveError as e:
-        await query.answer(tr(e.key, **e.fmt), show_alert=True)
+        # The query is answered already: a second answer() is dropped.
+        if isinstance(query.message, Message):
+            await safe_reply(query.message, tr(e.key, **e.fmt))
         return
     await _wait_pane_ready(new_wid)
     await _cmd_refresh_photo(query, new_wid, tab="ses")
+
+
+async def _revive_unbound_topic(query: CallbackQuery, data: str, update: Update) -> str:
+    """🔄/🆕 on the panel of a topic whose window is gone and unbound.
+
+    The stale-panel guard would refuse the tap (no binding to match), which
+    left the revive below unreachable from the panel. The window id in the
+    payload is never used: after a tmux-server restart it can name another
+    project's window. The revive works from the topic's own memory.
+
+    "handled": done here. "pass": let the tap through the guard. "": not a
+    revive tap, the guard decides.
+    """
+    if data.startswith((CB_CMD_RESTART, CB_CMD_FRESH)):
+        return "pass"  # only paints the confirm step; the stale id is inert
+    if data.startswith(CB_CMD_CONFIRM):
+        action = data[len(CB_CMD_CONFIRM) :].partition(":")[0]
+        if action in ("restart", "fresh"):
+            await _revive_from_panel(query, update, fresh=action == "fresh")
+            return "handled"
+    return ""
 
 
 # --- Reviving a container agent from its topic ------------------------------
@@ -1526,20 +1534,33 @@ async def _handle_dv_revive(
     user: User,
 ) -> None:
     """Bring a dead container agent back — continuing a conversation or clean."""
-    from .agent_restart import ReviveError, revive_docker_agent
+    from .agent_restart import ReviveError, docker_revive_options, revive_docker_agent
 
     wid = _revive_target(update, user)
     if wid is None:
         await query.answer(tr("revive.no_agent"), show_alert=True)
         return
     session_id = data[len(CB_DVR_RESUME) :] if data.startswith(CB_DVR_RESUME) else None
+    name = session_manager.get_display_name(wid)
+    # An offer stays in the chat after the agent is back: a tap on it then
+    # would kill a working agent mid-turn and swap its conversation.
+    if await session_manager.docker_agent_running(wid):
+        await query.answer()
+        await safe_edit(query, tr("revive.already_running", name=name))
+        return
+    if session_id is not None:
+        last, others = await docker_revive_options(wid)
+        offered = {s.session_id for s in ([last] if last else []) + others}
+        if session_id not in offered:
+            # Another topic holds it now: two agents on one transcript.
+            await query.answer(tr("revive.bad_session"), show_alert=True)
+            return
     await query.answer(tr("cb.reviving_toast"))
     try:
         await revive_docker_agent(wid, session_id=session_id)
     except ReviveError as e:
         await safe_edit(query, tr(e.key, **e.fmt))
         return
-    name = session_manager.get_display_name(wid)
     await safe_edit(
         query,
         tr("revive.back_resumed" if session_id else "revive.back_fresh", name=name),
@@ -1605,11 +1626,18 @@ async def _adopt_topic_name(window_id: str, current: str) -> str:
 
 
 async def _restart_agent(
-    query: CallbackQuery, window_id: str, *, fresh: bool, update: Update | None = None
+    query: CallbackQuery,
+    window_id: str,
+    *,
+    fresh: bool,
+    update: Update | None = None,
+    stop_background: bool = False,
 ) -> None:
     """Relaunch the agent's Claude process. ``fresh=False`` resumes the
     current session_id; ``fresh=True`` starts a brand-new one (the old
-    session's JSONL is untouched, so it stays in `/resume`).
+    session's JSONL is untouched, so it stays in `/resume`). When the CLI
+    holds the exit for running background work, the topic gets the list and
+    a «Restart and stop it» button instead.
     """
     from ..docker_driver import docker_driver
 
@@ -1625,22 +1653,21 @@ async def _restart_agent(
         ):
             await query.answer(tr("cb.container_not_running"), show_alert=True)
             return
+        if await _answer_restart_blocked(
+            query, window_id, fresh=fresh, stop_background=stop_background
+        ):
+            return
         await query.answer(
             tr("cb.new_session_toast") if fresh else tr("cb.restarting_toast")
         )
-        # send_lock: no other writer may type into the pane mid-restart.
-        async with session_manager.send_lock(window_id):
-            await docker_driver.kill_session(
-                target.agent.container, session=target.tmux_session
-            )
-            await asyncio.sleep(1)
-            await session_manager.start_docker_agent(
-                window_id,
-                resume_session_id=resume_id or None,
-                new_session_id=str(uuid.uuid4()) if fresh else None,
-                cwd=session_manager.get_window_state(window_id).cwd or "/workspace",
-            )
-        await _wait_pane_ready(window_id)
+        from .agent_restart import restart_docker_agent
+
+        started = await restart_docker_agent(
+            window_id, resume_id or None, _wait_pane_ready
+        )
+        if not started and isinstance(query.message, Message):
+            name = session_manager.get_display_name(window_id)
+            await safe_reply(query.message, tr("commands.restart_no_tmux", name=name))
         await _cmd_refresh_photo(query, window_id, tab="ses")
         return
 
@@ -1654,41 +1681,143 @@ async def _restart_agent(
             return
         await _revive_from_panel(query, update, fresh=fresh)
         return
-    # /exit + relaunch are typed into the pane — on a busy agent they'd
-    # land in the agent's prompt as text and it would keep running. Runtime-
-    # aware: codex's busy state has different chrome than Claude's.
-    pane = await tmux_manager.capture_pane(window_id)
-    if pane and session_manager.is_agent_working(window_id, pane):
-        await query.answer(
-            tr("cb.agent_busy_stop_first"),
-            show_alert=True,
-        )
+    if await _answer_restart_blocked(
+        query, window_id, fresh=fresh, stop_background=stop_background
+    ):
         return
     await query.answer(
         tr("cb.new_session_toast") if fresh else tr("cb.restarting_toast")
     )
-    # Runtime-aware exit + relaunch (claude: /exit → `claude --name…`; codex:
-    # /quit → `codex [resume …]`). launch_command validates/quotes and knows
-    # each CLI's resume flag, so no per-runtime branch here.
-    from ..runtimes import get_runtime
+    result = await _relaunch_tmux_agent(
+        window_id, w.window_name, resume_id or None, stop_background=stop_background
+    )
+    if not result.exited and isinstance(query.message, Message):
+        from .agent_restart import restart_refused
 
-    runtime = get_runtime(ws.runtime if ws else None)
-    # send_lock across exit → relaunch: anything typed into the pane in the gap
-    # would land in bash, not the agent.
-    async with session_manager.send_lock(window_id):
-        await tmux_manager.send_keys(window_id, runtime.exit_command())
-        # Wait for the CLI to actually exit before typing the relaunch — a blind
-        # sleep raced a swallowed /exit-Enter and concatenated the two commands
-        # («/exitclaude …»). If it hasn't exited, flush a lingering command line
-        # with a bare Enter and wait again, then proceed fail-visible.
-        if not await _wait_agent_exited(window_id):
-            await tmux_manager.send_keys(window_id, "Enter", enter=False, literal=False)
-            await _wait_agent_exited(window_id, timeout=5.0)
-        window_name = await _adopt_topic_name(window_id, w.window_name)
-        cmd = runtime.launch_command(window_name, resume_id or None)
-        await tmux_manager.send_keys(window_id, cmd)
-    await _wait_pane_ready(window_id)
+        text, keyboard = restart_refused(window_id, result, fresh=fresh)
+        await safe_reply(query.message, text, reply_markup=keyboard)
     await _cmd_refresh_photo(query, window_id, tab="ses")
+
+
+async def _answer_restart_blocked(
+    query: CallbackQuery, window_id: str, *, fresh: bool, stop_background: bool = False
+) -> bool:
+    """Answer and return True when the agent can't be restarted now.
+
+    /exit and its Enter are typed into the pane: a busy agent would take them
+    as a prompt, a dialog would take Enter as its highlighted answer (both
+    alerts). Background work a docker restart would kill gets the list and
+    «Restart and stop it» in the topic, unless the user already chose that.
+    """
+    from .agent_restart import restart_precheck, restart_refused
+
+    result = await restart_precheck(window_id)
+    if result is None or (stop_background and not result.refused):
+        return False
+    if result.refused:
+        key = {
+            "busy": "cb.agent_busy_stop_first",
+            "dialog": "cb.agent_dialog_answer_first",
+            "restarting": "cb.restart_in_progress",
+        }[result.refused]
+        await query.answer(tr(key), show_alert=True)
+        return True
+    await query.answer()
+    if isinstance(query.message, Message):
+        text, keyboard = restart_refused(window_id, result, fresh=fresh)
+        await safe_reply(query.message, text, reply_markup=keyboard)
+    return True
+
+
+async def _relaunch_tmux_agent(
+    window_id: str,
+    window_name: str,
+    resume_id: str | None,
+    *,
+    stop_background: bool = False,
+) -> ExitResult:
+    """Quit a tmux window's agent and start it again in the same pane.
+
+    Shared by the panel's 🔄/🆕, ``/restart`` and «Restart and stop it».
+    Runtime-aware (claude: /exit → `claude --name…`; codex: /quit →
+    `codex [resume …]`); launch_command validates/quotes and knows each CLI's
+    resume flag. Locking, re-checks and the safe exit:
+    ``agent_restart.relaunch_tmux_agent``.
+    """
+    from ..runtimes import get_runtime
+    from .agent_restart import relaunch_tmux_agent, resumable
+
+    ws = session_manager.get_window_state(window_id)
+    runtime = get_runtime(ws.runtime if ws else None)
+
+    async def launch() -> str:
+        name = await _adopt_topic_name(window_id, window_name)
+        resume = await resumable(runtime, resume_id or "")
+        return runtime.launch_command(name, resume or None)
+
+    return await relaunch_tmux_agent(
+        window_id,
+        runtime,
+        launch,
+        _wait_pane_ready,
+        stop_background=stop_background,
+    )
+
+
+async def _handle_restart_stop(
+    query: CallbackQuery,
+    data: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User,
+) -> None:
+    """«Restart and stop it»: the restart that background work held up, after
+    the user saw what it stops. Payload cm:rstop:<r|f>:<wid>."""
+    kind, _, window_id = data[len(CB_CMD_RESTART_STOP) :].partition(":")
+    # The payload holds at most CALLBACK_WID_MAX chars of the binding; the
+    # dispatcher's guard matched it to the topic's binding, which is the one
+    # to act on.
+    bound = session_manager.resolve_window_for_thread(user.id, get_thread_id(update))
+    if bound and bound[:CALLBACK_WID_MAX] == window_id:
+        window_id = bound
+    fresh = kind == "f"
+    is_docker = session_manager._is_docker_binding(window_id)
+    w = None
+    if not is_docker:
+        w = await tmux_manager.find_window_by_id(window_id) if window_id else None
+        if w is None:
+            await query.answer(tr("cb.window_gone"), show_alert=True)
+            return
+    if await _answer_restart_blocked(
+        query, window_id, fresh=fresh, stop_background=True
+    ):
+        return
+    await query.answer(
+        tr("cb.new_session_toast") if fresh else tr("cb.restarting_toast")
+    )
+    ws = session_manager.get_window_state(window_id)
+    resume_id = "" if fresh else (ws.session_id if ws else "")
+    name = session_manager.get_display_name(window_id)
+    if is_docker:
+        from .agent_restart import restart_docker_agent
+
+        started = await restart_docker_agent(
+            window_id, resume_id or None, _wait_pane_ready
+        )
+        key = "commands.restarted" if started else "commands.restart_no_tmux"
+        await safe_edit(query, tr(key, name=name))
+        return
+    assert w is not None
+    result = await _relaunch_tmux_agent(
+        window_id, w.window_name, resume_id or None, stop_background=True
+    )
+    if result.exited:
+        await safe_edit(query, tr("commands.restarted", name=name))
+        return
+    from .agent_restart import restart_refused
+
+    text, keyboard = restart_refused(window_id, result, fresh=fresh)
+    await safe_edit(query, text, reply_markup=keyboard)
 
 
 async def _show_confirm(query: CallbackQuery, window_id: str, action: str) -> None:
@@ -2002,6 +2131,7 @@ _PREFIX_DISPATCH: list[tuple[str, Any]] = [
     (CB_CMD_REFRESH, _handle_cmd_refresh),
     (CB_CMD_CONFIRM, _handle_cmd_confirm),
     (CB_CMD_CANCEL, _handle_cmd_cancel),
+    (CB_CMD_RESTART_STOP, _handle_restart_stop),
     # Worktree agents (parallel agents on one project)
     (CB_WT_NEW, _handle_wt_new),
     (CB_WT_DELOK, _handle_wt_delok),
@@ -2060,7 +2190,8 @@ _WID_GUARD_SIMPLE: tuple[str, ...] = (
     CB_AGENT_DEL,
 )
 # Prefixes with one routing field before the window_id
-# (kb:<key>:<wid>, cm:ref:<tab>:<wid>, cm:tab:<tab>:<wid>, cm:cfm:<action>:<wid>).
+# (kb:<key>:<wid>, cm:ref:<tab>:<wid>, cm:tab:<tab>:<wid>, cm:cfm:<action>:<wid>,
+# cm:rstop:<r|f>:<wid>).
 # cm:can: is deliberately NOT guarded: a legacy cancel payload has no tab
 # field (ambiguous parse for docker ids) and cancelling repaints only.
 _WID_GUARD_ONE_FIELD: tuple[str, ...] = (
@@ -2068,6 +2199,7 @@ _WID_GUARD_ONE_FIELD: tuple[str, ...] = (
     CB_CMD_REFRESH,
     CB_CMD_TAB,
     CB_CMD_CONFIRM,
+    CB_CMD_RESTART_STOP,
 )
 
 
@@ -2112,7 +2244,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # Compare truncated: the builder can only fit CALLBACK_WID_MAX chars of
         # the binding into the payload, so comparing against the full value
         # would mark every tap in a long-binding topic stale.
-        if (bound or "")[:CALLBACK_WID_MAX] != guarded:
+        unbound = await _revive_unbound_topic(query, data, update) if not bound else ""
+        if unbound == "handled":
+            return
+        if unbound != "pass" and (bound or "")[:CALLBACK_WID_MAX] != guarded:
             logger.info(
                 "Stale panel tap: data=%s bound=%s (user=%d thread=%s)",
                 data,

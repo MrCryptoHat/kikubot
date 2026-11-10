@@ -98,6 +98,9 @@ CB_CMD_FRESH = (
     "cm:fresh:"  # restart Claude with a brand-new session_id (old one stays in /resume)
 )
 CB_CMD_KILL = "cm:kill:"
+# cm:rstop:<r|f>:<window_id> — restart (r) or start fresh (f) even though it
+# stops the background work the CLI listed on exit.
+CB_CMD_RESTART_STOP = "cm:rstop:"
 CB_CMD_REFRESH = "cm:ref:"  # cm:ref:<tab>:<window_id>
 CB_CMD_TAB = "cm:tab:"  # cm:tab:<tab>:<window_id>
 CB_CMD_CONFIRM = "cm:cfm:"  # cm:cfm:<action>:<window_id>

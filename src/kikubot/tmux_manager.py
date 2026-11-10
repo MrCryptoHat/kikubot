@@ -29,9 +29,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import config
+from .pane_screen import SCREEN_FORMAT, PaneScreen, parse_screen_output
 from .procinfo import foreground_process_groups
 from .runtimes import get_runtime
-from .utils import KIKUBOT_DIR_ENV
+from .utils import KIKUBOT_DIR_ENV, tmux_literal_args
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +273,10 @@ def pane_agent_running(
     return tpgid != pane.pid
 
 
+# A tmux call slower than this gets a log line (see TmuxManager._tmux).
+SLOW_TMUX_SEC = 0.5
+
+
 class TmuxManager:
     """Manages tmux windows for Claude Code sessions."""
 
@@ -309,7 +314,28 @@ class TmuxManager:
         )
 
     async def _tmux(self, *args: str) -> TmuxResult:
-        return await asyncio.to_thread(self._tmux_sync, *args)
+        """``_tmux_sync`` on a worker thread, logging a call that ran slow.
+
+        A slow line says which: the wait for a free worker thread, or tmux
+        itself. Either stalls every pane read behind it (the 1 s poll, the
+        inline ``screen`` a client polls every second).
+        """
+        submitted = time.monotonic()
+
+        def run() -> tuple[TmuxResult, float, float]:
+            started = time.monotonic()
+            res = self._tmux_sync(*args)
+            return res, started - submitted, time.monotonic() - started
+
+        res, waited, ran = await asyncio.to_thread(run)
+        if waited + ran > SLOW_TMUX_SEC:
+            logger.warning(
+                "tmux %s slow: %.0f ms waiting for a thread, %.0f ms in tmux",
+                args[0] if args else "",
+                waited * 1000,
+                ran * 1000,
+            )
+        return res
 
     # --- session ------------------------------------------------------------
 
@@ -602,6 +628,47 @@ class TmuxManager:
             return res.stdout
         return res.stdout.rstrip("\n")
 
+    async def capture_screen(self, window_id: str, back: int = 0) -> PaneScreen | None:
+        """The pane with colours, cursor and size, for the inline ``screen``.
+
+        One tmux call: the capture and the format line come from the same
+        moment, so the cursor matches the text. ``back`` adds that many
+        history lines above the visible screen.
+        """
+        args = ["capture-pane", "-p", "-e", "-t", window_id]
+        if back > 0:
+            args += ["-S", f"-{back}"]
+        args += [";", "display-message", "-p", "-t", window_id, SCREEN_FORMAT]
+        res = await self._tmux(*args)
+        if not res.ok:
+            logger.debug("screen capture of %s failed: %s", window_id, res.stderr)
+            return None
+        return parse_screen_output(res.stdout)
+
+    async def send_key_batch(
+        self, window_id: str, items: Iterable[tuple[str, bool]]
+    ) -> bool:
+        """Type ``(key, literal)`` items in order with ONE tmux call.
+
+        The send-keys commands are joined with ``;``. Literal text goes
+        through ``tmux_literal_args``, so a ``;`` it ends with is typed
+        instead of splitting the commands.
+        """
+        args: list[str] = []
+        for key, literal in items:
+            if args:
+                args.append(";")
+            args += ["send-keys", "-t", window_id]
+            args += ["-l", "--", *tmux_literal_args(key)] if literal else [key]
+        if not args:
+            return True
+        res = await self._tmux(*args)
+        if not res.ok:
+            logger.error(
+                "send-keys batch failed for %s: %s", window_id, res.stderr.strip()
+            )
+        return res.ok
+
     async def _send_keys_once(self, window_id: str, *keys: str) -> bool:
         res = await self._tmux("send-keys", "-t", window_id, *keys)
         if not res.ok:
@@ -633,7 +700,9 @@ class TmuxManager:
                 return False
             return not enter or await self._send_keys_once(window_id, "Enter")
         if not enter:
-            return await self._send_keys_once(window_id, "-l", "--", text)
+            return await self._send_keys_once(
+                window_id, "-l", "--", *tmux_literal_args(text)
+            )
 
         # Text, a pause, then Enter on its own. Claude Code's TUI sometimes
         # takes an Enter arriving in the same input batch as the text for a
@@ -646,14 +715,18 @@ class TmuxManager:
             rest = text[1:]
             if rest:
                 await asyncio.sleep(1.0)
-                if not await self._send_keys_once(window_id, "-l", "--", rest):
+                if not await self._send_keys_once(
+                    window_id, "-l", "--", *tmux_literal_args(rest)
+                ):
                     return False
         else:
             # Split long text into chunks to avoid tmux buffer limits
             chunk_size = 200
             for i in range(0, len(text), chunk_size):
                 chunk = text[i : i + chunk_size]
-                if not await self._send_keys_once(window_id, "-l", "--", chunk):
+                if not await self._send_keys_once(
+                    window_id, "-l", "--", *tmux_literal_args(chunk)
+                ):
                     return False
                 if i + chunk_size < len(text):
                     await asyncio.sleep(0.1)

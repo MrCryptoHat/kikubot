@@ -23,6 +23,8 @@ JSON described here. Nothing in it is specific to one client.
 | Query | Results |
 |---|---|
 | `status <chat_id>:<thread_id>` | `status` (the card) and `status.v1.json` (JSON) for that topic's agent |
+| `screen <chat_id>:<thread_id> [back=<N>]` | the agent's terminal as text, see [Screen](#screen) |
+| `keys <chat_id>:<thread_id> <seq> <token> … .` | press keys in that terminal, answered with its screen, see [Keys](#keys) |
 | empty, `status`, or a name | one card per agent of the asking user, filtered by name |
 
 `chat_id` is the Bot API form (`-100…`), `thread_id` the topic's
@@ -121,8 +123,128 @@ Every action is a command the bot accepts in the topic: the client sends
 `/mode <id>` is the bot's own: it presses Shift+Tab until the agent's
 screen shows that mode, never while a dialog is open. The rest are passed to
 the agent. A status card picked from the inline results and sent into a
-topic is not passed to the agent. A client
-never sends keystrokes or callback data of its own.
+topic is not passed to the agent. Keystrokes go through the `keys` query
+below and nothing else: a client never makes up callback data of its own.
+
+## Screen
+
+`screen <chat_id>:<thread_id>` returns the topic's terminal as text, so a
+client can draw it itself: sharper than the /agent photo and quicker to
+refresh. The topic check, `ALLOWED_USERS`, `is_personal` and `cache_time=0`
+are the same as for `status`. Unlike `status`, each query captures the pane
+(read-only, a few milliseconds; it never types into it), so ask for the
+visible screen every second or two while the view is open, not faster.
+
+Results, all `InlineQueryResultArticle` + `InputTextMessageContent` without
+`parse_mode`:
+
+- `screen`: the meta.
+  ```json
+  {"v":1,"cols":100,"rows":50,"cursor":[2,42],"ts":1794316400,"parts":2,
+   "panel":12345,"back":0,"history":1995}
+  ```
+- `screen.1` … `screen.<parts>`: `{"d":"<chunk>"}`, each `message_text` at
+  most 4096 characters. Join the `d` values in order.
+
+The joined text is `capture-pane -p -e`: the same capture the /agent photo
+is drawn from, colours and attributes as SGR escapes (`\u001b[…m`), trailing
+blanks of a row trimmed. Every line ends with `\n`, a blank last row
+included: the text holds exactly `back` + `rows` lines. The JSON keeps ESC
+and leading spaces intact through Telegram. Characters it might strip or alter
+(controls, format characters such as ZWJ, private-use glyphs) are `\u`-escaped.
+
+| Field | Meaning |
+|---|---|
+| `cols`, `rows` | the pane size; the visible screen is the last `rows` lines of the text |
+| `cursor` | `[x, y]`, 0-based, `y` counted from the top of the visible screen; `null` while the program hides the cursor |
+| `ts` | unix seconds of the capture |
+| `parts` | how many `screen.N` results follow |
+| `panel` | message id of the topic's newest /agent panel, or `null` when the bot hasn't sent one since it started |
+| `back` | history lines that lead the text, above the visible screen |
+| `history` | history lines the terminal holds in all; `back` = `history` means the top is reached |
+| `error` | only when nothing was captured (agent not running): `"unavailable"`, with `parts` 0 |
+| `truncated` | `true` only when even the visible screen didn't fit the parts and its bottom was cut (a huge pane full of colour); otherwise absent |
+
+**History.** `back=<N>` adds up to N lines from above the visible screen
+(at most 3000), followed by the visible screen itself, in one capture, so
+the two meet without a gap or a repeated line. An answer holds at most 49
+parts (about 190 KB); when the lines don't fit, the oldest are dropped and
+`back` says how many came. Ask for history when the user scrolls, not on
+every refresh. A program on the alternate screen (a full-screen TUI) has no
+history there: `history` is 0.
+
+**Panel keys.** The /agent panel's `kb:<key>:<window>` buttons still work as
+taps, but they re-render the panel photo on every press; a client drawing the
+screen itself uses `keys` instead.
+
+## Keys
+
+`keys <chat_id>:<thread_id> <seq> <token> … .` presses keys in the topic's
+terminal and answers with its screen right after, in one round trip. It is
+the only inline query that types into an agent. Same topic check,
+`ALLOWED_USERS`, `is_personal` and `cache_time=0` as `screen`; an inline query
+holds at most 256 characters, so split longer input over several queries.
+
+- `seq`: an integer that grows with every `keys` query for that topic. A
+  query whose `seq` isn't above the last one the bot saw sends nothing
+  (`stale`), so a query delivered twice or late never presses its keys again
+  or out of order. Start from a value that also grows across app restarts (a
+  millisecond timestamp); a `seq` more than a day ahead of the clock is
+  refused (`bad-key`) and not recorded. The bot keeps the last `seq` across
+  its own restarts, so resending an unanswered query with the same `seq` is
+  safe: if the first one got through, the resend is `stale`. Any other retry
+  takes a new `seq`. Keep one query in flight and coalesce taps made
+  meanwhile into the next.
+- Tokens, checked before anything is sent; one bad token sends nothing:
+  - key names (tmux): `Up` `Down` `Left` `Right` `Enter` `Escape` `Tab`
+    `BTab` (Shift+Tab) `BSpace` `DC` (Delete) `Space` `Home` `End` `PPage`
+    `NPage` `F1`…`F12` `C-a`…`C-y` `C-Space` `M-a`…`M-z`. No `C-z`: it
+    would suspend the agent back to the shell.
+  - text: `=` and the text percent-encoded as UTF-8 (`=yes%2C%20go`), typed
+    exactly (a trailing `;` included), no Enter implied. No control
+    characters (newline, ESC…).
+  - `Clear`: empty the input box, every line of it, wherever the cursor is.
+    The bot uses the CLI's own editing keys and checks the box afterwards;
+    it never interrupts a running turn (no Esc, no Ctrl-C). An empty box
+    counts as done. A CLI whose box the bot can't read answers
+    `unsupported` (Claude Code is supported).
+  - `.` ends the query and is required: a query cut short or half-typed
+    sends nothing.
+- `Enter`, `C-m`, `C-j`, `C-c`, `C-d` and `Clear` may only be the last key
+  of a query: after an Enter that quits the agent, text would land in the
+  shell and run as a host command.
+- The keys go only to a pane whose agent still holds its terminal, checked
+  under the pane's lock and again right before the last key. After an Enter
+  or Ctrl-C/Ctrl-D (from `keys`, the panel or a message) the next write to
+  that pane waits up to 1 s first, the time an agent that quits takes to let
+  go of the terminal.
+- Keys aren't meant to end the agent (Restart and End stay on the panel), so
+  those that visibly would are refused (`would-exit`). In Claude Code: an
+  Enter while the input box holds `/exit`, `/quit`, `/logout`, the start of
+  one (`/ex`, which Enter completes) or the bare word `exit`/`quit`; an Enter
+  while the slash menu highlights one of them; Enter or Esc on the
+  folder-trust gate while it would quit; a Ctrl-C/Ctrl-D while the agent
+  shows «again to exit». For other CLIs, an Enter after their exit command
+  typed in the same query. This is a screen reading, not a guarantee; the
+  terminal check above is the rule that holds.
+
+The answer is the `screen` answer of the visible screen (`back` 0) after the
+keys, with `seq` and `sent` (tokens actually sent) in the meta. The bot waits
+for the screen to change, up to 0.3 s, and answers at that cap anyway; the
+next `screen` poll catches a slower redraw. The panel photo is not touched.
+
+| `error` | Meaning | Sent |
+|---|---|---|
+| `bad-key` | a token not on the list, bad text, no `.`, a key after Enter/C-c/C-d/Clear, or a `seq` far ahead | nothing |
+| `stale` | `seq` not above the last one | nothing |
+| `not-running` | no agent in the pane (it quit, or a restart is under way) | the keys before it, if it quit mid-query |
+| `busy` | the bot is typing a message into that pane; retry with a new `seq` | nothing |
+| `would-exit` | the last key would end the agent | the keys before it |
+| `unsupported` | `Clear` on a CLI whose input box the bot can't read | the keys before it |
+| `unavailable` | the pane couldn't be read or written | `sent` says how many |
+
+Every answer carries the current screen when it can be read; when it can't,
+the meta comes alone with `parts` 0.
 
 ## Planned (same version, new sections)
 

@@ -429,7 +429,7 @@ class TestWakeDockerAgent:
     async def test_resumes_last_session_and_waits_for_the_tui(self):
         ok, revive = await self._wake(self._sm())
         assert ok is True
-        revive.assert_awaited_once_with(self.WID, session_id=NEWEST)
+        revive.assert_awaited_once_with(self.WID, session_id=NEWEST, only_if_down=True)
 
     async def test_running_agent_is_not_touched(self):
         ok, revive = await self._wake(self._sm(running=True))

@@ -28,7 +28,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from .utils import is_valid_session_id
+from .pane_screen import SCREEN_FORMAT, PaneScreen, parse_screen_output
+from .utils import is_valid_session_id, tmux_literal_args
 
 logger = logging.getLogger(__name__)
 
@@ -208,12 +209,38 @@ class DockerDriver:
             "-l",
             # `--` so text starting with "-" isn't eaten as tmux flags.
             "--",
-            chars,
+            *tmux_literal_args(chars),
         ]
         rc, _, stderr = await self._run(argv)
         if rc != 0:
             logger.error(
                 "docker send-keys literal failed (container=%s): %s",
+                container,
+                stderr.decode(errors="replace").strip(),
+            )
+            return False
+        return True
+
+    async def send_key_batch(
+        self,
+        container: str,
+        items: list[tuple[str, bool]],
+        session: str | None = None,
+    ) -> bool:
+        """``tmux_manager.send_key_batch`` inside the container: one exec."""
+        target = self._pane_target(session)
+        cmds: list[str] = []
+        for key, literal in items:
+            if cmds:
+                cmds.append(";")
+            cmds += ["send-keys", "-t", target]
+            cmds += ["-l", "--", *tmux_literal_args(key)] if literal else [key]
+        if not cmds:
+            return True
+        rc, _, stderr = await self._run(self._exec_prefix(container) + ["tmux", *cmds])
+        if rc != 0:
+            logger.error(
+                "docker send-keys batch failed (container=%s): %s",
                 container,
                 stderr.decode(errors="replace").strip(),
             )
@@ -497,6 +524,36 @@ class DockerDriver:
             log("docker capture-pane failed (container=%s): %s", container, err)
             return None
         return stdout.decode("utf-8", errors="replace")
+
+    async def capture_screen(
+        self,
+        container: str,
+        back: int = 0,
+        session: str | None = None,
+        window: str | None = None,
+    ) -> PaneScreen | None:
+        """``tmux_manager.capture_screen`` inside the container: one exec."""
+        target = self._pane_target(session, window)
+        argv = self._exec_prefix(container) + [
+            "tmux",
+            "capture-pane",
+            "-p",
+            "-e",
+            "-t",
+            target,
+        ]
+        if back > 0:
+            argv += ["-S", f"-{back}"]
+        argv += [";", "display-message", "-p", "-t", target, SCREEN_FORMAT]
+        rc, stdout, stderr = await self._run(argv)
+        if rc != 0:
+            logger.debug(
+                "docker screen capture failed (container=%s): %s",
+                container,
+                stderr.decode(errors="replace").strip(),
+            )
+            return None
+        return parse_screen_output(stdout.decode("utf-8", errors="replace"))
 
 
 docker_driver = DockerDriver()

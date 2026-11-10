@@ -16,6 +16,14 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   their own screen — [docs/agent-status-format.md](docs/agent-status-format.md).
   A docker agent signed in to the host's account shows them too, once
   `DOCKER_AGENT_<NAME>_HOST_ACCOUNT=true` says so.
+- **The agent's terminal as text** for apps that draw it themselves: the
+  inline query `screen <chat_id>:<thread_id>` returns what the /agent photo
+  shows (colours, cursor, size), and `back=<N>` adds history above it.
+  Format in [docs/agent-status-format.md](docs/agent-status-format.md#screen).
+  The inline query `keys` presses keys there (or `Clear`s the input box) and
+  answers with the screen after them, in one round trip; keys go only to a
+  pane whose agent holds its terminal
+  ([format](docs/agent-status-format.md#keys)).
 - **`/mode`** shows the agent's permission mode; `/mode plan` (or `manual`,
   `accept_edits`, `auto`) switches it.
 
@@ -41,6 +49,36 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   later. tmux is driven through its CLI with short formats accepted only
   whole (libtmux dropped), and a live window that lost its topic goes back to
   it instead of being killed.
+- 🔄 and `/restart` no longer stop an agent's background work without asking.
+  Claude Code asks before quitting while shells or scheduled tasks run, with
+  «Exit and stop tasks» preselected, and the restart used to press Enter
+  there. It now cancels, lists that work in the topic and restarts only after
+  «Restart and stop it». A restart that can't quit the agent no longer types
+  the relaunch into it.
+- A message to an agent that has quit (its window back at the shell) is no
+  longer typed into the shell, where it would run as a command; the bot says
+  so and points to `/restart`.
+- A restart waits its turn safely: it refuses while the agent waits in a
+  dialog (Enter would pick the highlighted answer), clears a leftover draft
+  before `/exit`, refuses a second tap, and holds the agent's input until
+  the new CLI is up, so a message can't land in the shell in between.
+- An agent that dies right after an automatic revive is revived once per
+  10 minutes instead of in a loop, and a session with no transcript to
+  resume restarts clean instead of failing on `--resume`.
+- Container agents: 🔄 and `/restart` check for a running turn, a dialog and
+  background shells first; an old ▶️/🆕 offer no longer restarts an agent
+  that is already back; `/kill` keeps the topic's binding like ⏹; a restart
+  in progress is no longer mistaken for a dead sibling and revived over; a
+  message that wakes an agent no longer answers its resume dialog.
+- Text that ended in `;` lost it on the way to the agent: tmux read the
+  trailing semicolon as its own command separator. Messages, chunks and keys
+  are now typed exactly.
+- The panel's «Wipe input» and the draft cleanup before a restart erased only
+  up to the cursor, and a fresh session's input box (near the top of an empty
+  screen) wasn't found at all; a leftover draft could ride along with the
+  restart's `/exit` as a prompt. The box is now emptied whole and checked.
+- A restart no longer types `/exit` into a pane whose agent already quit, and
+  refuses rather than types when it can't read the pane.
 - A long message (3800+ characters) that arrived as a single piece was lost:
   the bot held it for a second in case Telegram had split it, then cancelled
   its own delivery without a trace. It now reaches the agent.

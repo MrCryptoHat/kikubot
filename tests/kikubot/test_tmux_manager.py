@@ -214,3 +214,28 @@ class TestOnRealTmux:
         tmux, manager, _ = tmux_server
         await manager.ensure_session_pane_size(120, 40)
         assert tmux("display", "-p", "-t", "t:agent", "#{window_width}") == "120\n"
+
+    async def test_capture_screen_with_history(self, tmux_server, tmp_path) -> None:
+        tmux, manager, signal = tmux_server
+        ok, _, _, wid = await manager.create_window(
+            str(tmp_path), window_name="scr", start_claude=False
+        )
+        assert ok
+        assert await manager.send_keys(wid, f"seq 1 300; {signal} done", enter=False)
+        assert await manager.send_keys(wid, "", enter=True, literal=False)
+        tmux("wait-for", "done")
+        rows = int(tmux("display", "-p", "-t", wid, "#{pane_height}"))
+        cols = int(tmux("display", "-p", "-t", wid, "#{pane_width}"))
+
+        screen = await manager.capture_screen(wid)
+        assert screen is not None
+        assert (screen.cols, screen.rows, screen.back) == (cols, rows, 0)
+        assert screen.history > 0 and screen.cursor is not None
+        assert screen.text.count("\n") == rows and screen.text.endswith("\n")
+
+        deep = await manager.capture_screen(wid, back=40)
+        assert deep is not None and deep.back == 40
+        lines = deep.text.split("\n")[:-1]
+        assert len(lines) == 40 + rows
+        assert lines[40:] == screen.text.split("\n")[:-1]
+        assert await manager.capture_screen("@99999") is None

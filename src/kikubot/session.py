@@ -30,7 +30,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from typing import Any, Literal, TypeAlias, TypeVar
 
 import aiofiles
@@ -43,7 +43,9 @@ from .docker_driver import (
     docker_driver,
     sub_tmux_session,
 )
-from .runtimes import get_runtime
+from .pane_screen import PaneScreen
+from .runtimes import AgentRuntime, get_runtime
+from .terminal_keys import CLEAR_KEY, EXIT_KEYS, FINAL_KEYS, KeyToken, exit_armed
 from .tmux_manager import TmuxReadError, tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import (
@@ -81,6 +83,10 @@ MENU_KEYBOARD_VERSION = 3
 # Sent back when tmux couldn't be read: the window may well be alive, so this
 # must not read as "the agent is gone".
 TMUX_UNREADABLE = "Couldn't reach the agent's terminal just now. Please try again."
+AGENT_NOT_RUNNING = (
+    "The agent isn't running in its window, so the message was not sent. "
+    "Bring it back with /restart."
+)
 
 # Binding-value grammar for containers: "docker:<agent>" (the agent's own
 # long-lived session) and "docker:<agent>/<slug>" (a kikubot-created sub-agent
@@ -172,6 +178,22 @@ _MACHINE_TEXT_PREFIXES = (
 def _is_machine_user_text(text: str) -> bool:
     """True if this "user" message is plumbing rather than something typed."""
     return text.lstrip().lower().startswith(_MACHINE_TEXT_PREFIXES)
+
+
+# Settle after a key that can end the CLI, before the next pane write.
+FINAL_SETTLE_SEC = 1.0
+_TEXT_ENTER_GAP = 0.06
+CLEAR_PASSES = 3
+_CLEAR_REDRAW_SEC = 0.12
+
+
+@dataclass(frozen=True)
+class _KeyWriter:
+    """One resolved pane (tmux window or docker session) for a key sequence."""
+
+    send: Callable[[list[tuple[str, bool]]], Awaitable[bool]]
+    capture: Callable[[], Awaitable[str | None]]
+    running: Callable[[], Awaitable[bool]]
 
 
 @dataclass
@@ -288,6 +310,11 @@ class SessionManager:
     # handlers, media, reaction confirm, restart
     # sequences — would otherwise interleave inside one prompt. Runtime-only.
     _send_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    # binding -> monotonic time of the last key that can end the CLI (Enter,
+    # Ctrl-C/D). An agent that quits takes 0.5–2 s to let go of its terminal,
+    # and keys typed meanwhile wait in the tty for the shell; the next writer
+    # waits FINAL_SETTLE_SEC out before its agent-running check.
+    _final_key_at: dict[str, float] = field(default_factory=dict)
     # Live-dashboard message_ids per docker-agent (agent_name → telegram
     # message_id in the shared LIVE_DASHBOARD_THREAD_ID topic). Persisted
     # so a bot restart edits the existing message instead of leaving a
@@ -2493,6 +2520,7 @@ class SessionManager:
         )
 
         async with self.send_lock(window_id):
+            await self._settle_after_final(window_id)
             if self._is_docker_binding(window_id):
                 if not config.docker_agents_enabled:
                     return False, "Docker agents disabled in config"
@@ -2515,8 +2543,15 @@ class SessionManager:
                     return False, TMUX_UNREADABLE
                 if not window:
                     return False, "Window not found (may have been closed)"
+                # The agent quit (crashed, a restart that didn't relaunch, the
+                # dead-window reaper's grace): its pane is a shell now, and
+                # text typed there would run as a command on the host.
+                if not await tmux_manager.is_agent_running(window):
+                    return False, AGENT_NOT_RUNNING
                 if not await tmux_manager.send_keys(window.window_id, text):
                     return False, "Failed to send keys"
+            # Its Enter can end the CLI (a message "/exit").
+            self._final_key_at[window_id] = time.monotonic()
             if not await self._confirm_submitted(window_id, text):
                 return False, UNSENT_IN_COMPOSER
             self.mark_generating(window_id)
@@ -2542,10 +2577,175 @@ class SessionManager:
         interleaving the lock exists to prevent. Single key presses
         hold it for one tmux round-trip — uncontended cost is nil.
         """
+        final = enter or (not literal and keys in FINAL_KEYS)
         async with self.send_lock(binding_value):
-            return await self._send_keys_unlocked(
+            await self._settle_after_final(binding_value)
+            ok = await self._send_keys_unlocked(
                 binding_value, keys, enter=enter, literal=literal
             )
+            if ok and final:
+                self._final_key_at[binding_value] = time.monotonic()
+            return ok
+
+    async def send_key_tokens(
+        self, binding_value: str, tokens: list[KeyToken], *, lock_wait: float = 2.0
+    ) -> tuple[int, str | None]:
+        """Send the inline ``keys`` query's checked tokens, in order.
+
+        Returns ``(sent, error)``. Everything runs under one hold of the send
+        lock, so nothing interleaves; a lock still held after ``lock_wait``
+        (a long message being typed) answers ``busy`` rather than letting the
+        inline answer time out. The agent must hold its terminal (else
+        ``not-running``: keys would reach the shell), checked after the settle
+        that follows a recent Enter/Ctrl-C and again right before the last
+        key. Keys that would end the CLI are refused (``would-exit``): Esc on
+        a gate that quits on cancel, a last Enter on a typed or highlighted
+        exit command, a Ctrl-C/Ctrl-D the CLI asks for a second time to quit.
+        A screen that can't be read refuses rather than sending blind. The
+        keys before the last go in one tmux (or docker) call.
+        """
+        lock = self.send_lock(binding_value)
+        try:
+            await asyncio.wait_for(lock.acquire(), lock_wait)
+        except TimeoutError:
+            return 0, "busy"
+        try:
+            return await self._send_key_tokens_locked(binding_value, tokens)
+        finally:
+            lock.release()
+
+    async def _send_key_tokens_locked(
+        self, binding_value: str, tokens: list[KeyToken]
+    ) -> tuple[int, str | None]:
+        writer = await self._key_writer(binding_value)
+        if writer is None:
+            return 0, "not-running"
+        await self._settle_after_final(binding_value)
+        if not await writer.running():
+            return 0, "not-running"
+        rt = get_runtime(self.window_runtime(binding_value))
+        last = tokens[-1]
+        final = not last.literal and last.key in (FINAL_KEYS | {CLEAR_KEY})
+        body = tokens[:-1] if final else tokens
+        if any(not t.literal and t.key == "Escape" for t in body):
+            pane = await writer.capture()
+            if pane is None:
+                return 0, "unavailable"
+            if rt.would_exit_on_escape(pane):
+                return 0, "would-exit"
+        if body and not await writer.send([(t.key, t.literal) for t in body]):
+            return 0, "unavailable"
+        sent = len(body)
+        if not final:
+            return sent, None
+        if last.key == CLEAR_KEY:
+            cleared = await self._clear_input_with(writer, rt)
+            if cleared is None:
+                return sent, "unsupported"
+            return (sent + 1, None) if cleared else (sent, "unavailable")
+        if any(t.literal for t in body):
+            # Text and the Enter in one burst read as a paste: the Enter
+            # becomes a newline instead of submitting.
+            await asyncio.sleep(_TEXT_ENTER_GAP)
+        pane = await writer.capture()
+        if pane is None or not await writer.running():
+            return sent, "unavailable" if pane is None else "not-running"
+        exit_cmd = rt.exit_command().lower()
+        typed_exit = any(
+            t.literal and t.key.strip().lower().startswith(exit_cmd) for t in body
+        )
+        if (last.key in EXIT_KEYS and exit_armed(pane)) or (
+            last.key not in EXIT_KEYS and (typed_exit or rt.would_exit_on_enter(pane))
+        ):
+            return sent, "would-exit"
+        if not await writer.send([(last.key, False)]):
+            return sent, "unavailable"
+        self._final_key_at[binding_value] = time.monotonic()
+        return sent + 1, None
+
+    async def _settle_after_final(self, binding_value: str) -> None:
+        """Wait out FINAL_SETTLE_SEC since this pane's last Enter/Ctrl-C/D."""
+        last = self._final_key_at.get(binding_value)
+        if last is not None:
+            left = FINAL_SETTLE_SEC - (time.monotonic() - last)
+            if left > 0:
+                await asyncio.sleep(left)
+
+    async def _key_writer(self, binding_value: str) -> _KeyWriter | None:
+        """The pane to type into, resolved once; None if there is none."""
+        if self._is_docker_binding(binding_value):
+            target = (
+                self.resolve_docker_target(binding_value)
+                if config.docker_agents_enabled
+                else None
+            )
+            if target is None:
+                return None
+            container, session = target.agent.container, target.tmux_session
+
+            async def d_send(items: list[tuple[str, bool]]) -> bool:
+                return await docker_driver.send_key_batch(container, items, session)
+
+            async def d_capture() -> str | None:
+                return await docker_driver.capture_pane(
+                    container, with_ansi=True, session=session
+                )
+
+            async def d_running() -> bool:
+                return await self.docker_agent_running(binding_value)
+
+            return _KeyWriter(d_send, d_capture, d_running)
+        try:
+            window = await tmux_manager.find_window_by_id(binding_value)
+        except TmuxReadError:
+            return None
+        if window is None:
+            return None
+        wid = window.window_id
+
+        async def t_send(items: list[tuple[str, bool]]) -> bool:
+            return await tmux_manager.send_key_batch(wid, items)
+
+        async def t_capture() -> str | None:
+            return await tmux_manager.capture_pane(wid, with_ansi=True)
+
+        async def t_running() -> bool:
+            return await tmux_manager.is_agent_running(window)
+
+        return _KeyWriter(t_send, t_capture, t_running)
+
+    async def clear_input(self, binding_value: str) -> bool | None:
+        """Empty the agent's input box without touching a running turn.
+
+        The caller holds the send lock. True once the box reads empty, False
+        if it couldn't be emptied or read, None when the CLI's box can't be
+        read or has no known way to clear (the caller then must not act as if
+        it were empty).
+        """
+        writer = await self._key_writer(binding_value)
+        if writer is None:
+            return False
+        rt = get_runtime(self.window_runtime(binding_value))
+        return await self._clear_input_with(writer, rt)
+
+    async def _clear_input_with(
+        self, writer: _KeyWriter, rt: AgentRuntime
+    ) -> bool | None:
+        for _ in range(CLEAR_PASSES):
+            pane = await writer.capture()
+            if pane is None:
+                return False
+            typed = rt.typed_input(pane)
+            if typed is None:
+                return None
+            if not typed:
+                return True
+            keys = rt.clear_input_pass(pane)
+            if not keys or not await writer.send([(k, False) for k in keys]):
+                return None if not keys else False
+            await asyncio.sleep(_CLEAR_REDRAW_SEC)
+        pane = await writer.capture()
+        return pane is not None and rt.typed_input(pane) == ""
 
     async def _send_keys_unlocked(
         self, binding_value: str, keys: str, *, enter: bool, literal: bool
@@ -2712,6 +2912,28 @@ class SessionManager:
             with_ansi=with_ansi,
             scrollback_lines=scrollback_lines,
         )
+
+    async def capture_screen(
+        self, binding_value: str, *, back: int = 0
+    ) -> PaneScreen | None:
+        """The bound agent's pane with cursor and size (inline ``screen``).
+
+        One tmux (or docker exec) call and no lookup first: a client polls it
+        every second, and a capture of a window or session that's gone just
+        fails, which is the answer.
+        """
+        if self._is_docker_binding(binding_value):
+            if not config.docker_agents_enabled:
+                return None
+            target = self.resolve_docker_target(binding_value)
+            if not target:
+                return None
+            return await docker_driver.capture_screen(
+                target.agent.container, back=back, session=target.tmux_session
+            )
+        if not self._is_window_id(binding_value):
+            return None
+        return await tmux_manager.capture_screen(binding_value, back=back)
 
     async def kill_agent(self, binding_value: str) -> bool:
         """Kill the bound agent.

@@ -53,6 +53,7 @@ from . import quiet_turn
 from .agent_restart import (
     ReviveError,
     docker_revive_options,
+    is_restarting,
     offer_docker_revive,
     revive_docker_agent,
 )
@@ -152,6 +153,8 @@ _sibling_down_seen: dict[str, bool] = {}
 # right after launch falls back to the offer instead of a relaunch loop.
 _auto_revive_tried: dict[str, float] = {}
 AUTO_REVIVE_RETRY = 600.0  # seconds
+# The same for host windows, keyed by topic: each revive makes a new window id.
+_dead_revive_tried: dict[tuple[int, int], float] = {}
 
 
 async def _auto_revive_sibling(window_id: str) -> bool:
@@ -170,7 +173,9 @@ async def _auto_revive_sibling(window_id: str) -> bool:
     if last is None:
         return False
     try:
-        await revive_docker_agent(window_id, session_id=last.session_id)
+        await revive_docker_agent(
+            window_id, session_id=last.session_id, only_if_down=True
+        )
     except ReviveError as e:
         logger.info("Auto-resume of %s failed: %s", window_id, e.key)
         return False
@@ -195,6 +200,18 @@ async def _revive_dead_window(bot: Bot, window_id: str, display: str) -> bool:
     for uid, tid, wid in list(session_manager.iter_thread_bindings()):
         if wid != window_id:
             continue
+        # An agent that dies right after launch would otherwise be revived
+        # every grace period forever; the second death closes the topic's
+        # window the usual way instead.
+        now = time.monotonic()
+        for key, at in list(_dead_revive_tried.items()):
+            if now - at >= AUTO_REVIVE_RETRY:
+                del _dead_revive_tried[key]  # past its window: nothing to cap
+        last = _dead_revive_tried.get((uid, tid), -AUTO_REVIVE_RETRY)
+        if now - last < AUTO_REVIVE_RETRY:
+            logger.warning("Dead window %s died again soon after a revive", display)
+            return False
+        _dead_revive_tried[(uid, tid)] = now
         try:
             new_wid, _ = await revive_topic_agent(uid, tid)
         except Exception as e:  # noqa: BLE001 — fall back to the old close path
@@ -225,6 +242,10 @@ async def _notify_dead_sibling(
     restarting there is nothing to say yet.
     """
     if not session_manager.is_docker_sub_agent(window_id):
+        return
+    # A restart kills the session before starting it again: that gap is not
+    # a death, and a revive from here would put the old session back.
+    if is_restarting(window_id) or session_manager.send_lock(window_id).locked():
         return
     if await session_manager.docker_agent_running(window_id):
         _sibling_down_seen.pop(window_id, None)  # alive again — re-arm

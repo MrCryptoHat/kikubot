@@ -7,6 +7,8 @@ on its next 1s tick.
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncio
+
 import pytest
 
 from kikubot.handlers.status_polling import update_status_message
@@ -252,6 +254,7 @@ class TestDeadSiblingIsQuiet:
         sm = MagicMock()
         sm.is_docker_sub_agent.return_value = True
         sm.docker_agent_running = AsyncMock(return_value=False)
+        sm.send_lock.return_value = asyncio.Lock()  # no restart in progress
         sm.stopped_docker_agents = {self.WID} if stopped else set()
         sm.resolve_docker_target.return_value = SimpleNamespace(
             agent=SimpleNamespace(container="ctn")
@@ -278,7 +281,18 @@ class TestDeadSiblingIsQuiet:
     async def test_died_with_container_is_revived_silently(self, monkeypatch):
         sp, revive, offer = self._patch(monkeypatch)
         await sp._notify_dead_sibling(MagicMock(), self.WID, 7, 1)
-        revive.assert_awaited_once_with(self.WID, session_id="s1")
+        revive.assert_awaited_once_with(self.WID, session_id="s1", only_if_down=True)
+        offer.assert_not_awaited()
+
+    async def test_a_restart_in_progress_is_not_a_death(self, monkeypatch):
+        # 🔄 kills the session, then starts it: in that gap the poll used to
+        # revive the OLD session over the one being started.
+        sp, revive, offer = self._patch(monkeypatch)
+        lock = asyncio.Lock()
+        await lock.acquire()
+        sp.session_manager.send_lock.return_value = lock
+        await sp._notify_dead_sibling(MagicMock(), self.WID, 7, 1)
+        revive.assert_not_awaited()
         offer.assert_not_awaited()
 
     async def test_user_stopped_stays_down_and_quiet(self, monkeypatch):
@@ -303,6 +317,31 @@ class TestDeadSiblingIsQuiet:
 class TestReviveDeadWindow:
     """KIKUBOT_AUTO_RESUME_AGENTS: a topic agent whose claude exited comes back
     on its own session instead of the topic being closed."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_tries(self):
+        from kikubot.handlers import status_polling as sp
+
+        sp._dead_revive_tried.clear()
+        yield
+        sp._dead_revive_tried.clear()
+
+    async def test_an_agent_that_dies_again_soon_is_not_revived_again(
+        self, monkeypatch
+    ):
+        from kikubot.handlers import agent_restart
+        from kikubot.handlers import status_polling as sp
+
+        sm = MagicMock()
+        sm.iter_thread_bindings.return_value = [(1, 42, "@7")]
+        monkeypatch.setattr(sp, "session_manager", sm)
+        revive = AsyncMock(return_value=("@9", "proj-x"))
+        monkeypatch.setattr(agent_restart, "revive_topic_agent", revive)
+        assert await sp._revive_dead_window(MagicMock(), "@7", "x") is True
+        # The revived window (a new id, same topic) dies within the cap.
+        sm.iter_thread_bindings.return_value = [(1, 42, "@9")]
+        assert await sp._revive_dead_window(MagicMock(), "@9", "x") is False
+        revive.assert_awaited_once()
 
     async def test_bound_window_is_revived(self, monkeypatch):
         from kikubot.handlers import agent_restart

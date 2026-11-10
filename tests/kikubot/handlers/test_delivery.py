@@ -86,6 +86,33 @@ class TestDeliverUserText:
             assert (status, detail) == ("error", "Window not found")
 
 
+class TestWakeThenGuard:
+    """A message to a stopped container agent wakes it and is delivered. The
+    widget guard had read the DEAD pane; a resumed big session can open on
+    the resume dialog, whose preselect a blind Enter takes."""
+
+    @pytest.mark.asyncio
+    async def test_widget_on_the_woken_pane_blocks_the_send(self):
+        route = AsyncMock(
+            side_effect=[(False, None), (False, "blocking_widget:ResumePrompt")]
+        )
+        with (
+            patch("kikubot.handlers.delivery.try_route_to_text_option", new=route),
+            patch("kikubot.handlers.delivery.session_manager") as sm,
+            patch("kikubot.handlers.delivery.config") as cfg,
+            patch(
+                "kikubot.handlers.agent_restart.wake_docker_agent",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            cfg.auto_resume_agents = True
+            sm.consume_voice_directive = MagicMock(return_value=None)
+            sm.send_to_window = AsyncMock(return_value=(False, "no session"))
+            status, detail = await deliver_user_text(1, 42, "docker:a", "привет")
+        assert (status, detail) == ("blocked_widget", "ResumePrompt")
+        assert sm.send_to_window.await_count == 1  # never typed into the dialog
+
+
 class TestForwardPendingText:
     """The topic's stashed first message goes through the same guard as every
     other message. It didn't use to: the bare send_to_window typed it — plus

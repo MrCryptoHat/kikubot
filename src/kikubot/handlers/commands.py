@@ -661,6 +661,15 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update.message, tr("commands.no_session_in_topic"))
         return
 
+    from .agent_restart import is_restarting
+
+    if is_restarting(wid):
+        # Its keys would land on the relaunch line or the booting CLI.
+        await safe_reply(
+            update.message,
+            tr("restart.in_progress", name=session_manager.get_display_name(wid)),
+        )
+        return
     keys = get_runtime(session_manager.window_runtime(wid)).interrupt_keys
     if session_manager._is_docker_binding(wid):
         target = session_manager.resolve_docker_target(wid)
@@ -715,21 +724,18 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     display = session_manager.get_display_name(wid)
     if session_manager._is_docker_binding(wid):
-        # For docker we kill the tmux session inside the container (Claude
-        # dies with it). The container itself stays up — you'd use
-        # `docker compose stop` for that. /restart re-spawns the session.
-        target = session_manager.resolve_docker_target(wid)
-        if target and await docker_driver.is_container_alive(target.agent.container):
-            await docker_driver.kill_session(
-                target.agent.container, session=target.tmux_session
-            )
-            logger.info(
-                "Kill command: killed tmux session %s in %s (user=%d, thread=%d)",
-                target.tmux_session,
-                target.agent.container,
-                user.id,
-                thread_id,
-            )
+        # The same deliberate stop as the panel's ⏹: the in-container session
+        # ends, the stop is recorded (auto-resume leaves it down), and the
+        # topic keeps its binding, so /restart or a message brings it back.
+        # Unbinding here stranded the topic: nothing could restart it.
+        if not await session_manager.stop_docker_agent(wid):
+            await safe_reply(update.message, tr("cb.kill_failed"))
+            return
+        logger.info(
+            "Kill command: stopped %s (user=%d, thread=%d)", wid, user.id, thread_id
+        )
+        await safe_reply(update.message, tr("cb.session_ended_docker", display=display))
+        return
     else:
         w = await tmux_manager.find_window_by_id(wid)
         if w:
@@ -1636,6 +1642,8 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pane_cache.set_file_id(pane_h, sent.photo[-1].file_id)
     if sent:
         pane_cache.set_hash(sent.message_id, pane_h)
+        if thread_id is not None:
+            pane_cache.note_panel(user.id, thread_id, sent.message_id)
 
 
 async def _revive_and_report(msg: Message, user_id: int, thread_id: int) -> bool:
@@ -1730,19 +1738,17 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     ws = session_manager.get_window_state(target_wid)
     session_id = ws.session_id if ws else ""
 
-    if not session_manager._is_docker_binding(target_wid):
-        # The tmux restart types /exit + the relaunch command into the
-        # pane — on a busy agent both would land in Claude's prompt as
-        # text (and the success check would still pass, since the
-        # process never exited). Docker restart kills the tmux session
-        # outright, so it doesn't need this guard.
-        pane = await tmux_manager.capture_pane(target_wid)
-        if pane and session_manager.is_agent_working(target_wid, pane):
-            await safe_reply(
-                update.message,
-                tr("commands.restart_busy", name=agent_name),
-            )
-            return
+    # /exit and its Enter are typed into a tmux pane (a busy agent takes them
+    # as a prompt, a dialog as its highlighted answer); a docker restart kills
+    # the session outright, with whatever runs in the background.
+    from .agent_restart import restart_precheck
+    from .agent_restart import restart_refused as refused_text
+
+    blocked = await restart_precheck(target_wid)
+    if blocked is not None:
+        text, keyboard = refused_text(target_wid, blocked, fresh=False)
+        await safe_reply(update.message, text, reply_markup=keyboard)
+        return
 
     await safe_reply(update.message, tr("commands.restarting", name=agent_name))
 
@@ -1753,24 +1759,18 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ):
             await safe_reply(update.message, tr("commands.container_not_running"))
             return
-        # send_lock: no other writer may type into the pane mid-restart.
-        async with session_manager.send_lock(target_wid):
-            await docker_driver.kill_session(
-                target.agent.container, session=target.tmux_session
-            )
-            await asyncio.sleep(1)
-            started = await session_manager.start_docker_agent(
-                target_wid,
-                resume_session_id=session_id or None,
-                cwd=ws.cwd or "/workspace",
-            )
+        from .agent_restart import restart_docker_agent
+        from .callbacks import _wait_pane_ready
+
+        started = await restart_docker_agent(
+            target_wid, session_id or None, _wait_pane_ready
+        )
         if not started:
             await safe_reply(
                 update.message,
                 tr("commands.restart_no_tmux", name=agent_name),
             )
             return
-        await asyncio.sleep(5)
         if await docker_driver.has_session(
             target.agent.container, session=target.tmux_session
         ):
@@ -1792,28 +1792,18 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await safe_reply(update.message, tr("commands.window_gone", name=agent_name))
         return
 
-    # Runtime-aware exit + relaunch (claude: /exit → `claude --name…`; codex:
-    # /quit → `codex [resume …]`). launch_command validates/quotes and knows
-    # each CLI's resume flag, so no per-runtime branch here.
-    from .callbacks import _wait_agent_exited
+    from .agent_restart import restart_refused
+    from .callbacks import _relaunch_tmux_agent
 
-    runtime = get_runtime(ws.runtime if ws else None)
-    # send_lock across exit → relaunch: anything typed into the pane in the gap
-    # would land in bash, not the agent.
-    async with session_manager.send_lock(target_wid):
-        await tmux_manager.send_keys(target_window.window_id, runtime.exit_command())
-        # Wait for the real exit before the relaunch — a blind sleep raced a
-        # swallowed /exit-Enter and typed the launch onto a lingering «/exit»
-        # («/exitclaude …»). Fallback Enter flushes it, then proceed fail-visible.
-        if not await _wait_agent_exited(target_wid):
-            await tmux_manager.send_keys(
-                target_window.window_id, "Enter", enter=False, literal=False
-            )
-            await _wait_agent_exited(target_wid, timeout=5.0)
-        cmd = runtime.launch_command(target_window.window_name, session_id or None)
-        await tmux_manager.send_keys(target_window.window_id, cmd)
+    result = await _relaunch_tmux_agent(
+        target_window.window_id, target_window.window_name, session_id or None
+    )
+    if not result.exited:
+        text, keyboard = restart_refused(target_wid, result, fresh=False)
+        await safe_reply(update.message, text, reply_markup=keyboard)
+        return
 
-    await asyncio.sleep(8)
+    # The relaunch already waited for the new CLI's input box.
     w = await tmux_manager.find_window_by_id(target_window.window_id)
     if w and await tmux_manager.is_agent_running(w):
         await safe_reply(update.message, tr("commands.restarted", name=agent_name))

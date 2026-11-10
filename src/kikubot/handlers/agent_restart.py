@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -37,9 +40,17 @@ from ..agent_session import AgentSession
 from ..i18n import tr
 from ..runtimes import AgentRuntime, default_runtime, get_runtime
 from ..session import session_manager
-from ..tmux_manager import tmux_manager
+from ..terminal_parser import is_interactive_ui
+from ..tmux_manager import TmuxReadError, tmux_manager
 from ..utils import is_valid_session_id
-from .callback_data import CB_DVR_BACK, CB_DVR_FRESH, CB_DVR_LIST, CB_DVR_RESUME
+from .callback_data import (
+    CALLBACK_WID_MAX,
+    CB_CMD_RESTART_STOP,
+    CB_DVR_BACK,
+    CB_DVR_FRESH,
+    CB_DVR_LIST,
+    CB_DVR_RESUME,
+)
 from .message_sender import safe_send
 
 logger = logging.getLogger(__name__)
@@ -52,6 +63,272 @@ class ReviveError(Exception):
         super().__init__(key)
         self.key = key
         self.fmt = fmt
+
+
+EXIT_WAIT_SEC = 10.0
+EXIT_FLUSH_WAIT_SEC = 5.0
+_POLL_SEC = 0.3
+
+# Windows a restart is working on, from the first check to the new CLI's
+# input box. A second tap is refused instead of queueing a second restart
+# behind the send lock, and /esc keeps its Ctrl-C off a half-typed relaunch.
+_restarting: set[str] = set()
+
+
+def is_restarting(window_id: str) -> bool:
+    return window_id in _restarting
+
+
+@dataclass(frozen=True)
+class ExitResult:
+    """How a restart's exit ended."""
+
+    exited: bool
+    # Set when the CLI asked about running work and the exit was cancelled:
+    # what it listed. Nothing was stopped.
+    background: tuple[str, ...] = ()
+    # Why nothing was typed at all: "busy", "dialog" or "restarting".
+    refused: str = ""
+
+
+def restart_blocker(window_id: str, pane: str | None) -> str:
+    """Why a tmux window can't be restarted right now ("" = it can).
+
+    The exit command and its Enter are typed into the pane: in a running turn
+    they'd become a prompt, and in a dialog Enter takes the preselected
+    option (approve the tool, accept the plan).
+    """
+    if window_id in _restarting:
+        return "restarting"
+    return _pane_blocker(window_id, pane)
+
+
+def _pane_blocker(window_id: str, pane: str | None) -> str:
+    if pane is None:
+        # A docker agent with no pane is down, which is what a restart fixes.
+        # A tmux pane that can't be read could hide a turn or a dialog: what
+        # we'd type is not to be guessed.
+        return "" if session_manager._is_docker_binding(window_id) else "unreadable"
+    if session_manager.is_agent_working(window_id, pane):
+        return "busy"
+    if is_interactive_ui(pane):
+        return "dialog"
+    return ""
+
+
+async def restart_precheck(window_id: str) -> ExitResult | None:
+    """Why the agent can't be restarted right now, or None if it can.
+
+    Both transports. A docker restart kills the in-container session
+    outright, with no exit question to read, so the footer's count of
+    background shells is what it has to go on.
+    """
+    pane = await session_manager.capture_pane(window_id)
+    blocker = restart_blocker(window_id, pane)
+    if blocker:
+        return ExitResult(False, refused=blocker)
+    if pane and session_manager._is_docker_binding(window_id):
+        rt = get_runtime(session_manager.window_runtime(window_id))
+        shells = rt.background_shells(pane)
+        if shells:
+            return ExitResult(False, (tr("restart.background_shells", n=shells),))
+    return None
+
+
+async def restart_docker_agent(
+    window_id: str,
+    resume_id: str | None,
+    wait_ready: Callable[[str], Awaitable[None]] | None = None,
+) -> bool:
+    """Kill a docker binding's in-container session and start it again.
+
+    Held under the send lock up to the new CLI's input box (``wait_ready``),
+    and marked as restarting, so the dead-sibling poll doesn't take the
+    gap between kill and start for a death and revive the old session over
+    the new one. With no session to continue (🆕, or one emptied by /clear)
+    the new one gets a kikubot-pinned id, as a sibling needs to stay
+    trackable. True iff it started.
+    """
+    from ..docker_driver import docker_driver
+
+    target = session_manager.resolve_docker_target(window_id)
+    if target is None or window_id in _restarting:
+        return False
+    _restarting.add(window_id)
+    try:
+        async with session_manager.send_lock(window_id):
+            await docker_driver.kill_session(
+                target.agent.container, session=target.tmux_session
+            )
+            await asyncio.sleep(1)
+            started = await session_manager.start_docker_agent(
+                window_id,
+                resume_session_id=resume_id or None,
+                new_session_id=None if resume_id else str(uuid.uuid4()),
+                cwd=session_manager.get_window_state(window_id).cwd or "/workspace",
+            )
+            if started and wait_ready is not None:
+                await wait_ready(window_id)
+            return started
+    finally:
+        _restarting.discard(window_id)
+
+
+async def _press(window_id: str, key: str) -> None:
+    await tmux_manager.send_keys(window_id, key, enter=False, literal=False)
+
+
+async def _agent_state(window_id: str) -> tuple[bool | None, str]:
+    """(agent still running, pane); running is None when tmux can't be read."""
+    try:
+        w = await tmux_manager.find_window_by_id(window_id)
+    except TmuxReadError:
+        return None, ""
+    if w is None:
+        return None, ""
+    running = await tmux_manager.is_agent_running(w)
+    return running, (await tmux_manager.capture_pane(window_id) or "")
+
+
+async def exit_for_relaunch(
+    window_id: str, runtime: AgentRuntime, *, stop_background: bool = False
+) -> ExitResult:
+    """Quit a tmux window's agent CLI back to its shell, for a relaunch.
+
+    The caller holds ``send_lock``. Nothing on the way is confirmed blind,
+    because Enter takes whatever the CLI preselected:
+
+    - Claude Code asks before quitting with background work running (shells,
+      scheduled tasks) and preselects «Exit and stop tasks». Esc cancels the
+      exit and the result lists that work, unless ``stop_background``: the
+      user already saw the list and chose to stop it.
+    - A notice screen (Claude Code's feedback drafts) is closed with Esc,
+      and the exit goes on.
+    - The exit command's own Enter can be swallowed by slash autocomplete,
+      and a relaunch typed after it became «/exitclaude …». So Enter is
+      pressed again only while the box still holds the command. Any other
+      screen gets Esc and the restart stops, with no relaunch typed.
+
+    A draft left in the input box is cleared first: the exit command would be
+    appended to it and the whole line sent to the agent as a prompt. A pane
+    already at the shell is left alone (nothing to quit, and the exit command
+    would run there); an unreadable one gets nothing typed.
+    """
+    running, _ = await _agent_state(window_id)
+    if running is None:
+        return ExitResult(False)  # tmux unreadable: type nothing
+    if running is False:
+        return ExitResult(True)  # already back at the shell: nothing to quit
+    if await session_manager.clear_input(window_id) is False:
+        return ExitResult(False)  # a draft that won't go: the exit would join it
+    exit_cmd = runtime.exit_command()
+    await tmux_manager.send_keys(window_id, exit_cmd)
+    deadline = time.monotonic() + EXIT_WAIT_SEC
+    flushed = confirmed = False
+    notices = 0
+    while True:
+        running, pane = await _agent_state(window_id)
+        if running is False:
+            return ExitResult(True)
+        prompt = runtime.exit_prompt(pane) if running else None
+        if prompt is not None and prompt.kind == "background" and not confirmed:
+            if not (stop_background and prompt.stop_selected):
+                await _press(window_id, "Escape")
+                if stop_background:
+                    # «Stop» isn't the highlighted answer: offering the same
+                    # button again would only loop back here.
+                    return ExitResult(False)
+                return ExitResult(False, prompt.items or ("…",))
+            await _press(window_id, "Enter")
+            confirmed = True
+            deadline = time.monotonic() + EXIT_WAIT_SEC
+        elif prompt is not None and prompt.kind == "notice" and notices < 2:
+            notices += 1
+            await _press(window_id, "Escape")
+            deadline = time.monotonic() + EXIT_WAIT_SEC
+        elif time.monotonic() >= deadline:
+            if running and not flushed and runtime.unsent_in_composer(pane, exit_cmd):
+                flushed = True
+                await _press(window_id, "Enter")
+                deadline = time.monotonic() + EXIT_FLUSH_WAIT_SEC
+            else:
+                if prompt is not None or (running and is_interactive_ui(pane)):
+                    await _press(window_id, "Escape")
+                logger.warning("Restart: %s did not quit; no relaunch typed", window_id)
+                return ExitResult(False)
+        await asyncio.sleep(_POLL_SEC)
+
+
+def restart_refused(
+    window_id: str, result: ExitResult, *, fresh: bool
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """The message (and button) for a restart that didn't go through."""
+    name = session_manager.get_display_name(window_id)
+    if result.refused == "busy":
+        return tr("commands.restart_busy", name=name), None
+    if result.refused == "dialog":
+        return tr("restart.dialog_open", name=name), None
+    if result.refused == "restarting":
+        return tr("restart.in_progress", name=name), None
+    if result.refused == "unreadable":
+        return tr("restart.unreadable", name=name), None
+    if not result.background:
+        return tr("restart.not_exited", name=name), None
+    items = "\n".join(f"• `{item.replace('`', '')}`" for item in result.background)
+    kind = "f" if fresh else "r"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    tr("restart.stop_and_restart_btn"),
+                    callback_data=(
+                        f"{CB_CMD_RESTART_STOP}{kind}:{window_id[:CALLBACK_WID_MAX]}"
+                    ),
+                )
+            ]
+        ]
+    )
+    return tr("restart.background_work", name=name, items=items), keyboard
+
+
+async def relaunch_tmux_agent(
+    window_id: str,
+    runtime: AgentRuntime,
+    launch: Callable[[], Awaitable[str]],
+    wait_ready: Callable[[str], Awaitable[None]],
+    *,
+    stop_background: bool = False,
+) -> ExitResult:
+    """Quit a tmux window's agent and start it again in the same pane.
+
+    ``launch`` returns the launch line once the CLI quit; ``wait_ready`` waits
+    for the new CLI's input box. The send lock spans all of it: text typed
+    between the exit and the relaunch would run in the shell, and text typed
+    while the new CLI boots lands blind. The busy and dialog checks run again
+    under the lock, so a message or a second tap that got in first wins.
+    """
+    if window_id in _restarting:
+        return ExitResult(False, refused="restarting")
+    _restarting.add(window_id)
+    try:
+        async with session_manager.send_lock(window_id):
+            blocker = _pane_blocker(
+                window_id, await tmux_manager.capture_pane(window_id)
+            )
+            if blocker:
+                return ExitResult(False, refused=blocker)
+            result = await exit_for_relaunch(
+                window_id, runtime, stop_background=stop_background
+            )
+            if result.exited:
+                # Anything left typed at the shell prompt would prefix the
+                # launch line.
+                await _press(window_id, "C-u")
+                await tmux_manager.send_keys(window_id, await launch())
+                await wait_ready(window_id)
+            return result
+    finally:
+        _restarting.discard(window_id)
 
 
 def _runtime_for_topic(user_id: int, thread_id: int) -> AgentRuntime:
@@ -68,6 +345,14 @@ def _runtime_for_topic(user_id: int, thread_id: int) -> AgentRuntime:
     return rt
 
 
+async def resumable(rt: AgentRuntime, session_id: str) -> str:
+    """``session_id``, or "" when the CLI has no transcript to resume it from."""
+    if session_id and await asyncio.to_thread(rt.has_transcript, session_id) is False:
+        logger.info("No transcript for session %s: starting fresh", session_id)
+        return ""
+    return session_id
+
+
 async def _session_to_resume(rt: AgentRuntime, cwd: str, old_wid: str | None) -> str:
     """The session id 🔄 should continue, or "" when there is nothing to resume.
 
@@ -80,8 +365,17 @@ async def _session_to_resume(rt: AgentRuntime, cwd: str, old_wid: str | None) ->
         ws = session_manager.window_states.get(old_wid)
         if ws and ws.session_id:
             return ws.session_id
+    # Another topic on this folder (a sibling) may be the one that talked
+    # last: a session a bound topic holds is not this topic's to resume. Only
+    # bound ones: the dead window's leftover state holds THIS topic's session.
+    bound = {wid for _, _, wid in session_manager.iter_thread_bindings()}
+    taken = {
+        state.session_id
+        for wid, state in session_manager.window_states.items()
+        if wid in bound and wid != old_wid and state.session_id
+    }
     sessions = await rt.list_sessions(session_manager, cwd)
-    return sessions[0].session_id if sessions else ""
+    return next((s.session_id for s in sessions if s.session_id not in taken), "")
 
 
 async def revive_topic_agent(
@@ -119,6 +413,7 @@ async def revive_topic_agent(
         resume_id = ""
     else:
         resume_id = resume_session_id or await _session_to_resume(rt, cwd, old_wid)
+        resume_id = await resumable(rt, resume_id)
 
     # Same-cwd guard for hookless runtimes: their transcript resolves by cwd
     # ("newest wins"), so a second live window here would make two topics
@@ -228,7 +523,9 @@ async def resume_agents_after_boot() -> None:
 REVIVE_SESSION_ROWS = 6
 
 
-async def revive_docker_agent(window_id: str, *, session_id: str | None) -> None:
+async def revive_docker_agent(
+    window_id: str, *, session_id: str | None, only_if_down: bool = False
+) -> None:
     """Start this docker binding's agent again — resuming, or clean.
 
     ``session_id`` continues that conversation (``claude --resume``);
@@ -236,6 +533,10 @@ async def revive_docker_agent(window_id: str, *, session_id: str | None) -> None
     sibling is provisioned. The binding and the topic are untouched either
     way — that is the whole point of reviving instead of re-creating: the
     topic keeps its history and its files.
+
+    ``only_if_down``: the automatic callers (poll, wake) decided the agent was
+    dead before taking the lock; if it runs by the time they hold it (a
+    restart started it meanwhile), nothing is killed.
     """
     from ..docker_driver import docker_driver
 
@@ -250,6 +551,8 @@ async def revive_docker_agent(window_id: str, *, session_id: str | None) -> None
 
     cwd = session_manager.get_window_state(window_id).cwd or "/workspace"
     async with session_manager.send_lock(window_id):
+        if only_if_down and await session_manager.docker_agent_running(window_id):
+            return
         # A dead session is the normal case here; kill_session tolerates its
         # absence and clears a half-alive one that would refuse the new name.
         await docker_driver.kill_session(
@@ -310,7 +613,9 @@ async def wake_docker_agent(window_id: str) -> bool:
     if last is None:
         return False
     try:
-        await revive_docker_agent(window_id, session_id=last.session_id)
+        await revive_docker_agent(
+            window_id, session_id=last.session_id, only_if_down=True
+        )
     except ReviveError as e:
         logger.info("Wake of %s failed: %s", window_id, e.key)
         return False

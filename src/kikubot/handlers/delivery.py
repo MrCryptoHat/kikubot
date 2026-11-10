@@ -99,6 +99,16 @@ async def deliver_user_text(
         from .agent_restart import wake_docker_agent
 
         if await wake_docker_agent(wid):
+            # The guard above read the dead pane. A resumed big session can
+            # open on the resume dialog, whose preselect («Resume from
+            # summary») a blind Enter would take: compacted, message lost.
+            routed, route_reason = await try_route_to_text_option(wid, text)
+            if routed:
+                return "routed", ""
+            if route_reason == "no_text_option":
+                return "blocked_no_text_option", ""
+            if route_reason and route_reason.startswith("blocking_widget:"):
+                return "blocked_widget", route_reason.split(":", 1)[1]
             ok, msg = await session_manager.send_to_window(wid, text)
     if ok:
         # Reaction-ack (opt-in via /react): the message reached the agent's pane.

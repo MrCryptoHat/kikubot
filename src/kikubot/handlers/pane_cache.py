@@ -26,6 +26,9 @@ Three small optimizations that piggyback on each other:
    short intervals and return as soon as the hash changes, or the
    max_wait deadline elapses. Fast redraws (common case) get ~150 ms
    instead of 500 ms; stuck redraws still bound at max_wait.
+
+Also remembers each topic's newest /agent panel message for the inline
+``screen`` answer.
 """
 
 import asyncio
@@ -43,6 +46,20 @@ _PANE_HASH_BY_MSG: dict[int, str] = {}
 # pane_hash -> Telegram file_id for the rendered photo. OrderedDict for LRU.
 FILE_ID_CACHE_MAX = 256
 _FILE_ID_BY_HASH: OrderedDict[str, str] = OrderedDict()
+
+
+# (user_id, thread_id) -> message_id of the topic's newest /agent panel, for
+# the inline `screen` meta (a client presses that panel's keys). Lost on a bot
+# restart; the client then finds a panel itself.
+_PANEL_BY_TOPIC: dict[tuple[int, int], int] = {}
+
+
+def note_panel(user_id: int, thread_id: int, message_id: int) -> None:
+    _PANEL_BY_TOPIC[(user_id, thread_id)] = message_id
+
+
+def latest_panel(user_id: int, thread_id: int) -> int | None:
+    return _PANEL_BY_TOPIC.get((user_id, thread_id))
 
 
 def pane_hash(text: str) -> str:

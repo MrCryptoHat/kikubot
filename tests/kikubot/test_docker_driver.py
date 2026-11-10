@@ -364,3 +364,42 @@ class TestStartSessionResumeValidation:
 
         await driver.start_session("ctn")
         assert "--resume" not in calls[0][-1]
+
+
+async def test_capture_screen_is_one_exec(monkeypatch):
+    from kikubot.pane_screen import SCREEN_FORMAT
+
+    driver = DockerDriver()
+    calls: list[list[str]] = []
+
+    async def fake_run(argv):
+        calls.append(list(argv))
+        return 0, b"h1\nrow1\nrow2\n3 1 80 2 1 9\n", b""
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    screen = await driver.capture_screen("ctn", back=1, session="claude-x")
+    assert screen is not None
+    assert (screen.back, screen.rows, screen.cursor, screen.history) == (
+        1,
+        2,
+        (3, 1),
+        9,
+    )
+    (argv,) = calls
+    tail = argv[argv.index("tmux") :]
+    assert tail == [
+        "tmux",
+        "capture-pane",
+        "-p",
+        "-e",
+        "-t",
+        "=claude-x:",
+        "-S",
+        "-1",
+        ";",
+        "display-message",
+        "-p",
+        "-t",
+        "=claude-x:",
+        SCREEN_FORMAT,
+    ]
