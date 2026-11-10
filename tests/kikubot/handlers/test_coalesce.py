@@ -102,6 +102,28 @@ async def test_all_full_width_flushes_on_timeout(monkeypatch):
     assert (1, 42) not in coalesce._buffers
 
 
+async def test_timeout_flush_survives_an_awaiting_callback(monkeypatch):
+    """The real forward awaits (tmux, Telegram) before the text reaches the
+    pane. On the timeout path the flush runs inside the timer task, so the
+    flush must not cancel that task — a single near-ceiling message used to
+    vanish at the callback's first await, without a log line."""
+    monkeypatch.setattr(coalesce, "FLUSH_TIMEOUT", 0.05)
+    sent: list[str] = []
+
+    async def cb(text: str) -> None:
+        await asyncio.sleep(0)  # any real I/O suspends here
+        await asyncio.sleep(0.01)
+        sent.append(text)
+
+    one = "a" * (coalesce.NEAR_CEILING + 100)  # one message, never split
+    await coalesce.coalesce_text(1, 42, 100, one, cb)
+
+    await asyncio.sleep(0.2)
+
+    assert sent == [one]
+    assert (1, 42) not in coalesce._buffers
+
+
 async def test_separate_topics_do_not_mix():
     sent_a: list[str] = []
     sent_b: list[str] = []

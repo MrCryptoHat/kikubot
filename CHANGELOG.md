@@ -28,6 +28,9 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   later. tmux is driven through its CLI with short formats accepted only
   whole (libtmux dropped), and a live window that lost its topic goes back to
   it instead of being killed.
+- A long message (3800+ characters) that arrived as a single piece was lost:
+  the bot held it for a second in case Telegram had split it, then cancelled
+  its own delivery without a trace. It now reaches the agent.
 
 ## [0.1.0] — 2026-07-16
 

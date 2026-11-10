@@ -124,13 +124,13 @@ def _arm_timer(key: QueueKey) -> None:
 async def _timeout_flush(key: QueueKey) -> None:
     try:
         await asyncio.sleep(FLUSH_TIMEOUT)
-        async with _lock_for(key):
-            # A tail fragment may have already flushed and popped the buffer.
-            if key in _buffers:
-                logger.info("Coalesce buffer for %s flushed on timeout", key)
-                await _flush_locked(key)
     except asyncio.CancelledError:
-        pass
+        return  # a newer fragment re-armed the timer, or the tail flushed
+    async with _lock_for(key):
+        # A tail fragment may have already flushed and popped the buffer.
+        if key in _buffers:
+            logger.info("Coalesce buffer for %s flushed on timeout", key)
+            await _flush_locked(key)
 
 
 async def _flush_locked(key: QueueKey) -> None:
@@ -138,9 +138,12 @@ async def _flush_locked(key: QueueKey) -> None:
     buf = _buffers.pop(key, None)
     if buf is None:
         return
-    if buf.timer is not None:
-        buf.timer.cancel()
-        buf.timer = None
+    timer, buf.timer = buf.timer, None
+    # On the timeout path the timer IS the running task: cancelling it would
+    # cancel the forward below at its first await and drop the message without
+    # a trace (it did, a single 3900-char message, 2026-11).
+    if timer is not None and timer is not asyncio.current_task():
+        timer.cancel()
     if buf.flush_cb is None:
         return
     buf.parts.sort(key=lambda p: p[0])
