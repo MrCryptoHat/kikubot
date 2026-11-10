@@ -586,3 +586,24 @@ def test_a_report_mentioning_launched_still_ends_the_subagent(env):
     ]
     agent_status.note_usage("sid-claude", CLAUDE.latest_usage(batch))
     assert agent_status.build_status("@5", now=NOW).agents == []
+
+
+def test_a_foreground_subagent_ending_in_a_later_batch(env):
+    # Its result arrives minutes later, in another monitor batch.
+    from kikubot.runtimes import CLAUDE
+
+    start = [
+        _assistant(
+            {
+                "type": "tool_use",
+                "id": "ag4",
+                "name": "Agent",
+                "input": {"description": "Long job"},
+            }
+        )
+    ]
+    agent_status.note_usage("sid-claude", CLAUDE.latest_usage(start))
+    assert agent_status.build_status("@5", now=NOW).agents == [("ag4", "Long job")]
+    later = [_user([{"type": "tool_result", "tool_use_id": "ag4", "content": "Done."}])]
+    agent_status.note_usage("sid-claude", CLAUDE.latest_usage(later))
+    assert agent_status.build_status("@5", now=NOW).agents == []

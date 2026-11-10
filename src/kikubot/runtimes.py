@@ -271,7 +271,6 @@ def _claude_activity(
     """(edited files, subagent events) in a batch of Claude transcript entries."""
     files: list[str] = []
     events: list[tuple[str, str, str]] = []
-    agent_ids: set[str] = set()
     for raw in raw_entries:
         content = (raw.get("message") or {}).get("content")
         if raw.get("type") == "assistant" and isinstance(content, list):
@@ -288,16 +287,19 @@ def _claude_activity(
                 elif b.get("name") in _CLAUDE_AGENT_TOOLS and isinstance(
                     b.get("id"), str
                 ):
-                    agent_ids.add(b["id"])
                     desc = inp.get("description") or inp.get("subagent_type") or ""
                     events.append(("start", b["id"], str(desc)))
         elif raw.get("type") == "user":
             if isinstance(content, list):
                 for b in content:
+                    # Any tool's result may close a subagent: a foreground
+                    # one answers minutes later, in another monitor batch,
+                    # so it can't be matched to a launch seen in this one.
+                    # The cache ignores ids it doesn't hold.
                     if (
                         isinstance(b, dict)
                         and b.get("type") == "tool_result"
-                        and b.get("tool_use_id") in agent_ids
+                        and isinstance(b.get("tool_use_id"), str)
                         and not _block_text(b.get("content"))
                         .lstrip()
                         .startswith(_ASYNC_AGENT_PREFIX)
