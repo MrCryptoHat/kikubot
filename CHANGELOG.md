@@ -55,6 +55,11 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
 
 ### Fixed
 
+- A Codex prompt with its newer key-hint footer («enter continue · esc skip»,
+  e.g. its update prompt) is shown as a dialog again. A message typed into
+  the update prompt picked the preselected «Update now», which quit Codex.
+- A just-launched agent is no longer reported as stopped while its shell is
+  still starting up.
 - The first reply after a quiet minute or more no longer waits for a new
   connection to Telegram: the bot keeps one warm.
 - A failed tmux read no longer reads as "every window is gone": the bot used

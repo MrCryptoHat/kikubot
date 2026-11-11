@@ -290,6 +290,23 @@ class TmuxManager:
         """
         self.session_name = session_name or config.tmux_session_name
         self.socket_name = socket_name
+        # window id → when its agent's launch command was typed (monotonic)
+        self._launched_at: dict[str, float] = {}
+
+    def launched_within(self, window_id: str, seconds: float) -> bool:
+        """Was an agent launched in this window less than ``seconds`` ago?
+
+        The launch is typed into a shell, which holds the terminal until it
+        has read its startup files and runs the command: a second or more on
+        a busy machine. Until then the window reads as "agent exited".
+        """
+        at = self._launched_at.get(window_id)
+        if at is None:
+            return False
+        if time.monotonic() - at < seconds:
+            return True
+        del self._launched_at[window_id]
+        return False
 
     # --- tmux primitive -----------------------------------------------------
 
@@ -854,6 +871,7 @@ class TmuxManager:
             )
             await self.send_keys(wid, cmd, enter=False)
             await self._send_keys_once(wid, "Enter")
+            self._launched_at[wid] = time.monotonic()
 
         logger.info("Created window '%s' (id=%s) at %s", final_window_name, wid, path)
         return (

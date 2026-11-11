@@ -882,6 +882,26 @@ class TestChoiceMenu:
         assert res.name == "ChoiceMenu"
         assert is_interactive_ui(_CODEX_APPROVAL) is True
 
+    def test_codex_update_prompt_with_its_terse_footer(self):
+        # Codex 0.167's update prompt: «Update now» is preselected, so a
+        # message typed into it unseen updated and quit the agent.
+        pane = (
+            "  Update available · 1.0.0 → 1.1.0\n"
+            "  Release notes: https://example.com/releases/latest\n"
+            "\n"
+            "› 1. Update now (runs `brew upgrade --cask codex`)\n"
+            "  2. Skip\n"
+            "  3. Skip until next version\n"
+            "\n"
+            "  enter continue · esc skip\n" + "\n" * 20
+        )
+        res = extract_interactive_content(pane)
+        assert res is not None and res.name == "ChoiceMenu"
+
+    def test_prose_mentioning_enter_continue_is_not_a_menu(self):
+        pane = "• Press the key: enter continue · then wait\n› \n  gpt · ~/p\n"
+        assert is_interactive_ui(pane) is False
+
     def test_codex_idle_output_not_menu(self):
         assert is_interactive_ui(_CODEX_IDLE) is False
 

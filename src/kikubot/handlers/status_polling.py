@@ -103,6 +103,10 @@ _agent_down_since: dict[str, float] = {}
 
 # Grace period before killing dead window (allows for /restart)
 DEAD_WINDOW_GRACE = 30.0  # seconds
+# A window this young isn't judged at all: its shell still holds the terminal
+# while it starts up, before it runs the agent. Judged anyway, a codex launch
+# on a busy Mac drew a false «agent stopped» (2026-11-11).
+LAUNCH_GRACE_SEC = 15.0
 
 # Track orphan window state: window_id -> monotonic time when first seen unbound.
 # Long enough to cover the gap between create_window and bind_thread inside the
@@ -792,8 +796,10 @@ async def status_poll_loop(bot: Bot) -> None:
             for w in all_windows:
                 if w.window_name == "__main__":
                     continue
-                if w.window_id in running_ids:
-                    # Agent is running — clear any down timer
+                if w.window_id in running_ids or tmux_manager.launched_within(
+                    w.window_id, LAUNCH_GRACE_SEC
+                ):
+                    # Agent is running (or still starting) — clear any timer
                     _agent_down_since.pop(w.window_id, None)
                     continue
 

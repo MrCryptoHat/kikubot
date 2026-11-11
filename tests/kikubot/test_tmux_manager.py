@@ -239,3 +239,18 @@ class TestOnRealTmux:
         assert len(lines) == 40 + rows
         assert lines[40:] == screen.text.split("\n")[:-1]
         assert await manager.capture_screen("@99999") is None
+
+
+def test_launched_within_counts_from_the_launch(monkeypatch):
+    """A just-launched agent's shell still holds the terminal: the dead-agent
+    check must not judge that window yet."""
+    mgr = TmuxManager(session_name="t", socket_name="unused")
+    now = [1000.0]
+    monkeypatch.setattr(tm_mod.time, "monotonic", lambda: now[0])
+    assert not mgr.launched_within("@1", 15)
+    mgr._launched_at["@1"] = now[0]
+    now[0] += 5
+    assert mgr.launched_within("@1", 15)
+    now[0] += 11
+    assert not mgr.launched_within("@1", 15)
+    assert "@1" not in mgr._launched_at  # forgotten once past

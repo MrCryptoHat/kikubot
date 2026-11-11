@@ -434,6 +434,11 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"Press enter to (confirm|continue|select)"),
             re.compile(r"Enter to confirm"),
             re.compile(r"[Ee]sc to (cancel|exit)"),
+            # Codex's terse key-hint footer (0.167: its update prompt ends
+            # «enter continue · esc skip»). Unmatched, a message was typed
+            # into that prompt and its Enter picked the preselected
+            # «Update now», which quit the agent (2026-11-11).
+            re.compile(r"(?i)\benter (to )?(continue|confirm|select)\s*(·|$)"),
             re.compile(r"^\s*\d+\.\s"),  # a sibling option below the cursor row
         ),
         min_gap=1,
