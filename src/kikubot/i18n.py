@@ -155,6 +155,8 @@ STRINGS: dict[str, str] = {
     "astatus.cmd.restart": "Restart",
     "astatus.cmd.end": "End session",
     "astatus.cmd.delete": "Delete agent and topic",
+    "astatus.cmd.role": "Topic role",
+    "astatus.role.placeholder": "What the agent in this topic does and how it answers",
     "astatus.confirm.compact": "Compact the context? The conversation so far is replaced by a summary.",
     "astatus.confirm.clear": "Clear the context? The agent starts over with an empty conversation; this one stays in the resume list.",
     "astatus.confirm.restart": "Restart the agent? It comes back in the same conversation.",
@@ -179,6 +181,18 @@ STRINGS: dict[str, str] = {
     "bgtask.nothing_running": "Nothing is running in {name} to send to the background.",
     "bgtask.unsupported": "{name}'s agent has no background for running tasks.",
     "cmd.pin": "pin big task messages: on/off",
+    "cmd.role": "this topic's standing role for its agent",
+    "role.none": "This topic has no role yet.\n\nSet one: /role and the text after it — what the agent here does and how it should answer. Every agent in this topic gets it at start, after /clear and after a restart.",
+    "role.current": "🎭 This topic's role:\n\n{role}\n\nChange it: /role and the new text. Remove it: /role off",
+    "role.saved": "🎭 Role saved. The agent in this topic gets it from its first start.",
+    "role.saved_told": "🎭 Role saved and passed to the agent. Every new start in this topic gets it too.",
+    "role.saved_later": "🎭 Role saved, but the agent couldn't take it right now. It gets it with its next start: /restart keeps the conversation and applies it.",
+    "role.cleared": "Role removed.",
+    "role.cleared_told": "Role removed; the agent knows.",
+    "role.cleared_later": "Role removed. The agent hears of it with its next start: /restart keeps the conversation.",
+    "role.too_long": "That's {n} characters; a role fits in {max}. Keep what the agent must always remember.",
+    "role.docker": "A container agent takes its standing instructions from CLAUDE.md in its workspace: /role works for agents on this computer.",
+    "role.no_hook": "{agent} won't get it again after a restart: only Claude agents do.",
 }
 
 
@@ -201,6 +215,7 @@ STRINGS.update(
         "/diff — send screenshots of code edits\n"
         "/tables — tables: native or screenshots\n"
         "/pin — pin big task messages in the topic\n"
+        "/role — this topic's standing instructions for its agent\n"
         "/react — 👀 “message taken” receipt\n\n"
         "*Good to know:*\n"
         "• 👍 on an agent message = confirm (Enter or “yes”)\n"
@@ -419,6 +434,7 @@ STRINGS.update(
         "dirb.resume_header": "*Which agent to run?*\n",
         "dirb.resume_found": "Resume a saved conversation or start a new one:",
         "dirb.no_sessions": "No saved conversations with this agent here yet.",
+        "dirb.own_session_hint": "⭐ — this topic's conversations, newest first.",
         "dirb.ts_now": "now",
         "dirb.ts_min": "{n}m",
         "dirb.ts_hour": "{n}h",

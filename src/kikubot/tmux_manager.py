@@ -798,6 +798,7 @@ class TmuxManager:
         start_claude: bool = True,
         resume_session_id: str | None = None,
         runtime: str = "claude",
+        env: dict[str, str] | None = None,
     ) -> tuple[bool, str, str, str]:
         """Create a new tmux window and optionally start the agent CLI.
 
@@ -809,6 +810,8 @@ class TmuxManager:
             resume_session_id: If set (and well-formed), resume that session
             runtime: Agent runtime to launch — "claude" (default) or "codex".
                 The launch/resume command is built by runtimes.get_runtime.
+            env: Extra environment for the window's shell and so the agent
+                (``new-window -e``), e.g. ``SessionManager.topic_env``.
 
         Returns:
             Tuple of (success, message, window_name, window_id)
@@ -827,9 +830,11 @@ class TmuxManager:
             logger.error("Failed to create window: %s", e)
             return False, f"Failed to create window: {e}", "", ""
 
+        env_args = [arg for k, v in (env or {}).items() for arg in ("-e", f"{k}={v}")]
         res = await self._tmux(
             "new-window",
             "-d",
+            *env_args,
             "-t",
             f"{sid}:",
             "-n",

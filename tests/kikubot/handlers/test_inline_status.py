@@ -38,6 +38,11 @@ class _FakeSM:
     def get_display_name(self, binding):
         return {"@5": "webapp", "@6": "kikubot"}[binding]
 
+    def get_topic_role(self, uid, thread):
+        return {f"{OWNER}:42": "Log gym notes\n- no questions"}.get(
+            f"{uid}:{thread}", ""
+        )
+
 
 @pytest.fixture
 def env(monkeypatch):
@@ -462,3 +467,40 @@ async def test_screen_unchanged_since_the_clients_hash_sends_no_parts(env, monke
     await inline_status.inline_status_handler(update, _ctx())
     results = query.answer.call_args.args[0]
     assert len(results) == 2  # changed: the full screen
+
+
+def test_parse_role_target():
+    assert inline_status.parse_role_target(f"role {CHAT}:42") == (CHAT, 42)
+    assert inline_status.parse_role_target("role") is None
+    assert inline_status.parse_role_target(f"role {CHAT}:42 extra") is None
+
+
+async def test_role_answers_the_topics_text(env, monkeypatch):
+    update, query = _update(monkeypatch, OWNER, f"role {CHAT}:42")
+    await inline_status.inline_status_handler(update, _ctx())
+    results = query.answer.call_args.args[0]
+    assert [r.id for r in results] == ["role.v1.json"]
+    data = json.loads(results[0].input_message_content.message_text)
+    assert data["v"] == 1 and data["role"] == "Log gym notes\n- no questions"
+    assert data["max"] > 0
+    assert query.answer.call_args.kwargs == {"cache_time": 0, "is_personal": True}
+
+
+async def test_role_unset_is_an_empty_text(env, monkeypatch):
+    update, query = _update(monkeypatch, OWNER, f"role {CHAT}:43")
+    await inline_status.inline_status_handler(update, _ctx())
+    data = json.loads(
+        query.answer.call_args.args[0][0].input_message_content.message_text
+    )
+    assert data["role"] == ""
+
+
+@pytest.mark.parametrize(
+    "uid,text", [(999, f"role {CHAT}:42"), (OWNER, "role -100999:42")]
+)
+async def test_role_of_a_foreign_topic_or_stranger_is_empty(
+    env, monkeypatch, uid, text
+):
+    update, query = _update(monkeypatch, uid, text)
+    await inline_status.inline_status_handler(update, _ctx())
+    assert query.answer.call_args.args[0] == []

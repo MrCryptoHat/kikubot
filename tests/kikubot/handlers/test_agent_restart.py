@@ -29,6 +29,10 @@ def _mocks(tmp_path, *, sessions=None, window_state=None):
     sm.has_live_agent_on_cwd = AsyncMock(return_value=False)
     sm.live_window_for_session = AsyncMock(return_value=None)
     sm.docker_agent_for_dir.return_value = None
+    sm.get_topic_sessions.return_value = []
+    sm.sessions_of_other_topics.return_value = set()
+    sm.topic_env.return_value = {"KIKUBOT_TOPIC": "1:42"}
+    sm.iter_thread_bindings.return_value = []
     sm.wait_for_session_map_entry = AsyncMock(return_value=True)
     sm.get_window_state.return_value = window_state or SimpleNamespace(
         session_id="", cwd="", window_name=""
@@ -59,6 +63,98 @@ async def test_resumes_the_newest_session_of_the_folder(tmp_path):
     assert tm.create_window.await_args.kwargs["resume_session_id"] == NEWEST
     assert tm.create_window.await_args.kwargs["runtime"] == "claude"
     sm.bind_thread.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_the_topics_own_session_wins_over_the_folders_newest(tmp_path):
+    # Several topics share a folder (➕ siblings): the newest session there is
+    # another topic's conversation, not this one's.
+    sm, tm, rt = _mocks(tmp_path, sessions=[NEWEST, PINNED])
+    sm.get_topic_sessions.return_value = [PINNED]
+    rt.has_transcript.return_value = True
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        await ar.revive_topic_agent(1, 42)
+
+    sm.get_topic_sessions.assert_called_with(1, 42)
+    assert tm.create_window.await_args.kwargs["resume_session_id"] == PINNED
+    assert tm.create_window.await_args.kwargs["env"] == {"KIKUBOT_TOPIC": "1:42"}
+
+
+@pytest.mark.asyncio
+async def test_history_skips_a_session_live_elsewhere(tmp_path):
+    # Topic B opened A's conversation with the CLI's own /resume: it is in
+    # both histories. B's revive goes on to its own earlier one.
+    sm, tm, rt = _mocks(tmp_path, sessions=[PINNED, NEWEST])
+    sm.get_topic_sessions.return_value = [PINNED, NEWEST]
+    rt.has_transcript.return_value = True
+    sm.iter_thread_bindings.return_value = [(1, 77, "@3")]
+    sm.window_states = {"@3": SimpleNamespace(session_id=PINNED)}
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        await ar.revive_topic_agent(1, 42)
+
+    assert tm.create_window.await_args.kwargs["resume_session_id"] == NEWEST
+
+
+@pytest.mark.asyncio
+async def test_a_history_with_nothing_usable_starts_fresh(tmp_path):
+    # Never a conversation the topic didn't have: the folder's newest is
+    # someone else's.
+    sm, tm, rt = _mocks(tmp_path, sessions=[NEWEST])
+    sm.get_topic_sessions.return_value = [PINNED]
+    rt.has_transcript.side_effect = lambda sid: sid != PINNED
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        await ar.revive_topic_agent(1, 42)
+
+    assert tm.create_window.await_args.kwargs["resume_session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_without_a_history_another_topics_session_is_not_taken(tmp_path):
+    # A topic that predates the history falls back to the folder, but never
+    # to a conversation another topic has run, even with that one stopped.
+    sm, tm, rt = _mocks(tmp_path, sessions=[PINNED, NEWEST])
+    sm.sessions_of_other_topics.return_value = {PINNED}
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        await ar.revive_topic_agent(1, 42)
+
+    sm.sessions_of_other_topics.assert_called_with(1, 42)
+    assert tm.create_window.await_args.kwargs["resume_session_id"] == NEWEST
+
+
+@pytest.mark.asyncio
+async def test_resumed_id_pinned_before_the_bind(tmp_path):
+    # Once bound, a save records the window's session in the topic's
+    # history: the hook's fresh id must already be replaced by then.
+    ws = SimpleNamespace(session_id="hook-new-id", cwd="", window_name="")
+    sm, tm, rt = _mocks(tmp_path, window_state=ws)
+    sm.get_topic_sessions.return_value = [PINNED]
+    rt.has_transcript.return_value = True
+    seen: list[str] = []
+    sm.bind_thread.side_effect = lambda *a, **k: seen.append(ws.session_id)
+    with (
+        patch.object(ar, "session_manager", sm),
+        patch.object(ar, "tmux_manager", tm),
+        patch.object(ar, "get_runtime", return_value=rt),
+    ):
+        await ar.revive_topic_agent(1, 42)
+
+    assert seen == [PINNED]
 
 
 @pytest.mark.asyncio

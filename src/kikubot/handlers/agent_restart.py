@@ -353,27 +353,44 @@ async def resumable(rt: AgentRuntime, session_id: str) -> str:
     return session_id
 
 
-async def _session_to_resume(rt: AgentRuntime, cwd: str, old_wid: str | None) -> str:
+async def _session_to_resume(
+    rt: AgentRuntime,
+    cwd: str,
+    old_wid: str | None,
+    user_id: int,
+    thread_id: int,
+) -> str:
     """The session id 🔄 should continue, or "" when there is nothing to resume.
 
     The dead window's own state is the exact answer while it lasts; the stale
-    sweep in ``load_session_map`` drops it, so the newest session recorded for
-    the folder is the fallback (same conversation for every everyday case —
-    one topic works one folder).
+    sweep in ``load_session_map`` drops it, and then the topic's own history
+    is (``SessionManager.topic_sessions``, newest first): the first entry no
+    live window holds and the CLI can still resume. A topic with a history
+    but nothing usable in it starts fresh rather than in a conversation it
+    never had. Only a topic older than the history falls back to the folder:
+    its newest session that no live window holds and no other topic ran.
     """
     if old_wid:
         ws = session_manager.window_states.get(old_wid)
         if ws and ws.session_id:
             return ws.session_id
-    # Another topic on this folder (a sibling) may be the one that talked
-    # last: a session a bound topic holds is not this topic's to resume. Only
-    # bound ones: the dead window's leftover state holds THIS topic's session.
+    # A session a bound topic holds is not this one's to resume. Only bound
+    # ones: the dead window's leftover state holds THIS topic's session.
     bound = {wid for _, _, wid in session_manager.iter_thread_bindings()}
-    taken = {
+    live = {
         state.session_id
         for wid, state in session_manager.window_states.items()
         if wid in bound and wid != old_wid and state.session_id
     }
+    history = session_manager.get_topic_sessions(user_id, thread_id)
+    for sid in history:
+        if sid in live:
+            continue
+        if await asyncio.to_thread(rt.has_transcript, sid) is not False:
+            return sid
+    if history:
+        return ""
+    taken = live | session_manager.sessions_of_other_topics(user_id, thread_id)
     sessions = await rt.list_sessions(session_manager, cwd)
     return next((s.session_id for s in sessions if s.session_id not in taken), "")
 
@@ -412,7 +429,9 @@ async def revive_topic_agent(
     if fresh:
         resume_id = ""
     else:
-        resume_id = resume_session_id or await _session_to_resume(rt, cwd, old_wid)
+        resume_id = resume_session_id or await _session_to_resume(
+            rt, cwd, old_wid, user_id, thread_id
+        )
         resume_id = await resumable(rt, resume_id)
 
     # Same-cwd guard for hookless runtimes: their transcript resolves by cwd
@@ -432,6 +451,7 @@ async def revive_topic_agent(
         window_name=session_manager.topic_window_name(user_id, thread_id),
         resume_session_id=resume_id or None,
         runtime=rt.name,
+        env=session_manager.topic_env(user_id, thread_id),
     )
     if not ok:
         logger.warning("Revive: create_window failed for %s: %s", cwd, message)
@@ -444,13 +464,13 @@ async def revive_topic_agent(
         hook_ok = await session_manager.wait_for_session_map_entry(
             wid, timeout=15.0 if resume_id else 5.0
         )
-    session_manager.bind_thread(user_id, thread_id, wid, window_name=wname)
-
     if resume_id and rt.uses_session_map:
         # `--resume` makes the SessionStart hook report a NEW session_id while
         # messages keep writing to the ORIGINAL JSONL — pin window_state to the
         # resumed id so the monitor tracks the right transcript (mirrors the
-        # resume override in bot._create_and_bind_window).
+        # resume override in bot._create_and_bind_window). Before the bind:
+        # once bound, a save records the window's session in the topic's
+        # history, and the hook's id would land there as a conversation.
         ws = session_manager.get_window_state(wid)
         if not hook_ok:
             logger.warning(
@@ -466,6 +486,7 @@ async def revive_topic_agent(
         elif ws.session_id != resume_id:
             ws.session_id = resume_id
             session_manager._save_state()
+    session_manager.bind_thread(user_id, thread_id, wid, window_name=wname)
 
     logger.info(
         "Revived agent for thread %d: window %s at %s (runtime=%s, resume=%s)",

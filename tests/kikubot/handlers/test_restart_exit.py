@@ -557,6 +557,8 @@ async def test_revive_fallback_skips_a_session_another_topic_holds():
     from types import SimpleNamespace
 
     sm = MagicMock()
+    sm.get_topic_sessions.return_value = []  # a topic older than the history
+    sm.sessions_of_other_topics.return_value = set()
     sm.iter_thread_bindings.return_value = [(1, 8, "@9")]  # the sibling topic
     sm.window_states = {
         "@9": SimpleNamespace(session_id="sib"),
@@ -567,7 +569,7 @@ async def test_revive_fallback_skips_a_session_another_topic_holds():
         return_value=[SimpleNamespace(session_id=i) for i in ("sib", "mine", "old")]
     )
     with patch.object(agent_restart, "session_manager", sm):
-        assert await agent_restart._session_to_resume(rt, "/p", None) == "mine"
+        assert await agent_restart._session_to_resume(rt, "/p", None, 1, 7) == "mine"
 
 
 def test_unreadable_tmux_pane_blocks_a_restart_docker_does_not():

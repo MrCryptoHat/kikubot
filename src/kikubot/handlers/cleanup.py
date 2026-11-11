@@ -99,6 +99,7 @@ async def purge_deleted_topic(bot: Bot, user_id: int, thread_id: int, wid: str) 
     # and the old menu keyboard in it must still be removed.
     session_manager.topic_agent_names.pop(f"{user_id}:{thread_id}", None)
     session_manager.menu_clear_topics.discard(f"{user_id}:{thread_id}")
+    session_manager.forget_topic_memory(user_id, thread_id)
     logger.info(
         "Topic gone — unbound thread %d, cleaned up (window_id=%s) for user %d",
         thread_id,

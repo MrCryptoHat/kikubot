@@ -21,6 +21,7 @@ from kikubot.handlers.directory_browser import (
     PICKER_SESSION_ROWS,
     build_runtime_menu,
     build_session_picker,
+    order_for_topic,
 )
 from kikubot.runtimes import AgentRuntime
 
@@ -153,3 +154,50 @@ class TestRuntimeMenu:
         back_row = kb.inline_keyboard[-1]
         assert len(back_row) == 1
         assert _cd(back_row[0]) == f"{CB_RUNTIME_TAB}codex"
+
+
+class TestTopicsOwnSessions:
+    """Several topics share a folder: each sees its own conversations first,
+    starred, and the other topics' last."""
+
+    _MIXED = [
+        AgentSession("other-new", "Other topic", 3, "/tmp/o.jsonl"),
+        AgentSession("mine-new", "My latest", 3, "/tmp/m1.jsonl"),
+        AgentSession("nobody", "Started in a terminal", 3, "/tmp/n.jsonl"),
+        AgentSession("mine-old", "My first", 3, "/tmp/m2.jsonl"),
+    ]
+
+    def test_own_first_unclaimed_next_others_last(self):
+        ordered = order_for_topic(
+            self._MIXED, own=["mine-old", "mine-new"], others={"other-new"}
+        )
+        # Each part keeps the listing's newest-first order; a closed topic's
+        # conversations stay reachable, just last.
+        assert [s.session_id for s in ordered] == [
+            "mine-new",
+            "mine-old",
+            "nobody",
+            "other-new",
+        ]
+
+    def test_no_history_keeps_the_listing(self):
+        assert order_for_topic(_SESSIONS, own=[], others=set()) == _SESSIONS
+
+    def test_a_session_both_claim_counts_as_mine(self):
+        ordered = order_for_topic(_SESSIONS, own=["id-b"], others={"id-b"})
+        assert [s.session_id for s in ordered] == ["id-b", "id-a"]
+
+    def test_own_rows_starred_and_explained(self):
+        sessions = order_for_topic(self._MIXED, ["mine-new", "mine-old"], set())
+        text, kb = build_session_picker(
+            sessions, "/tmp", "claude", {"mine-new", "mine-old"}
+        )
+        rows = [b.text for b in _flat(kb) if _cd(b).startswith(CB_SESSION_SELECT)]
+        assert rows[0].startswith("⭐ My latest") and rows[1].startswith("⭐ My first")
+        assert all(r.startswith("▶") for r in rows[2:])
+        assert "⭐" in text
+
+    def test_no_star_without_own_sessions(self):
+        text, kb = build_session_picker(_SESSIONS, "/tmp", "claude", {"id-gone"})
+        assert "⭐" not in text
+        assert not any(b.text.startswith("⭐") for b in _flat(kb))

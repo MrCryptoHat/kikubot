@@ -72,6 +72,7 @@ from .directory_browser import (
     build_session_picker,
     clear_browse_state,
     clear_session_picker_state,
+    sessions_for_topic,
 )
 from .message_sender import PARSE_MODE, safe_reply
 from ..screenshot import text_to_image
@@ -80,7 +81,7 @@ from ..docker_driver import docker_driver
 from .. import plugins
 from ..i18n import tr
 from ..runtimes import default_runtime, get_runtime
-from ..session import session_manager
+from ..session import TOPIC_ROLE_MAX_CHARS, session_manager
 from ..terminal_parser import is_interactive_ui
 from ..tmux_manager import tmux_manager
 from ..transcript_parser import TranscriptParser
@@ -562,6 +563,7 @@ def build_bot_commands() -> list[BotCommand]:
         BotCommand("bgtask", tr("cmd.bgtask")),
         BotCommand("delete", tr("cmd.delete")),
         BotCommand("pin", tr("cmd.pin")),
+        BotCommand("role", tr("cmd.role")),
         *plugins.bot_commands(),
     ]
 
@@ -645,6 +647,86 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text, keyboard = offer
     # Plain text, like the panel caption it mirrors.
     await update.message.reply_text(text, reply_markup=keyboard)
+
+
+# Agent-directed (English, outside i18n): how a live agent hears of a change
+# the hook would otherwise bring only at its next start.
+_ROLE_SET_NOTE = (
+    "[kikubot] The user set standing instructions for this topic (/role). "
+    "Follow them from now on; every new session in this topic gets them too:"
+)
+_ROLE_CLEARED_NOTE = (
+    "[kikubot] The user removed this topic's standing instructions (/role); "
+    "they no longer apply."
+)
+
+
+async def role_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/role — the topic's standing instructions for whatever agent runs in it.
+
+    ``/role`` shows them, ``/role <text>`` sets them, ``/role off`` removes
+    them. They are kept per topic, not per session: the SessionStart hook
+    hands them to every Claude session the topic starts, resumes, clears or
+    compacts (hook._topic_role). A live agent is told at once, as a message
+    — the hook would reach it only at its next start — unless a dialog is
+    open, where the message would become its answer.
+    """
+    user = effective_user(update)
+    if not user or not is_user_allowed(user.id) or not update.message:
+        return
+    thread_id = get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, tr("common.topics_only"))
+        return
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id) or ""
+    if wid and session_manager._is_docker_binding(wid):
+        await safe_reply(update.message, tr("role.docker"))
+        return
+
+    # The raw text, not context.args: those are split on whitespace and would
+    # lose the line breaks of a role written as a list.
+    parts = (update.message.text or "").split(None, 1)
+    text = parts[1].strip() if len(parts) > 1 else ""
+    if not text:
+        current = session_manager.get_topic_role(user.id, thread_id)
+        if current:
+            await safe_reply(update.message, tr("role.current", role=current))
+        else:
+            await safe_reply(update.message, tr("role.none"))
+        return
+    if text.lower() == "off":
+        if not session_manager.get_topic_role(user.id, thread_id):
+            await safe_reply(update.message, tr("role.none"))
+            return
+        session_manager.set_topic_role(user.id, thread_id, "")
+        note, saved_key = _ROLE_CLEARED_NOTE, "role.cleared"
+    else:
+        if len(text) > TOPIC_ROLE_MAX_CHARS:
+            await safe_reply(
+                update.message,
+                tr("role.too_long", n=len(text), max=TOPIC_ROLE_MAX_CHARS),
+            )
+            return
+        session_manager.set_topic_role(user.id, thread_id, text)
+        note, saved_key = f"{_ROLE_SET_NOTE}\n\n{text}", "role.saved"
+
+    rt = get_runtime(
+        session_manager.window_runtime(wid)
+        if wid
+        else session_manager.get_remembered_runtime(user.id, thread_id) or "claude"
+    )
+    reply = tr(saved_key)
+    if wid:
+        # Typed as a plain message, and only into the prompt box: with a
+        # dialog open the note would become its answer.
+        pane = await session_manager.capture_pane(wid)
+        told = pane is not None and not is_interactive_ui(pane)
+        if told:
+            told, _ = await session_manager.send_to_window(wid, note)
+        reply = tr(f"{saved_key}_told" if told else f"{saved_key}_later")
+    if saved_key == "role.saved" and not rt.uses_session_map:
+        reply = f"{reply}\n{tr('role.no_hook', agent=rt.display_name)}"
+    await safe_reply(update.message, reply)
 
 
 async def bgtask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2157,7 +2239,7 @@ async def _auto_bind_to_directory(
     # re-arm the memory of a topic that hasn't chosen yet.
     session_manager.record_thread_directory(user_id, thread_id, str(matching_dir))
     shown = _display_home_path(matching_dir)
-    sessions = await rt.list_sessions(session_manager, str(matching_dir))
+    sessions, own = await sessions_for_topic(rt, str(matching_dir), user_id, thread_id)
 
     # ALWAYS the picker — resolving the FOLDER is automatic, starting a session
     # in it never is. Even with nothing to resume the picker is the choice that
@@ -2171,7 +2253,7 @@ async def _auto_bind_to_directory(
         context.user_data[PICKER_RUNTIME_KEY] = rt.name
         context.user_data["_selected_path"] = str(matching_dir)
         context.user_data["_pending_thread_id"] = thread_id
-    text, keyboard = build_session_picker(sessions, str(matching_dir), rt.name)
+    text, keyboard = build_session_picker(sessions, str(matching_dir), rt.name, own)
     try:
         await safe_reply(msg, text, reply_markup=keyboard)
     except Exception as e:

@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 KIKUBOT_DIR_ENV = "KIKUBOT_DIR"
 
+# Set on every topic window kikubot creates ("user_id:thread_id"), so the
+# SessionStart hook knows the topic before the binding is saved (it fires
+# while the window is still starting) — see hook._topic_role.
+TOPIC_ENV = "KIKUBOT_TOPIC"
+
 # Claude Code session ids are UUID-shaped. This pins them to the same charset
 # docker_driver validates before interpolating `--resume <id>`, so a value read
 # from session_map.json or a JSONL filename can never smuggle shell

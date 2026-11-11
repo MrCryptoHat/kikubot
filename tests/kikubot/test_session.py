@@ -91,6 +91,131 @@ class TestMenuClearTopics:
         assert "menu_shown_topics" not in written[-1]
 
 
+SID_A = "aaaaaaaa-1111-2222-3333-444444444444"
+SID_B = "bbbbbbbb-1111-2222-3333-444444444444"
+
+
+class TestTopicMemory:
+    """A topic outlives its sessions: it keeps its conversations and its role.
+
+    The window's own state dies with the window, and a folder's session list
+    can't say which topic held what once several share the folder.
+    """
+
+    @staticmethod
+    def _saving(monkeypatch, tmp_path) -> tuple[SessionManager, list[dict]]:
+        from kikubot import session as session_mod
+
+        monkeypatch.setattr(session_mod.config, "state_file", tmp_path / "s.json")
+        written: list[dict] = []
+        monkeypatch.setattr(
+            session_mod,
+            "schedule_async_json_write",
+            lambda path, data, **kw: written.append(data),
+        )
+        return SessionManager(), written
+
+    def test_save_records_each_bound_topics_session(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        mgr, written = self._saving(monkeypatch, tmp_path)
+        mgr.thread_bindings = {100: {42: "@5", 43: "docker:assistant"}}
+        mgr.window_states = {
+            "@5": WindowState(session_id=SID_A),
+            "docker:assistant": WindowState(session_id=SID_B),
+        }
+        mgr._save_state()
+        # Docker bindings revive through their own offer.
+        assert written[-1]["topic_sessions"] == {"100:42": [SID_A]}
+        assert mgr.get_topic_sessions(100, 42) == [SID_A]
+
+    def test_history_newest_first_without_repeats(self, monkeypatch, tmp_path) -> None:
+        mgr, written = self._saving(monkeypatch, tmp_path)
+        mgr.thread_bindings = {100: {42: "@5"}}
+        state = WindowState(session_id=SID_A)
+        mgr.window_states = {"@5": state}
+        mgr._save_state()
+        state.session_id = SID_B  # /clear, 🆕, or a resume of another one
+        mgr._save_state()
+        mgr._save_state()
+        state.session_id = SID_A  # back to the first
+        mgr._save_state()
+        assert written[-1]["topic_sessions"] == {"100:42": [SID_A, SID_B]}
+
+    def test_history_is_capped(self, monkeypatch, tmp_path) -> None:
+        from kikubot.session import TOPIC_SESSIONS_MAX
+
+        mgr, _ = self._saving(monkeypatch, tmp_path)
+        mgr.thread_bindings = {100: {42: "@5"}}
+        state = WindowState()
+        mgr.window_states = {"@5": state}
+        for n in range(TOPIC_SESSIONS_MAX + 3):
+            state.session_id = f"{n:08d}-1111-2222-3333-444444444444"
+            mgr._save_state()
+        history = mgr.get_topic_sessions(100, 42)
+        assert len(history) == TOPIC_SESSIONS_MAX
+        assert history[0] == state.session_id
+
+    def test_record_outlives_the_window(self, monkeypatch, tmp_path) -> None:
+        mgr, written = self._saving(monkeypatch, tmp_path)
+        mgr.thread_bindings = {100: {42: "@5"}}
+        mgr.window_states = {"@5": WindowState(session_id=SID_A)}
+        mgr._save_state()
+        mgr.thread_bindings = {}
+        mgr.window_states = {}
+        mgr._save_state()
+        assert written[-1]["topic_sessions"] == {"100:42": [SID_A]}
+
+    def test_other_topics_sessions(self, mgr: SessionManager) -> None:
+        mgr.topic_sessions = {"100:42": [SID_A], "100:43": [SID_B], "7:1": [SID_A]}
+        assert mgr.sessions_of_other_topics(100, 42) == {SID_A, SID_B}
+        assert mgr.sessions_of_other_topics(100, 43) == {SID_A}
+
+    def test_round_trip_and_bad_ids_dropped(self, monkeypatch, tmp_path) -> None:
+        from kikubot import session as session_mod
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "topic_sessions": {
+                        "100:42": [SID_A, "$(rm -rf ~)", SID_B],
+                        "100:43": SID_B,  # a plain id
+                        "100:44": ["bad"],
+                    },
+                    "topic_roles": {"100:42": "Log gym notes"},
+                }
+            )
+        )
+        monkeypatch.setattr(session_mod.config, "state_file", state_file)
+        mgr = SessionManager()
+        assert mgr.topic_sessions == {"100:42": [SID_A, SID_B], "100:43": [SID_B]}
+        assert mgr.get_topic_role(100, 42) == "Log gym notes"
+        assert mgr.get_topic_role(100, None) == ""
+        assert mgr.get_topic_sessions(100, None) == []
+
+    def test_set_and_clear_role(self, mgr: SessionManager) -> None:
+        mgr.set_topic_role(100, 42, "  Log gym notes\n- no questions  ")
+        assert mgr.get_topic_role(100, 42) == "Log gym notes\n- no questions"
+        mgr.set_topic_role(100, 42, "")
+        assert mgr.get_topic_role(100, 42) == ""
+        # Kept as "": the hook tells a resumed conversation it's gone.
+        assert mgr.topic_roles == {"100:42": ""}
+        mgr.set_topic_role(100, 43, "")  # never had one: nothing to mark
+        assert "100:43" not in mgr.topic_roles
+
+    def test_forget_drops_role_and_sessions(self, mgr: SessionManager) -> None:
+        mgr.topic_roles = {"100:42": "r", "100:43": "keep"}
+        mgr.topic_sessions = {"100:42": [SID_A]}
+        mgr.forget_topic_memory(100, 42)
+        assert mgr.topic_roles == {"100:43": "keep"}
+        assert mgr.topic_sessions == {}
+
+    def test_topic_env(self) -> None:
+        assert SessionManager.topic_env(100, 42) == {"KIKUBOT_TOPIC": "100:42"}
+        assert SessionManager.topic_env(100, None) == {}
+
+
 class TestThreadDirectoryMemory:
     """Learned topic→directory memory (auto-rebind by permanent thread_id)."""
 

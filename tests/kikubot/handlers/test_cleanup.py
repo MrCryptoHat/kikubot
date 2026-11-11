@@ -33,6 +33,8 @@ async def test_purge_tmux_binding_kills_window_and_unbinds():
         mock_tmux.kill_window.assert_awaited_once_with("@5")
         mock_sm.unbind_thread.assert_called_once_with(1, 42)
         mock_clear.assert_awaited_once_with(1, 42, bot)
+        # Its role and last conversation go only with the topic itself.
+        mock_sm.forget_topic_memory.assert_called_once_with(1, 42)
 
 
 @pytest.mark.asyncio

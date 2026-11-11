@@ -39,6 +39,14 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   new topic picks its own agent.
 - **`/mode`** shows the agent's permission mode; `/mode plan` (or `manual`,
   `accept_edits`, `auto`) switches it.
+- **`/role` — a topic's standing instructions.** `/role <text>` gives the
+  topic a role that outlives every session in it: each Claude session the
+  topic starts, resumes, clears or compacts gets it from the SessionStart
+  hook, and a running agent is told at once. `/role` shows it, `/role off`
+  removes it. Host agents only; a container agent keeps its CLAUDE.md. Apps
+  get it as the session action `role` (it takes text: `input`) and its
+  current text from the inline query `role <chat_id>:<thread_id>`
+  ([format](docs/agent-status-format.md#role)).
 
 ### Changed
 
@@ -57,6 +65,12 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
 
 ### Fixed
 
+- A topic now remembers its own conversations. Bringing an agent back (🔄,
+  a dead window, `KIKUBOT_AUTO_RESUME_AGENTS` after a reboot) used to take
+  the folder's newest session, which in a folder shared by several topics
+  was often another topic's; it now takes the topic's own last one. The
+  session picker lists the topic's conversations first, marked ⭐, and the
+  ones other topics ran last.
 - A busy agent's status JSON over Telegram's size cap no longer loses its
   session actions: the edited-file list and other long lists go first.
 - A Codex prompt with its newer key-hint footer («enter continue · esc skip»,

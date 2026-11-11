@@ -166,6 +166,21 @@ class TestOnRealTmux:
         assert await manager.find_window_by_id(wid) is None
         assert await manager.kill_window(wid) is False  # already gone
 
+    async def test_window_env_reaches_its_shell(self, tmux_server, tmp_path) -> None:
+        # The SessionStart hook finds a still-starting window's topic by it.
+        tmux, manager, signal = tmux_server
+        ok, _, _, wid = await manager.create_window(
+            str(tmp_path),
+            window_name="env",
+            start_claude=False,
+            env={"KIKUBOT_TOPIC": "5:42"},
+        )
+        assert ok
+        cmd = f'[ "$KIKUBOT_TOPIC" = 5:42 ] && {signal} env-ok'
+        assert await manager.send_keys(wid, cmd, enter=False)
+        assert await manager.send_keys(wid, "", enter=True, literal=False)
+        tmux("wait-for", "env-ok")
+
     async def test_non_ascii_name_survives_a_bare_locale(
         self, tmux_server, tmp_path, monkeypatch
     ) -> None:

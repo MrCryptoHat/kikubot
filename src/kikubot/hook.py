@@ -76,27 +76,87 @@ def _kikubot_tmux_session_name() -> str:
     return os.environ.get("TMUX_SESSION_NAME", "") or "kikubot"
 
 
-def _emit_agent_brief() -> None:
-    """Print the SessionStart context payload that carries `_AGENT_BRIEF`.
+# Header of a topic's /role text in the SessionStart context. Agent-directed,
+# English, outside i18n (like _AGENT_BRIEF).
+_ROLE_HEADER = (
+    "[kikubot] Standing instructions for this Telegram topic, set by the user "
+    "with /role. They hold for every session in this topic until the user "
+    "changes them:"
+)
+
+
+# Said to a conversation that resumes (or compacts) after its topic's role
+# was removed: the old role is still in its context.
+_ROLE_REMOVED = (
+    "[kikubot] This topic's standing instructions (/role) were removed by the "
+    "user; any given earlier no longer apply."
+)
+
+
+def _topic_role(window_id: str) -> str | None:
+    """The /role text of the topic this window serves; "" if it was removed,
+    None if it never had one.
+
+    Read from state.json (written atomically by the bot, so a read sees a
+    whole file). The binding names the topic once it is saved — unless two
+    name this window (a stale one after a tmux restart reused the id); a
+    window still starting has none yet — its SessionStart fires before the
+    bot binds it — so the topic it was created for (``TOPIC_ENV``) answers
+    then. Any failure means no role: the hook must never break a session
+    start.
+    """
+    from .utils import TOPIC_ENV, kikubot_dir
+
+    try:
+        state = json.loads((kikubot_dir() / "state.json").read_text())
+        roles = state.get("topic_roles") or {}
+        if not roles:
+            return None
+        bound = [
+            f"{uid}:{tid}"
+            for uid, binds in (state.get("thread_bindings") or {}).items()
+            for tid, wid in (binds or {}).items()
+            if wid == window_id
+        ]
+        key = bound[0] if len(bound) == 1 else os.environ.get(TOPIC_ENV, "")
+        role = roles.get(key)
+    except (OSError, ValueError, AttributeError, TypeError) as e:
+        logger.warning("Topic role unreadable: %s", e)
+        return None
+    return role.strip() if isinstance(role, str) else None
+
+
+def _emit_agent_brief(role: str | None = None, source: str = "") -> None:
+    """Print the SessionStart context payload: `_AGENT_BRIEF` and the topic role.
 
     Claude Code merges ``hookSpecificOutput.additionalContext`` into the
     session's context; a version that fails to parse the JSON falls back to
     treating SessionStart stdout as context, so the briefing lands either
-    way. Opt out with ``KIKUBOT_AGENT_BRIEF=0`` (an operator who already
-    documents the protocol in their own CLAUDE.md).
+    way. Opt out of the briefing with ``KIKUBOT_AGENT_BRIEF=0`` (an operator
+    who already documents the protocol in their own CLAUDE.md); a topic's
+    role (/role) is the user's own words and is sent regardless. A removed
+    role ("") is said to be removed only where an old one may linger: a
+    resumed or compacted conversation (``source``), not a fresh one.
     """
-    if os.environ.get("KIKUBOT_AGENT_BRIEF", "").strip().lower() in (
+    parts = []
+    if os.environ.get("KIKUBOT_AGENT_BRIEF", "").strip().lower() not in (
         "0",
         "false",
         "no",
     ):
+        parts.append(_AGENT_BRIEF)
+    if role:
+        parts.append(f"{_ROLE_HEADER}\n\n{role}")
+    elif role == "" and source in ("resume", "compact"):
+        parts.append(_ROLE_REMOVED)
+    if not parts:
         return
     print(
         json.dumps(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": _AGENT_BRIEF,
+                    "additionalContext": "\n\n".join(parts),
                 }
             },
             ensure_ascii=False,
@@ -686,4 +746,4 @@ def hook_main() -> None:
     # Runs last on purpose — printing to stdout must not preempt the
     # session_map write, which is what makes replies arrive at all.
     if tmux_session_name == _kikubot_tmux_session_name():
-        _emit_agent_brief()
+        _emit_agent_brief(_topic_role(window_id), str(payload.get("source", "")))

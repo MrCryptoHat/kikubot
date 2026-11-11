@@ -15,6 +15,7 @@ Key components:
 
 import os
 import time
+from collections.abc import Collection
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -23,7 +24,7 @@ from ..agent_session import AgentSession
 
 from ..config import config
 from ..i18n import tr
-from ..runtimes import get_runtime, pickable_runtimes
+from ..runtimes import AgentRuntime, get_runtime, pickable_runtimes
 from .callback_data import (
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
@@ -275,10 +276,49 @@ def _folder_lines(directory: str | None) -> list[str]:
 PICKER_SESSION_ROWS = 5
 
 
+def order_for_topic(
+    sessions: list[AgentSession], own: Collection[str], others: Collection[str]
+) -> list[AgentSession]:
+    """The picker's list in a topic: its own conversations first, others' last.
+
+    Several topics can share a folder (➕ siblings, a worktree's main), so
+    the folder's list mixes their conversations and its newest was often
+    another topic's. ``own`` are this topic's sessions, ``others`` those
+    other topics have run (``SessionManager.topic_sessions``). What no topic
+    claims — started outside the bot, or before topics kept a history —
+    comes next; other topics' come last, not hidden: a closed topic keeps
+    its claims, and its conversations must stay reachable. Each part keeps
+    the listing's newest-first order. Callers cache the result
+    (SESSIONS_KEY), so a tap's index still names the right session.
+    """
+    own_set, others_set = set(own), set(others) - set(own)
+
+    def rank(s: AgentSession) -> int:
+        if s.session_id in own_set:
+            return 0
+        return 2 if s.session_id in others_set else 1
+
+    return sorted(sessions, key=rank)  # stable: newest-first within a part
+
+
+async def sessions_for_topic(
+    rt: AgentRuntime, directory: str, user_id: int, thread_id: int | None
+) -> tuple[list[AgentSession], set[str]]:
+    """``rt``'s sessions in ``directory`` as this topic's picker lists them,
+    and which of them are the topic's own (they get the star)."""
+    from ..session import session_manager
+
+    own = session_manager.get_topic_sessions(user_id, thread_id)
+    listed = await rt.list_sessions(session_manager, directory)
+    others = session_manager.sessions_of_other_topics(user_id, thread_id)
+    return order_for_topic(listed, own, others), set(own)
+
+
 def build_session_picker(
     sessions: list[AgentSession],
     directory: str | None = None,
     active_runtime: str = "claude",
+    own_session_ids: Collection[str] = (),
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Session picker with an agent-switcher row.
 
@@ -299,6 +339,9 @@ def build_session_picker(
         directory: absolute path of the folder (``$HOME`` collapsed to ``~`` in
             the header) so the user can confirm the topic resolved as expected.
         active_runtime: the runtime whose sessions these are.
+        own_session_ids: the topic's own conversations
+            (:func:`sessions_for_topic`): their rows are starred and the text
+            says why.
 
     Returns: (text, keyboard).
     """
@@ -306,16 +349,20 @@ def build_session_picker(
     lines = [tr("dirb.resume_header")]
     lines.extend(_folder_lines(directory))
     lines.append(tr("dirb.resume_found") if sessions else tr("dirb.no_sessions"))
+    shown = sessions[:PICKER_SESSION_ROWS]
+    if any(s.session_id in own_session_ids for s in shown):
+        lines.append(tr("dirb.own_session_hint"))
 
     buttons: list[list[InlineKeyboardButton]] = []
 
     # Resume buttons, one full-width row per session — a 2-per-row grid
     # squeezed titles into ~14 chars of mush (the redesign's trigger). Indices
     # address the SESSIONS_KEY cache, so showing a prefix keeps them aligned.
-    for i, s in enumerate(sessions[:PICKER_SESSION_ROWS]):
+    for i, s in enumerate(shown):
         title = s.summary[:24] + "…" if len(s.summary) > 24 else s.summary
         age = _relative_time_short(s.file_path)
-        label = f"▶ {title} · {age}" if age else f"▶ {title}"
+        mark = "⭐" if s.session_id in own_session_ids else "▶"
+        label = f"{mark} {title} · {age}" if age else f"{mark} {title}"
         buttons.append(
             [InlineKeyboardButton(label, callback_data=f"{CB_SESSION_SELECT}{i}")]
         )

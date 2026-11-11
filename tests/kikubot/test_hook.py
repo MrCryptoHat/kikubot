@@ -519,7 +519,12 @@ class TestAgentBrief:
     """
 
     @staticmethod
-    def _run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, session_name: str) -> str:
+    def _run(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        session_name: str,
+        source: str = "startup",
+    ) -> str:
         monkeypatch.setenv("KIKUBOT_DIR", str(tmp_path))
         monkeypatch.setenv("TMUX_PANE", "%7")
         monkeypatch.setattr("kikubot.hook._count_claude_ancestors", lambda: 1)
@@ -539,6 +544,7 @@ class TestAgentBrief:
                         "session_id": "550e8400-e29b-41d4-a716-446655440000",
                         "cwd": "/home/user/project",
                         "hook_event_name": "SessionStart",
+                        "source": source,
                     }
                 )
             ),
@@ -576,3 +582,117 @@ class TestAgentBrief:
         monkeypatch.setenv("KIKUBOT_AGENT_BRIEF", "0")
         assert self._run(monkeypatch, tmp_path, "kikubot") == ""
         assert (tmp_path / "session_map.json").exists()
+
+
+class TestTopicRole:
+    """A topic's /role rides every SessionStart of the window serving it.
+
+    Kept per topic, not per session, so a restart, /clear or compaction
+    never loses it. The binding names the topic; a window still starting has
+    none yet, and the topic it was created for (KIKUBOT_TOPIC) answers.
+    """
+
+    ROLE = "Only log my gym notes as tasks. Don't ask questions."
+
+    @staticmethod
+    def _state(tmp_path: Path, *, bindings: dict, roles: dict) -> None:
+        (tmp_path / "state.json").write_text(
+            json.dumps({"thread_bindings": bindings, "topic_roles": roles})
+        )
+
+    def _ctx(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str = "startup"
+    ) -> str:
+        out = TestAgentBrief._run(monkeypatch, tmp_path, "kikubot", source)
+        return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out else ""
+
+    def test_bound_window_gets_its_topics_role(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("KIKUBOT_TOPIC", raising=False)
+        self._state(tmp_path, bindings={"5": {"42": "@3"}}, roles={"5:42": self.ROLE})
+        ctx = self._ctx(monkeypatch, tmp_path)
+        assert "send file" in ctx  # the brief stays
+        assert "/role" in ctx and ctx.endswith(self.ROLE)
+
+    def test_window_still_starting_uses_the_topic_it_was_made_for(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("KIKUBOT_TOPIC", "5:42")
+        self._state(tmp_path, bindings={"5": {"7": "@1"}}, roles={"5:42": self.ROLE})
+        assert self._ctx(monkeypatch, tmp_path).endswith(self.ROLE)
+
+    def test_the_binding_wins_over_the_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A window adopted by another topic serves that topic now.
+        monkeypatch.setenv("KIKUBOT_TOPIC", "5:99")
+        self._state(
+            tmp_path,
+            bindings={"5": {"42": "@3"}},
+            roles={"5:42": self.ROLE, "5:99": "someone else's role"},
+        )
+        ctx = self._ctx(monkeypatch, tmp_path)
+        assert ctx.endswith(self.ROLE) and "someone else" not in ctx
+
+    def test_other_topics_role_is_not_shown(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("KIKUBOT_TOPIC", raising=False)
+        self._state(tmp_path, bindings={"5": {"42": "@3"}}, roles={"5:8": self.ROLE})
+        assert self.ROLE not in self._ctx(monkeypatch, tmp_path)
+
+    def test_role_survives_the_brief_opt_out(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("KIKUBOT_AGENT_BRIEF", "0")
+        monkeypatch.delenv("KIKUBOT_TOPIC", raising=False)
+        self._state(tmp_path, bindings={"5": {"42": "@3"}}, roles={"5:42": self.ROLE})
+        ctx = self._ctx(monkeypatch, tmp_path)
+        assert "send file" not in ctx and ctx.endswith(self.ROLE)
+
+    def test_unreadable_state_never_breaks_the_start(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("KIKUBOT_TOPIC", "5:42")
+        (tmp_path / "state.json").write_text("{not json")
+        ctx = self._ctx(monkeypatch, tmp_path)
+        assert "send file" in ctx
+        assert (tmp_path / "session_map.json").exists()
+
+    def test_foreign_tmux_gets_no_role(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("KIKUBOT_TOPIC", "5:42")
+        self._state(tmp_path, bindings={}, roles={"5:42": self.ROLE})
+        assert TestAgentBrief._run(monkeypatch, tmp_path, "work") == ""
+
+    def test_two_bindings_on_one_window_defer_to_the_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A stale binding to a reused window id (tmux restarted) must not
+        # hand this window another topic's role.
+        monkeypatch.setenv("KIKUBOT_TOPIC", "5:42")
+        self._state(
+            tmp_path,
+            bindings={"5": {"7": "@3", "42": "@3"}},
+            roles={"5:42": self.ROLE, "5:7": "stale topic's role"},
+        )
+        ctx = self._ctx(monkeypatch, tmp_path)
+        assert ctx.endswith(self.ROLE) and "stale" not in ctx
+
+    @pytest.mark.parametrize("source", ["resume", "compact"])
+    def test_removed_role_is_retracted_where_it_may_linger(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
+    ) -> None:
+        monkeypatch.delenv("KIKUBOT_TOPIC", raising=False)
+        self._state(tmp_path, bindings={"5": {"42": "@3"}}, roles={"5:42": ""})
+        assert "were removed" in self._ctx(monkeypatch, tmp_path, source)
+
+    @pytest.mark.parametrize("source", ["startup", "clear"])
+    def test_removed_role_is_not_mentioned_to_a_fresh_conversation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
+    ) -> None:
+        monkeypatch.delenv("KIKUBOT_TOPIC", raising=False)
+        self._state(tmp_path, bindings={"5": {"42": "@3"}}, roles={"5:42": ""})
+        assert "/role" not in self._ctx(monkeypatch, tmp_path, source)

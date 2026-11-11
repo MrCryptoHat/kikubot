@@ -1,4 +1,4 @@
-"""Inline queries ``status``, ``screen``, ``keys`` — the agent's status and terminal.
+"""Inline queries ``status``, ``screen``, ``keys``, ``role`` — an agent's status and terminal.
 
 Inert until the bot owner enables inline mode in @BotFather (/setinline):
 Telegram sends no inline queries before that. Shapes:
@@ -12,6 +12,8 @@ Telegram sends no inline queries before that. Shapes:
   (pane_screen.py), for a client that draws it itself; same topic check.
 - ``keys <chat_id>:<thread_id> <seq> <token>… .`` — press keys in that
   terminal and answer with its screen (inline_keys.py); same topic check.
+- ``role <chat_id>:<thread_id>`` — that topic's /role text, for a client's
+  role editor to start from; same topic check.
 - anything else (``@bot``, ``@bot status``, ``@bot <name>``) — one card per
   agent of the user, filtered by name, for official Telegram.
 
@@ -24,6 +26,7 @@ captures the pane (read-only, a few ms); ``keys`` is the only one that types.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -41,13 +44,14 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from ..agent_status import AgentStatus, build_status
 from ..i18n import tr
 from ..pane_screen import MAX_BACK, MAX_PARTS, screen_messages
-from ..session import session_manager
+from ..session import TOPIC_ROLE_MAX_CHARS, session_manager
 from . import effective_user, is_user_allowed, pane_cache
 from .inline_keys import parse_keys_query, run_keys
 
 logger = logging.getLogger(__name__)
 
 _TARGETED = re.compile(r"^\s*status\s+(-?\d+):(\d+)\s*$", re.IGNORECASE)
+_ROLE = re.compile(r"^\s*role\s+(-?\d+):(\d+)\s*$", re.IGNORECASE)
 _SCREEN = re.compile(
     r"^\s*screen\s+(-?\d+):(\d+)((?:\s+(?:back=\d+|h=[0-9a-f]{6,40}))*)\s*$",
     re.IGNORECASE,
@@ -62,6 +66,44 @@ def parse_target(query: str) -> tuple[int, int] | None:
     """(chat_id, thread_id) from ``status <chat_id>:<thread_id>``, else None."""
     m = _TARGETED.match(query)
     return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def parse_role_target(query: str) -> tuple[int, int] | None:
+    """(chat_id, thread_id) from ``role <chat_id>:<thread_id>``, else None."""
+    m = _ROLE.match(query)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+async def _answer_role(
+    query: InlineQuery, user_id: int, chat_id: int, thread_id: int
+) -> None:
+    """Answer ``role``: one ``role.v1.json`` article; [] for a foreign topic.
+
+    The text is the user's own, so it stays out of the status JSON (which
+    carries no message text) and comes only when a client asks for it.
+    """
+    if resolve_topic_binding(user_id, chat_id, thread_id) is None:
+        await query.answer([], cache_time=0, is_personal=True)
+        return
+    payload = {
+        "v": 1,
+        "role": session_manager.get_topic_role(user_id, thread_id),
+        "max": TOPIC_ROLE_MAX_CHARS,
+    }
+    await _answer(
+        query,
+        [
+            InlineQueryResultArticle(
+                id="role.v1.json",
+                title="role.v1.json",
+                input_message_content=InputTextMessageContent(
+                    json.dumps(payload, ensure_ascii=False)
+                ),
+            )
+        ],
+        cache_time=0,
+        is_personal=True,
+    )
 
 
 def parse_screen_target(query: str) -> tuple[int, int, int, str | None] | None:
@@ -267,6 +309,10 @@ async def inline_status_handler(
     if screen_target is not None:
         await _answer_screen(query, user.id, *screen_target)
         _note_slow("screen", t0)
+        return
+    role_target = parse_role_target(query.query)
+    if role_target is not None:
+        await _answer_role(query, user.id, *role_target)
         return
     keys_target = parse_keys_query(query.query)
     if keys_target is not None:

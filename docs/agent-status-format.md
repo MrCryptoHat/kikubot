@@ -25,6 +25,7 @@ JSON described here. Nothing in it is specific to one client.
 | `status <chat_id>:<thread_id>` | `status` (the card) and `status.v1.json` (JSON) for that topic's agent |
 | `screen <chat_id>:<thread_id> [back=<N>]` | the agent's terminal as text, see [Screen](#screen) |
 | `keys <chat_id>:<thread_id> <seq> <token> … .` | press keys in that terminal, answered with its screen, see [Keys](#keys) |
+| `role <chat_id>:<thread_id>` | `role.v1.json`: the topic's role text, for the role editor, see [Role](#role) |
 | empty, `status`, or a name | one card per agent of the asking user, filtered by name |
 
 `chat_id` is the Bot API form (`-100…`), `thread_id` the topic's
@@ -118,7 +119,7 @@ Sections sent today, in this order:
 Icons are names from this list; a client draws its own glyph or none:
 `hand`, `code`, `plan`, `bolt`, `warning`, and for session actions `plus`,
 `branch`, `compress`, `context`, `model`, `trash`, `undo`, `history`,
-`background`, `diff`, `restart`, `stop`, `delete`.
+`background`, `diff`, `restart`, `stop`, `delete`, `role`.
 
 ### Session actions
 
@@ -137,6 +138,7 @@ a bound topic.
 | `confirm` | present when the client should ask this question first |
 | `terminal` | `true` when the result is a picker or dialog in the agent's terminal: open the terminal after sending |
 | `icon` | from the list above |
+| `input` | present when the action takes text, see below |
 
 | id | cmd | group | notes |
 |---|---|---|---|
@@ -150,11 +152,26 @@ a bound topic.
 | `resume` | `/resume` | session | terminal: the CLI's list of past conversations |
 | `background` | `/bgtask` | session | sends the running tool to the background (Ctrl+B); refused while idle or in a dialog. Not the CLI's own `/background`, which detaches the whole session |
 | `diff` | `/diff` | session | turns the per-edit screenshots on or off for the topic |
+| `role` | `/role` | session | the topic's standing instructions for its agent; takes text (`input`). Not for a container agent |
 | `restart` | `/restart` | danger | confirm; the same conversation continues |
 | `end` | `/kill` | danger | confirm |
 | `delete` | `/delete` | danger | only for an extra agent (a worktree agent or a sibling), as on the panel. No `confirm`: the bot answers in the topic with its own, which says what would be lost (uncommitted or unmerged work); its ✅ deletes the agent and the topic |
 
 Items without `group` (older bots) belong under `session`.
+
+An item with `input` asks the user for text and sends `cmd`, a space and the
+text, as one message (line breaks kept):
+
+| Field | Meaning |
+|---|---|
+| `prefill` | an inline query (`<prefill> <chat_id>:<thread_id>`) whose answer holds the current text: start the editor from it, so changing and adding to it are the same edit |
+| `clear` | the message to send when the user empties the field |
+| `max` | the longest text the bot accepts, in characters |
+| `placeholder` | a hint for the empty field, ready to show |
+
+For `role`: the bot saves the text for the topic, tells a running agent at
+once, and gives it to every Claude session the topic starts, resumes, clears
+or compacts. It answers in the topic either way.
 
 ### Acting
 
@@ -317,6 +334,19 @@ characters. Count them as UTF-16 units to be safe (an emoji is 2).
 
 Every answer carries the current screen when it can be read; when it can't,
 the meta comes alone with `parts` 0.
+
+## Role
+
+`role <chat_id>:<thread_id>` answers one article, `role.v1.json`, whose
+`message_text` is:
+
+```json
+{"v": 1, "role": "Only log my gym notes as tasks.\nNo questions.", "max": 2000}
+```
+
+`role` is `""` when the topic has none. Same topic check as `status`; a
+topic without an agent gets no results. The text is the user's own, which is
+why it is not in the status JSON.
 
 ## Planned (same version, new sections)
 

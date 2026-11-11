@@ -122,9 +122,16 @@ def test_claude_status_from_snapshot(env):
         "/resume",
         "/bgtask",
         "/diff",
+        "/role",
         "/restart",
         "/kill",
     ]
+    role = next(c for c in st.commands if c["id"] == "role")
+    # Text in: the client asks for it, starting from the inline `role` answer.
+    assert role["input"]["prefill"] == "role"
+    assert role["input"]["clear"] == "/role off"
+    assert role["input"]["max"] > 0 and role["input"]["placeholder"]
+    assert role["icon"] in agent_status.ACTION_ICONS
 
 
 def test_json_v1_shape(env):

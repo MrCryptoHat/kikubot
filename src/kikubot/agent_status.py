@@ -107,7 +107,7 @@ def _mode_ids(offered: tuple[str, ...], current: str | None) -> list[str]:
 # Icons a session action may carry (docs/agent-status-format.md lists them).
 ACTION_ICONS = frozenset(
     {"plus", "branch", "compress", "trash", "undo", "history", "background", "diff"}
-    | {"restart", "stop", "model", "context", "delete"}
+    | {"restart", "stop", "model", "context", "delete", "role"}
 )
 
 _panes: dict[str, tuple[float, str | None]] = {}
@@ -829,7 +829,7 @@ def session_actions(binding: str, runtime: str, reserved: Iterable[str]) -> list
     to ask before sending; ``terminal`` says the result is a picker or dialog
     in the agent's terminal.
     """
-    from .session import session_manager
+    from .session import TOPIC_ROLE_MAX_CHARS, session_manager
 
     rt = get_runtime(runtime)
     taken = {r.lstrip("/").lower() for r in reserved}
@@ -869,6 +869,23 @@ def session_actions(binding: str, runtime: str, reserved: Iterable[str]) -> list
         add("background", "/bgtask", "session", icon="background")
     if rt.edit_tool_names:
         add("diff", "/diff", "session", icon="diff")
+    # The topic's standing instructions (/role). Text in, so the item says how
+    # to ask for it; the current text comes from the inline ``role`` query,
+    # not from here (no message text in this JSON). A container agent keeps
+    # its CLAUDE.md, and /role refuses it.
+    if binding.startswith("@"):
+        add(
+            "role",
+            "/role",
+            "session",
+            icon="role",
+            input={
+                "prefill": "role",
+                "clear": "/role off",
+                "max": TOPIC_ROLE_MAX_CHARS,
+                "placeholder": tr("astatus.role.placeholder"),
+            },
+        )
     add(
         "restart",
         "/restart",

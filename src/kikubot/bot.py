@@ -74,6 +74,7 @@ from .handlers.commands import (
     menu_button_dispatcher,
     bind_command,
     react_command,
+    role_command,
     tables_command,
     restart_command,
     screenshot_command,
@@ -771,6 +772,7 @@ async def _create_and_bind_window(
         window_name=session_manager.topic_window_name(user.id, pending_thread_id),
         resume_session_id=resume_session_id,
         runtime=rt.name,
+        env=session_manager.topic_env(user.id, pending_thread_id),
     )
     if success:
         # Stamp runtime (+cwd for hookless runtimes) before anything can poll.
@@ -1573,6 +1575,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("worktree", worktree_command))
     application.add_handler(CommandHandler("bgtask", bgtask_command))
     application.add_handler(CommandHandler("delete", delete_command))
+    application.add_handler(CommandHandler("role", role_command))
     application.add_handler(CommandHandler("pin", pin_command))
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("bind", bind_command))

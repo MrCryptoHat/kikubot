@@ -121,6 +121,7 @@ from .directory_browser import (
     clear_browse_state,
     clear_session_picker_state,
     clear_window_picker_state,
+    sessions_for_topic,
 )
 from . import pane_cache
 from .codex_status_parser import (
@@ -456,13 +457,15 @@ async def _handle_dir_confirm(
     # to start fresh on the active runtime. This replaces the old two-screen
     # flow (session picker → separate runtime picker for the no-sessions case).
     rt = default_runtime()
-    sessions = await rt.list_sessions(session_manager, selected_path)
+    sessions, own = await sessions_for_topic(
+        rt, selected_path, user.id, confirm_thread_id
+    )
     if context.user_data is not None:
         context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
         context.user_data[SESSIONS_KEY] = sessions
         context.user_data[PICKER_RUNTIME_KEY] = rt.name
         context.user_data["_selected_path"] = selected_path
-    text, keyboard = build_session_picker(sessions, selected_path, rt.name)
+    text, keyboard = build_session_picker(sessions, selected_path, rt.name, own)
     await safe_edit(query, text, reply_markup=keyboard)
     await query.answer()
 
@@ -599,12 +602,14 @@ async def _handle_runtime_tab(
 
     # get_runtime normalises an unknown suffix to "claude" (safe degrade).
     runtime = get_runtime(_extract_suffix(data, CB_RUNTIME_TAB)).name
-    sessions = await get_runtime(runtime).list_sessions(session_manager, selected_path)
+    sessions, own = await sessions_for_topic(
+        get_runtime(runtime), selected_path, user.id, pending_tid
+    )
     if context.user_data is not None:
         context.user_data[SESSIONS_KEY] = sessions
         context.user_data[PICKER_RUNTIME_KEY] = runtime
 
-    text, keyboard = build_session_picker(sessions, selected_path, runtime)
+    text, keyboard = build_session_picker(sessions, selected_path, runtime, own)
     await safe_edit(query, text, reply_markup=keyboard)
     await query.answer()
 

@@ -49,6 +49,7 @@ from .terminal_keys import CLEAR_KEY, EXIT_KEYS, FINAL_KEYS, KeyToken, exit_arme
 from .tmux_manager import TmuxReadError, tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import (
+    TOPIC_ENV,
     atomic_write_json,
     is_valid_session_id,
     same_dir,
@@ -58,6 +59,13 @@ from .voice.safety import Reservation, VoiceBudget
 from .worktrees import WorktreeMeta, agent_name
 
 logger = logging.getLogger(__name__)
+
+# Conversations a topic's history keeps (topic_sessions): its picker shows the
+# newest few; the rest stay reachable through the CLI's own /resume.
+TOPIC_SESSIONS_MAX = 20
+# A topic's role (/role) is context every one of its sessions carries from
+# its first token: room for a page of instructions, not for a document.
+TOPIC_ROLE_MAX_CHARS = 2000
 
 _T = TypeVar("_T")
 
@@ -273,6 +281,20 @@ class SessionManager:
     # same way; otherwise its window would be the folder name plus -2. The Bot
     # API can't read a topic's title back, so it is recorded at creation.
     topic_agent_names: dict[str, str] = field(default_factory=dict)
+    # The conversations each topic has run ("user_id:thread_id" → session
+    # ids, newest first, at most TOPIC_SESSIONS_MAX), kept after its window
+    # is gone. The window's own state dies with the window (the boot sweep
+    # drops it), and a folder's sessions say nothing of which topic held them
+    # once several topics share it (➕ siblings, worktree mains): the newest
+    # was often another topic's. The revive takes the newest of the topic's
+    # own; the picker stars them and hides other topics'. Refreshed from the
+    # bindings on every save (_note_topic_sessions); dropped with the topic.
+    topic_sessions: dict[str, list[str]] = field(default_factory=dict)
+    # Standing instructions per topic ("user_id:thread_id" → text), set with
+    # /role. The SessionStart hook reads them from state.json and hands them
+    # to every Claude session the topic starts, resumes, clears or compacts,
+    # so a role outlives any one session. Dropped with the topic.
+    topic_roles: dict[str, str] = field(default_factory=dict)
     # Global toggle (/react): bot puts a 👀 reaction on a user message the
     # moment the agent takes it into context. Default from KIKUBOT_REACTION_ACK
     # (on); /react overrides at runtime (persisted in state.json).
@@ -417,6 +439,7 @@ class SessionManager:
         snapshot submitted later always lands on disk after an earlier one.
         Drain on shutdown via ``shutdown_async_writer``.
         """
+        self._note_topic_sessions()
         state: dict[str, Any] = {
             "window_states": {k: v.to_dict() for k, v in self.window_states.items()},
             "user_window_offsets": {
@@ -436,6 +459,10 @@ class SessionManager:
             "stopped_docker_agents": sorted(self.stopped_docker_agents),
             "sub_agent_topics": sorted(self.sub_agent_topics),
             "topic_agent_names": dict(sorted(self.topic_agent_names.items())),
+            "topic_sessions": {
+                k: list(v) for k, v in sorted(self.topic_sessions.items())
+            },
+            "topic_roles": dict(sorted(self.topic_roles.items())),
             "reaction_ack_enabled": self.reaction_ack_enabled,
             "table_style": self.table_style,
             "voice_announced_sessions": sorted(self.voice_announced_sessions),
@@ -669,6 +696,16 @@ class SessionManager:
                     str(k): str(v)
                     for k, v in state.get("topic_agent_names", {}).items()
                 }
+                self.topic_sessions = {}
+                for k, ids in state.get("topic_sessions", {}).items():
+                    # A plain id: a state file from before the history.
+                    ids = [ids] if isinstance(ids, str) else list(ids or [])
+                    valid = [str(i) for i in ids if is_valid_session_id(str(i))]
+                    if valid:
+                        self.topic_sessions[str(k)] = valid[:TOPIC_SESSIONS_MAX]
+                self.topic_roles = {
+                    str(k): str(v) for k, v in state.get("topic_roles", {}).items()
+                }
                 self.reaction_ack_enabled = bool(
                     state.get("reaction_ack_enabled", config.reaction_ack_default)
                 )
@@ -746,6 +783,8 @@ class SessionManager:
                 self.stopped_docker_agents = set()
                 self.sub_agent_topics = set()
                 self.topic_agent_names = {}
+                self.topic_sessions = {}
+                self.topic_roles = {}
                 self.reaction_ack_enabled = config.reaction_ack_default
                 self.table_style = config.table_style_default
                 self.voice_announced_sessions = set()
@@ -1165,6 +1204,80 @@ class SessionManager:
             name = agent_name(meta.repo_name, meta.task_title) if meta else ""
         name = " ".join(name.split())[:126]
         return name or None
+
+    @staticmethod
+    def topic_env(user_id: int, thread_id: int | None) -> dict[str, str]:
+        """Environment for a topic's new window: which topic it serves."""
+        if thread_id is None:
+            return {}
+        return {TOPIC_ENV: f"{user_id}:{thread_id}"}
+
+    def _note_topic_sessions(self) -> None:
+        """Put every bound tmux topic's current session first in its history.
+
+        Runs on each save, so the record is as fresh as state.json itself and
+        stays as it was once the window is gone. Docker bindings revive
+        through their own offer and are left out.
+        """
+        for user_id, thread_id, wid in self.iter_thread_bindings():
+            if self._is_docker_binding(wid):
+                continue
+            state = self.window_states.get(wid)
+            if not state or not state.session_id:
+                continue
+            key = f"{user_id}:{thread_id}"
+            history = self.topic_sessions.get(key, [])
+            if history[:1] != [state.session_id]:
+                rest = [s for s in history if s != state.session_id]
+                self.topic_sessions[key] = [state.session_id, *rest][
+                    :TOPIC_SESSIONS_MAX
+                ]
+
+    def get_topic_sessions(self, user_id: int, thread_id: int | None) -> list[str]:
+        """The conversations this topic has run, newest first (topic_sessions)."""
+        if thread_id is None:
+            return []
+        return list(self.topic_sessions.get(f"{user_id}:{thread_id}", []))
+
+    def sessions_of_other_topics(self, user_id: int, thread_id: int | None) -> set[str]:
+        """Every session another topic has run: not this topic's to offer."""
+        mine = f"{user_id}:{thread_id}"
+        return {
+            sid
+            for key, ids in self.topic_sessions.items()
+            if key != mine
+            for sid in ids
+        }
+
+    def get_topic_role(self, user_id: int, thread_id: int | None) -> str:
+        """This topic's standing instructions (/role), or ""."""
+        if thread_id is None:
+            return ""
+        return self.topic_roles.get(f"{user_id}:{thread_id}", "")
+
+    def set_topic_role(self, user_id: int, thread_id: int, text: str) -> None:
+        """Set this topic's standing instructions; empty text removes them.
+
+        A removed role stays as "" rather than going: a conversation that had
+        it still carries it, and the hook tells such a resumed conversation
+        it no longer applies (hook._emit_agent_brief).
+        """
+        key = f"{user_id}:{thread_id}"
+        text = text.strip()
+        if self.topic_roles.get(key) == text or (
+            not text and key not in self.topic_roles
+        ):
+            return
+        self.topic_roles[key] = text
+        self._save_state()
+
+    def forget_topic_memory(self, user_id: int, thread_id: int) -> None:
+        """Drop what only a still-existing topic needs: its role and session."""
+        key = f"{user_id}:{thread_id}"
+        dropped = self.topic_roles.pop(key, None) is not None
+        dropped = self.topic_sessions.pop(key, None) is not None or dropped
+        if dropped:
+            self._save_state()
 
     def is_sub_agent_topic(self, user_id: int, thread_id: int | None) -> bool:
         """Was this topic's agent created as an extra beside another one?"""

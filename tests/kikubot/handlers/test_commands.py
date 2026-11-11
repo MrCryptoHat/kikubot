@@ -256,3 +256,114 @@ def test_menu_removal_only_where_the_old_menu_may_be() -> None:
         assert isinstance(pending_menu_removal(100, 42), ReplyKeyboardRemove)
         sm.menu_needs_clearing.return_value = False
         assert pending_menu_removal(100, 42) is None
+
+
+class TestRoleCommand:
+    """/role — the topic's standing instructions, kept past every session."""
+
+    @pytest.fixture
+    def sm(self, monkeypatch):
+        from kikubot.session import SessionManager
+
+        monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+        monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+        return SessionManager()
+
+    async def _run(
+        self, sm, text: str, *, wid: str = "", sent: bool = True, dialog: bool = False
+    ):
+        from kikubot.handlers.commands import role_command
+
+        update = MagicMock()
+        update.effective_user.id = 1
+        update.message.text = text
+        send = AsyncMock(return_value=(sent, ""))
+        reply = AsyncMock()
+        sm.resolve_window_for_thread = MagicMock(return_value=wid or None)
+        sm.capture_pane = AsyncMock(return_value="pane")
+        sm.send_to_window = send
+        with (
+            patch("kikubot.handlers.commands.is_user_allowed", return_value=True),
+            patch("kikubot.handlers.commands.get_thread_id", return_value=42),
+            patch("kikubot.handlers.commands.session_manager", sm),
+            patch("kikubot.handlers.commands.safe_reply", new=reply),
+            patch("kikubot.handlers.commands.is_interactive_ui", return_value=dialog),
+        ):
+            await role_command(update, MagicMock())
+        return reply.await_args.args[1], send
+
+    @pytest.mark.asyncio
+    async def test_set_in_a_topic_without_an_agent(self, sm):
+        said, deliver = await self._run(sm, "/role Log gym notes")
+        assert sm.get_topic_role(1, 42) == "Log gym notes"
+        assert said == tr("role.saved")
+        deliver.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_agent_is_told_at_once(self, sm):
+        said, deliver = await self._run(
+            sm, "/role@yourbot Log gym notes\n- no questions", wid="@5"
+        )
+        # Line breaks survive: the raw text, not context.args.
+        assert sm.get_topic_role(1, 42) == "Log gym notes\n- no questions"
+        note = deliver.await_args.args[1]
+        assert note.startswith("[kikubot]") and note.endswith("- no questions")
+        assert said == tr("role.saved_told")
+
+    @pytest.mark.asyncio
+    async def test_open_dialog_gets_no_note(self, sm):
+        # Typed into a dialog, the note would become its answer.
+        said, send = await self._run(sm, "/role Log", wid="@5", dialog=True)
+        assert sm.get_topic_role(1, 42) == "Log"
+        assert said == tr("role.saved_later")
+        send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_send_says_when(self, sm):
+        said, _ = await self._run(sm, "/role Log", wid="@5", sent=False)
+        assert said == tr("role.saved_later")
+
+    @pytest.mark.asyncio
+    async def test_show_and_none(self, sm):
+        said, _ = await self._run(sm, "/role")
+        assert said == tr("role.none")
+        sm.set_topic_role(1, 42, "Log gym notes")
+        said, deliver = await self._run(sm, "/role", wid="@5")
+        assert "Log gym notes" in said
+        deliver.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_off_clears_and_tells_the_agent(self, sm):
+        sm.set_topic_role(1, 42, "Log gym notes")
+        said, deliver = await self._run(sm, "/role off", wid="@5")
+        assert sm.get_topic_role(1, 42) == ""
+        assert "no longer apply" in deliver.await_args.args[1]
+        assert said == tr("role.cleared_told")
+
+    @pytest.mark.asyncio
+    async def test_too_long_is_refused(self, sm):
+        from kikubot.session import TOPIC_ROLE_MAX_CHARS
+
+        said, _ = await self._run(sm, "/role " + "x" * (TOPIC_ROLE_MAX_CHARS + 1))
+        assert sm.get_topic_role(1, 42) == ""
+        assert str(TOPIC_ROLE_MAX_CHARS) in said
+
+    @pytest.mark.asyncio
+    async def test_container_agent_is_refused(self, sm):
+        said, deliver = await self._run(sm, "/role Log", wid="docker:assistant")
+        assert sm.get_topic_role(1, 42) == ""
+        assert said == tr("role.docker")
+        deliver.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hookless_agent_hears_it_wont_come_back(self, sm):
+        sm.window_runtime = MagicMock(return_value="codex")
+        said, _ = await self._run(sm, "/role Log", wid="@5")
+        assert said.startswith(tr("role.saved_told"))
+        assert said.endswith(tr("role.no_hook", agent="Codex"))
+
+    @pytest.mark.asyncio
+    async def test_hookless_topic_without_an_agent_hears_it_too(self, sm):
+        sm.record_thread_directory(1, 42, "/w", runtime="codex")
+        said, _ = await self._run(sm, "/role Log")
+        assert said == f"{tr('role.saved')}\n{tr('role.no_hook', agent='Codex')}"
