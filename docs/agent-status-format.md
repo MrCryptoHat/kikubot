@@ -89,7 +89,9 @@ Ids of the sections to show first, in order; everything else goes behind a
 ### `sections` — the server-driven sheet
 
 An ordered list; draw them in order, skip a type you don't know. Each has
-`type`, `id`, `title`.
+`type`, `id`, `title`. The whole JSON must fit one Telegram message, so on
+a busy agent some sections are left out: `files` first, then `agents` and
+`session`; `commands` is the last to go.
 
 | `type` | Fields |
 |---|---|

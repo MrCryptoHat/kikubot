@@ -461,6 +461,20 @@ def test_json_never_exceeds_the_inline_cap(env, monkeypatch):
     assert json.loads(text)["v"] == 1
 
 
+def test_over_the_cap_the_session_menu_is_kept(env, monkeypatch):
+    """The menu was the last section, so it went first: a busy agent's client
+    lost every action. Long lists go first now."""
+    big = [agent_status.Item(f"r{i}", "x" * 50, "y" * 50) for i in range(80)]
+    monkeypatch.setattr(agent_status, "ITEM_PROVIDERS", [lambda src: big])
+    _write(env.dir, "@5", _SNAP)
+    st = agent_status.build_status("@5", now=NOW)
+    st.files = [f"src/module_{i}.py" for i in range(150)]
+    out = json.loads(st.to_json())
+    ids = [s["id"] for s in out["sections"]]
+    assert "commands" in ids
+    assert "files" not in ids and "session" not in ids
+
+
 def test_old_window_without_snapshot_reads_well(env):
     agent_status.note_usage(
         "sid-claude", AgentUsage(context_tokens=720000, model="claude-opus-5-5")

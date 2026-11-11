@@ -57,6 +57,8 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
 
 ### Fixed
 
+- A busy agent's status JSON over Telegram's size cap no longer loses its
+  session actions: the edited-file list and other long lists go first.
 - A Codex prompt with its newer key-hint footer («enter continue · esc skip»,
   e.g. its update prompt) is shown as a dialog again. A message typed into
   the update prompt picked the preselected «Update now», which quit Codex.

@@ -36,6 +36,31 @@ logger = logging.getLogger(__name__)
 
 FORMAT_VERSION = 1
 MAX_JSON_CHARS = 4000  # Telegram caps an inline result's message_text at 4096
+# Over the cap, sections go in this order: the long lists first, the session
+# menu last. Dropped from the end, the menu (~1.6 KB, always last) went first,
+# and a client lost every action on a busy agent (2026-11-11).
+DROP_ORDER = (
+    "files",
+    "agents",
+    "session",
+    "effort",
+    "limits",
+    "context",
+    "mode",
+    "model",
+    "commands",
+)
+
+
+def _drop_one(sections: list[dict]) -> list[dict]:
+    """``sections`` without the one DROP_ORDER gives up first (else the last)."""
+    ids = [s.get("id") for s in sections]
+    for victim in DROP_ORDER:
+        if victim in ids:
+            i = ids.index(victim)
+            return sections[:i] + sections[i + 1 :]
+    return sections[:-1]
+
 
 # A pane note older than this says nothing about the agent's state any more
 # (the poll refreshes bound windows every second).
@@ -306,10 +331,10 @@ class AgentStatus:
                 out["summary"] = [i for i in SUMMARY_IDS if i in ids]
             text = json.dumps(out, ensure_ascii=False, separators=(",", ":"))
             # message_text over Telegram's cap fails the WHOLE inline answer:
-            # drop sections from the end until it fits.
+            # drop sections, least needed first, until it fits.
             if len(text) <= MAX_JSON_CHARS or not sections:
                 return text
-            sections = sections[:-1]
+            sections = _drop_one(sections)
             out.pop("sections", None)
             out.pop("summary", None)
 
