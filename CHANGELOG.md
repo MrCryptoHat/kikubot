@@ -31,7 +31,9 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   each a command the topic accepts, grouped and marked for confirmation, for
   a client's menu ([format](docs/agent-status-format.md#session-actions)).
   New commands behind them: `/sibling` and `/worktree` (the panel's ➕ and
-  🌳) and `/bgtask` (Ctrl+B on the running tool, only while one runs).
+  🌳), `/bgtask` (Ctrl+B on the running tool, only while one runs) and
+  `/delete` (the panel's 🗑: only for a worktree agent or a sibling, with the
+  same confirm, never for a topic's own agent).
 - 🌳 (an agent on its own branch) is offered in any agent's git-project
   topic, Codex and Grok included: the bot makes the worktree itself and the
   new topic picks its own agent.
@@ -62,6 +64,7 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   still starting up.
 - The first reply after a quiet minute or more no longer waits for a new
   connection to Telegram: the bot keeps one warm.
+
 - A failed tmux read no longer reads as "every window is gone": the bot used
   to unbind a working agent's topic on one such read and kill its window 90 s
   later. tmux is driven through its CLI with short formats accepted only

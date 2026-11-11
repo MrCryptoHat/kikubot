@@ -116,7 +116,7 @@ Sections sent today, in this order:
 Icons are names from this list; a client draws its own glyph or none:
 `hand`, `code`, `plan`, `bolt`, `warning`, and for session actions `plus`,
 `branch`, `compress`, `context`, `model`, `trash`, `undo`, `history`,
-`background`, `diff`, `restart`, `stop`.
+`background`, `diff`, `restart`, `stop`, `delete`.
 
 ### Session actions
 
@@ -150,6 +150,7 @@ a bound topic.
 | `diff` | `/diff` | session | turns the per-edit screenshots on or off for the topic |
 | `restart` | `/restart` | danger | confirm; the same conversation continues |
 | `end` | `/kill` | danger | confirm |
+| `delete` | `/delete` | danger | only for an extra agent (a worktree agent or a sibling), as on the panel. No `confirm`: the bot answers in the topic with its own, which says what would be lost (uncommitted or unmerged work); its ✅ deletes the agent and the topic |
 
 Items without `group` (older bots) belong under `session`.
 

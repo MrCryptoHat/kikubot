@@ -1,6 +1,7 @@
 """Tests for the session-action commands a client's «Session» menu sends:
 /bgtask presses Ctrl+B only while a turn runs, never into a dialog;
-/sibling and /worktree open the same naming prompts as the panel's ➕ and 🌳."""
+/sibling and /worktree open the same naming prompts as the panel's ➕ and 🌳;
+/delete offers the panel's 🗑 confirm, only for an extra agent."""
 
 from __future__ import annotations
 
@@ -88,3 +89,59 @@ async def test_worktree_command_refuses_a_non_repo(sm):
         await commands.worktree_command(update, MagicMock())
     ask.assert_not_awaited()
     assert reply.await_args.args[1] == "no repo"
+
+
+def _delete_update():
+    message = SimpleNamespace(reply_text=AsyncMock())
+    return SimpleNamespace(message=message), message
+
+
+async def test_delete_command_refuses_a_main_topic(sm):
+    sm.can_delete_agent.return_value = False
+    update, message = _delete_update()
+    with (
+        patch(
+            "kikubot.handlers.worktrees.delete_offer", new=AsyncMock(return_value=None)
+        ),
+        patch.object(commands, "safe_reply", new=AsyncMock()) as reply,
+    ):
+        await commands.delete_command(update, MagicMock())
+    assert reply.await_args.args[1] == commands.tr("agentdel.main_topic")
+    message.reply_text.assert_not_awaited()
+
+
+async def test_delete_command_offers_the_sibling_confirm(sm):
+    from kikubot.handlers import agent_delete
+
+    sm.can_delete_agent.return_value = True
+    sm.is_docker_sub_agent.return_value = False
+    sm._is_docker_binding.return_value = False
+    update, message = _delete_update()
+    ctx = MagicMock()
+    ctx.user_data = {}
+    with (
+        patch(
+            "kikubot.handlers.worktrees.delete_offer", new=AsyncMock(return_value=None)
+        ),
+        patch.object(agent_delete, "session_manager", sm),
+    ):
+        await commands.delete_command(update, ctx)
+    text = message.reply_text.await_args.args[0]
+    assert text == commands.tr("agentdel.confirm_tmux", name="proj")
+    markup = message.reply_text.await_args.kwargs["reply_markup"]
+    ok = markup.inline_keyboard[0][0].callback_data
+    assert ok == "ad:ok:42"
+    assert ctx.user_data[agent_delete._TARGET_KEY] == (42, "@5")  # ✅ armed
+
+
+async def test_delete_command_offers_the_worktree_guard_first(sm):
+    """A worktree topic gets its own confirm, even with the agent stopped."""
+    sm.resolve_window_for_thread.return_value = None
+    update, message = _delete_update()
+    offer = ("⚠️ unmerged", MagicMock())
+    with patch(
+        "kikubot.handlers.worktrees.delete_offer", new=AsyncMock(return_value=offer)
+    ) as wt:
+        await commands.delete_command(update, MagicMock())
+    wt.assert_awaited_once_with(1, 42, "")
+    assert message.reply_text.await_args.args[0] == "⚠️ unmerged"

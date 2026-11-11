@@ -56,6 +56,14 @@ class _FakeSM:
     def can_offer_worktree(self, binding):
         return binding.startswith("@")
 
+    extra_agents: frozenset[str] = frozenset()
+
+    def is_worktree_window(self, binding):
+        return binding in self.extra_agents
+
+    def can_delete_agent(self, binding):
+        return binding in self.extra_agents
+
     # The real resolver: siblings (docker:<agent>/<slug>) must resolve to
     # their configured agent exactly as in production.
     split_docker_binding = staticmethod(session_mod.SessionManager.split_docker_binding)
@@ -693,6 +701,17 @@ def test_session_actions_shape(env):
     assert "confirm" not in by_id["rewind"] and "terminal" not in by_id["restart"]
     assert by_id["background"]["cmd"] == "/bgtask"  # never the CLI's /bg
     assert all(c["icon"] in agent_status.ACTION_ICONS for c in st.commands)
+
+
+def test_delete_is_offered_only_for_an_extra_agent(env):
+    """As on the panel: a main topic holds the project's history, no delete."""
+    st = agent_status.build_status("@5", now=NOW)
+    assert "delete" not in {c["id"] for c in st.commands}
+    env.sm.extra_agents = frozenset({"@5"})
+    st = agent_status.build_status("@5", now=NOW)
+    delete = {c["id"]: c for c in st.commands}["delete"]
+    assert delete["cmd"] == "/delete" and delete["group"] == "danger"
+    assert "confirm" not in delete  # the bot asks, with what would be lost
 
 
 def test_docker_topic_offers_no_worktree(env):

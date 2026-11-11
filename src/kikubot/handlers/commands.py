@@ -560,6 +560,7 @@ def build_bot_commands() -> list[BotCommand]:
         BotCommand("sibling", tr("cmd.sibling")),
         BotCommand("worktree", tr("cmd.worktree")),
         BotCommand("bgtask", tr("cmd.bgtask")),
+        BotCommand("delete", tr("cmd.delete")),
         BotCommand("pin", tr("cmd.pin")),
         *plugins.bot_commands(),
     ]
@@ -611,6 +612,39 @@ async def worktree_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_reply(update.message, refusal)
         return
     await ask_worktree_task(context, user.id, thread_id, wid)
+
+
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/delete — remove this extra agent with its topic (the panel's 🗑).
+
+    The same confirm as the panel's, as a message of its own; the same
+    scope too: a 🌳 worktree topic (its guard weighs unmerged work, and it
+    works with the agent stopped) or a ➕ sibling. A main topic is refused.
+    """
+    user = effective_user(update)
+    if not user or not is_user_allowed(user.id) or not update.message:
+        return
+    thread_id = get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, tr("wt.not_in_topic"))
+        return
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id) or ""
+    from .worktrees import delete_offer as worktree_offer
+
+    offer = await worktree_offer(user.id, thread_id, wid)
+    if offer is None:
+        if not wid:
+            await safe_reply(update.message, tr("commands.no_session_in_topic"))
+            return
+        if not session_manager.can_delete_agent(wid):
+            await safe_reply(update.message, tr("agentdel.main_topic"))
+            return
+        from .agent_delete import delete_offer
+
+        offer = delete_offer(context, thread_id, wid)
+    text, keyboard = offer
+    # Plain text, like the panel caption it mirrors.
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def bgtask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -82,7 +82,7 @@ def _mode_ids(offered: tuple[str, ...], current: str | None) -> list[str]:
 # Icons a session action may carry (docs/agent-status-format.md lists them).
 ACTION_ICONS = frozenset(
     {"plus", "branch", "compress", "trash", "undo", "history", "background", "diff"}
-    | {"restart", "stop", "model", "context"}
+    | {"restart", "stop", "model", "context", "delete"}
 )
 
 _panes: dict[str, tuple[float, str | None]] = {}
@@ -852,6 +852,12 @@ def session_actions(binding: str, runtime: str, reserved: Iterable[str]) -> list
         confirm=tr("astatus.confirm.restart"),
     )
     add("end", "/kill", "danger", icon="stop", confirm=tr("astatus.confirm.end"))
+    # Only for extra agents, as on the panel. No client-side confirm: the bot
+    # answers with its own, which says what would be lost (unmerged work).
+    if session_manager.is_worktree_window(binding) or session_manager.can_delete_agent(
+        binding
+    ):
+        add("delete", "/delete", "danger", icon="delete")
     return out
 
 

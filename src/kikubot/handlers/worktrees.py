@@ -562,23 +562,17 @@ async def _handle_wt_keep(
 # --- 🗑 panel button (instant, in-app delete) -------------------------------
 
 
-async def _handle_wt_del(
-    query: CallbackQuery,
-    data: str,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user: User,
-) -> None:
-    """🗑 Delete agent — compute the guard and show a confirm on the panel."""
-    wid = data[len(CB_WT_DEL) :]
-    thread_id = get_thread_id(update)
-    if thread_id is None:
-        await query.answer(tr("wt.not_in_topic"), show_alert=True)
-        return
-    meta = session_manager.get_worktree_meta(user.id, thread_id)
+async def delete_offer(
+    user_id: int, thread_id: int, wid: str
+) -> tuple[str, InlineKeyboardMarkup] | None:
+    """The 🗑 confirm for this worktree topic, guard included; None if it isn't one.
+
+    Shared by the panel's 🗑 (shown as its caption) and /delete (a message of
+    its own). ``wid`` only rides the cancel payload, to repaint the panel.
+    """
+    meta = session_manager.get_worktree_meta(user_id, thread_id)
     if meta is None:
-        await query.answer(tr("wt.not_worktree_agent"), show_alert=True)
-        return
+        return None
     status = await wtc.worktree_status(
         Path(meta.repo), Path(meta.path), meta.base_branch, meta.branch
     )
@@ -613,11 +607,49 @@ async def _handle_wt_del(
             ],
         ]
     )
+    return caption, keyboard
+
+
+async def _handle_wt_del(
+    query: CallbackQuery,
+    data: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User,
+) -> None:
+    """🗑 Delete agent — compute the guard and show a confirm on the panel."""
+    wid = data[len(CB_WT_DEL) :]
+    thread_id = get_thread_id(update)
+    if thread_id is None:
+        await query.answer(tr("wt.not_in_topic"), show_alert=True)
+        return
+    offer = await delete_offer(user.id, thread_id, wid)
+    if offer is None:
+        await query.answer(tr("wt.not_worktree_agent"), show_alert=True)
+        return
+    caption, keyboard = offer
     try:
         await query.edit_message_caption(caption=caption, reply_markup=keyboard)
     except Exception as e:  # noqa: BLE001
         logger.debug("wt delete confirm edit failed: %s", e)
     await query.answer()
+
+
+def on_panel(query: CallbackQuery) -> bool:
+    """Was this tapped on the agent panel (a photo), not a /delete confirm?"""
+    return bool(getattr(query.message, "photo", None))
+
+
+async def edit_note(query: CallbackQuery, text: str) -> None:
+    """Replace the tapped message with a plain note: a panel photo's caption,
+    or the text of a /delete confirm. Best effort: the topic may be gone."""
+    try:
+        if on_panel(query):
+            await query.edit_message_caption(caption=text)
+        else:
+            await query.edit_message_text(text)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("delete note edit failed: %s", e)
 
 
 async def _handle_wt_delok(
@@ -636,13 +668,8 @@ async def _handle_wt_delok(
     await query.answer(tr("wt.deleting"))
     chat_id = session_manager.resolve_chat_id(user.id, thread_id)
     await teardown_worktree(context.bot, chat_id, user.id, thread_id, meta, force=True)
-    # The topic (and this panel message) is gone now; best-effort note if not.
-    try:
-        await query.edit_message_caption(
-            caption=tr("wt.agent_deleted", title=meta.task_title)
-        )
-    except Exception:  # noqa: BLE001
-        pass
+    # The topic (and this message) is gone now; best-effort note if not.
+    await edit_note(query, tr("wt.agent_deleted", title=meta.task_title))
 
 
 async def _handle_wt_delno(
@@ -658,6 +685,11 @@ async def _handle_wt_delno(
     from .commands import _build_commands_keyboard
 
     wid = data[len(CB_WT_DELNO) :]
+    if not on_panel(query):
+        # A /delete confirm, not the panel: nothing to repaint.
+        await edit_note(query, tr("wt.kept_msg"))
+        await query.answer(tr("wt.cancelled"))
+        return
     display = session_manager.get_display_name(wid)
     caption = tr("wt.panel_agent_header", name=escape_markdown(display, version=2))
     try:

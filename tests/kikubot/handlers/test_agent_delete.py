@@ -171,6 +171,20 @@ class TestCancel:
             query.edit_message_caption.await_args.kwargs["reply_markup"] == "KEYBOARD"
         )
 
+    @pytest.mark.asyncio
+    async def test_on_a_delete_command_confirm_it_just_says_kept(self) -> None:
+        """/delete's confirm is a text message: no panel to repaint there."""
+        query = _query()
+        query.message.photo = ()
+        query.edit_message_text = AsyncMock()
+        with patch("kikubot.handlers.commands._build_commands_keyboard") as build:
+            await _handle_agent_delno(
+                query, f"{CB_AGENT_DELNO}@12", _update(), _context(), MagicMock(id=1)
+            )
+        build.assert_not_called()
+        query.edit_message_caption.assert_not_awaited()
+        query.edit_message_text.assert_awaited_once()
+
 
 class TestMainTopicIsProtected:
     """An old panel scrolled back to still carries 🗑, so both taps re-check

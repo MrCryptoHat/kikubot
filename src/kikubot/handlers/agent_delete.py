@@ -38,6 +38,7 @@ from ..session import session_manager
 from . import get_thread_id
 from .callback_data import CB_AGENT_DEL, CB_AGENT_DELNO, CB_AGENT_DELOK
 from .cleanup import purge_deleted_topic
+from .worktrees import edit_note, on_panel
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,22 @@ async def _handle_agent_del(
     if not session_manager.can_delete_agent(wid):
         await query.answer(tr("agentdel.main_topic"), show_alert=True)
         return
-    display = session_manager.get_display_name(wid)
+    caption, keyboard = delete_offer(context, thread_id, wid)
+    try:
+        await query.edit_message_caption(caption=caption, reply_markup=keyboard)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("agent delete confirm edit failed: %s", e)
+    await query.answer()
+
+
+def delete_offer(
+    context: ContextTypes.DEFAULT_TYPE, thread_id: int, wid: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    """The red confirm for deleting this extra agent; arms the ✅ tap for it.
+
+    Shared by the panel's 🗑 (shown as its caption) and /delete (a message of
+    its own). The caller has checked ``can_delete_agent``.
+    """
     if context.user_data is not None:
         context.user_data[_TARGET_KEY] = (thread_id, wid)
     keyboard = InlineKeyboardMarkup(
@@ -99,13 +115,7 @@ async def _handle_agent_del(
             ],
         ]
     )
-    try:
-        await query.edit_message_caption(
-            caption=_confirm_caption(wid, display), reply_markup=keyboard
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.debug("agent delete confirm edit failed: %s", e)
-    await query.answer()
+    return _confirm_caption(wid, session_manager.get_display_name(wid)), keyboard
 
 
 async def _handle_agent_delok(
@@ -154,12 +164,7 @@ async def _handle_agent_delok(
         # lacks «Delete messages»). Say so in the topic that is still there —
         # otherwise the next message in it silently opens the bind flow.
         logger.warning("delete_forum_topic on agent delete failed: %s", e)
-        try:
-            await query.edit_message_caption(
-                caption=tr("agentdel.err_topic", name=display)
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        await edit_note(query, tr("agentdel.err_topic", name=display))
         return
     logger.info(
         "Agent %s deleted with its topic (user=%d, thread=%d)", wid, user.id, thread_id
@@ -179,6 +184,11 @@ async def _handle_agent_delno(
     from .commands import _build_commands_keyboard
 
     wid = data[len(CB_AGENT_DELNO) :]
+    if not on_panel(query):
+        # A /delete confirm, not the panel: nothing to repaint.
+        await edit_note(query, tr("wt.kept_msg"))
+        await query.answer(tr("wt.cancelled"))
+        return
     display = session_manager.get_display_name(wid)
     try:
         await query.edit_message_caption(
