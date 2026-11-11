@@ -252,7 +252,10 @@ holds at most 256 characters, so split longer input over several queries.
   query. Keys that reach the bot more than 8 s later are refused
   (`expired`), nothing sent, and the `seq` is recorded: the user was already
   told they weren't sent, and typing them now would double what he presses
-  again. Keep the phone's clock synced.
+  again. Date it on the bot's clock, not the phone's: a phone clock 8 s
+  behind would get every query refused. Every answer carries the bot's time
+  (`ts`, and `tms` when a screen was captured), so keep offset = `tms` − the
+  phone's time when that answer arrived, and send the phone's time + offset.
 - Tokens, checked before anything is sent; one bad token sends nothing:
   - key names (tmux): `Up` `Down` `Left` `Right` `Enter` `Escape` `Tab`
     `BTab` (Shift+Tab) `BSpace` `DC` (Delete) `Space` `Home` `End` `PPage`
@@ -307,7 +310,7 @@ characters. Count them as UTF-16 units to be safe (an emoji is 2).
 | `busy` | the bot is typing a message into that pane; send them under a new `seq` | nothing |
 | `would-exit` | the last key would end the agent | the keys before it |
 | `unsupported` | `Clear` on a CLI whose input box the bot can't read | the keys before it |
-| `unavailable` | the pane couldn't be read or written | `sent` says how many |
+| `unavailable` | the pane couldn't be read or written | `sent` says how many it knows of; after an internal failure some may have gone in uncounted, so check the screen |
 
 Every answer carries the current screen when it can be read; when it can't,
 the meta comes alone with `parts` 0.

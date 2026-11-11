@@ -202,6 +202,7 @@ async def run_keys(
 
     t0 = time.perf_counter()
     sent = 0
+    finished = False
     try:
         before = await session_manager.capture_screen(binding)
         changed = False
@@ -210,8 +211,13 @@ async def run_keys(
         screen = before
         if sent:
             screen, changed = await _wait_change(binding, before)
+        finished = True
     finally:
         if outcome is not None:
+            # Raised midway: how many keys went in is unknown, so a repeat
+            # must not hear "nothing sent, no error".
+            if not finished and error is None:
+                error = "unavailable"
             outcome.sent, outcome.error = sent, error
             outcome.done.set()
     logger.info(

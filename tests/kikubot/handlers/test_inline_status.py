@@ -400,6 +400,23 @@ async def test_keys_repeat_waits_for_a_send_in_progress(keys_env, monkeypatch):
     assert meta["repeat"] is True and meta["sent"] == 2
 
 
+async def test_keys_repeat_after_a_send_that_raised_says_unavailable(
+    keys_env, monkeypatch
+):
+    """Some keys may have gone in before it raised: the repeat mustn't read
+    as "nothing sent, no error"."""
+    from kikubot.handlers import inline_keys
+
+    async def broken(binding, tokens):
+        raise RuntimeError("boom")
+
+    inline_keys.session_manager.send_key_tokens = broken
+    with pytest.raises(RuntimeError):
+        await inline_keys.run_keys(OWNER, CHAT, 42, "@5", 30, ["=x", "Up", "."])
+    _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 30 =x Up .")
+    assert meta["repeat"] is True and meta["error"] == "unavailable"
+
+
 async def test_keys_that_arrive_late_are_expired_and_recorded(keys_env, monkeypatch):
     import time as _time
 
