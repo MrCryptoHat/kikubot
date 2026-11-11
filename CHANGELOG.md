@@ -55,6 +55,8 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
 
 ### Fixed
 
+- The first reply after a quiet minute or more no longer waits for a new
+  connection to Telegram: the bot keeps one warm.
 - A failed tmux read no longer reads as "every window is gone": the bot used
   to unbind a working agent's topic on one such read and kill its window 90 s
   later. tmux is driven through its CLI with short formats accepted only

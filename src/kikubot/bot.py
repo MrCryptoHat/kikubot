@@ -42,7 +42,7 @@ from . import i18n
 from . import plugins
 from .config import config
 from .hook import hook_installed_in_settings
-from .rate_limiter import KikubotRateLimiter
+from .rate_limiter import KikubotRateLimiter, background_context
 from .handlers import (
     effective_user,
     get_thread_id,
@@ -1293,11 +1293,30 @@ quiet_turn.set_deliver(handle_new_message)
 # --- App lifecycle ---
 
 
-# Below the ~75 s after which servers commonly drop an idle keep-alive.
+# Idle pooled connections are dropped after KEEPALIVE_SEC. Keep it well under
+# the path's own idle limit: on a far link (2026-11) a connection idle 150 s
+# was reused, one idle 300 s was dead without a FIN, and a request on it hung
+# until the read timeout instead of reconnecting.
 KEEPALIVE_SEC = 60.0
+# A getMe this often keeps one pooled connection from going idle, so the first
+# answer after a quiet spell (an inline query: someone is watching) skips the
+# TCP + TLS setup, ~0.4–0.6 s on a far link.
+WARM_SEC = 40.0
 
 _loop_watch_task: asyncio.Task[None] | None = None
+_warm_task: asyncio.Task[None] | None = None
 LOOP_LAG_WARN_SEC = 0.5
+
+
+async def _keep_connection_warm(bot: Bot) -> None:
+    """Send a getMe every WARM_SEC so a pooled connection never idles out."""
+    while True:
+        await asyncio.sleep(WARM_SEC)
+        try:
+            with background_context():
+                await bot.get_me()
+        except Exception as e:  # a network blip: the next round tries again
+            logger.debug("keep-warm getMe failed: %s", e)
 
 
 async def _watch_event_loop() -> None:
@@ -1368,8 +1387,9 @@ async def post_init(application: Application) -> None:
     logger.info("Session monitor started")
 
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
-    global _loop_watch_task
+    global _loop_watch_task, _warm_task
     _loop_watch_task = asyncio.create_task(_watch_event_loop())
+    _warm_task = asyncio.create_task(_keep_connection_warm(application.bot))
     logger.info("Status polling task started")
 
     # Windows lost with the previous tmux server come back on their sessions
@@ -1415,6 +1435,8 @@ async def post_shutdown(application: Application) -> None:
         logger.info("Status polling stopped")
     if _loop_watch_task is not None:
         _loop_watch_task.cancel()
+    if _warm_task is not None:
+        _warm_task.cancel()
 
     global _inject_runner
     if _inject_runner is not None:
@@ -1504,6 +1526,8 @@ def create_bot() -> Application:
         # each new connection costs a TCP + TLS setup (~0.4 s on a far link), and
         # with connections dropped after 5 s idle, about every other inline
         # answer paid it (answerInlineQuery 0.8–1.1 s instead of ~0.2 s).
+        # Past a quiet minute the first answer still paid it, hence
+        # _keep_connection_warm.
         .request(
             HTTPXRequest(
                 connection_pool_size=256,
