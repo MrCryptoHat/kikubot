@@ -16,6 +16,7 @@ import pytest
 from kikubot.bot import _topic_name_from_root
 from kikubot.handlers import commands as cmd
 from kikubot.handlers.commands import _find_matching_dir_for_topic
+from kikubot.runtimes import get_runtime
 
 
 @pytest.fixture
@@ -222,6 +223,9 @@ async def test_remembered_runtime_still_gets_the_picker(tmp_path: Path):
     sm.has_live_agent_on_cwd = AsyncMock(return_value=False)
     ctx = SimpleNamespace(user_data={}, bot=SimpleNamespace())
     with (
+        # Installed or not on this machine: an uninstalled one degrades to
+        # the default, which is another test's case.
+        patch.object(get_runtime("codex"), "is_available", return_value=True),
         patch.object(cmd, "session_manager", sm),
         patch.object(cmd, "tmux_manager", tm),
         patch.object(cmd, "safe_reply", new=AsyncMock()),

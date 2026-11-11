@@ -69,9 +69,13 @@ def _no_live_tmux_or_docker(monkeypatch):
 @pytest.fixture(autouse=True, scope="session")
 def _reap_isolated_tmux():
     yield
+    import shutil
     import subprocess
 
     # A test that created a session on the private socket started a server.
+    # No tmux installed (a CI runner): no test could have started one.
+    if not shutil.which("tmux"):
+        return
     subprocess.run(
         ["tmux", "-L", _ISOLATED_TMUX_SOCKET, "kill-server"],
         capture_output=True,
