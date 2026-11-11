@@ -6,13 +6,17 @@ tokens are checked (terminal_keys.py), sent in order under the pane's send
 lock (``SessionManager.send_key_tokens``), and the answer is the ``screen``
 answer of the pane right after, with ``seq``/``sent``/``error`` in its meta.
 
-``seq`` must grow with every query for that topic and user: an older or
-repeated one sends nothing (``stale``), so a query Telegram delivers twice or
-late can't press its keys again or out of order. The last ``seq`` per topic
-survives a bot restart (``keys_seq.json``): a client resends an unanswered
-query with the same ``seq``, and one that waited out the restart would
-otherwise be typed a second time. Topic resolution and the ALLOWED_USERS gate
-are inline_status.py's, as for ``screen``.
+``seq`` must grow with every query for that topic and user. A new seq is
+recorded before its keys are sent, and its outcome (tokens sent, error) is
+kept: a repeat of it answers with that outcome (``repeat``), waiting while
+the keys are still going in, so a client that gave up on an answer learns
+what happened instead of guessing. An older seq, or one from before a bot
+restart, sends nothing (``stale``); the last seq per topic survives a restart
+(``keys_seq.json``) so a query that waited it out can't be typed twice.
+``t=<unix ms>`` after the seq dates the query: keys older than
+MAX_KEY_AGE_MS are refused (``expired``), as the user was already told they
+weren't sent. Topic resolution and the ALLOWED_USERS gate are
+inline_status.py's, as for ``screen``.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 
 from ..pane_screen import PaneScreen
 from ..session import session_manager
@@ -45,6 +51,13 @@ _SETTLE = 0.05
 # A seq is a client counter started from a millisecond timestamp; one more
 # than a day ahead of the clock is a bug, not a counter.
 MAX_SEQ_AHEAD_MS = 86_400_000
+# Keys the client sent (t=) longer ago than this were already reported to the
+# user as not sent; typing them now would double what he presses again.
+MAX_KEY_AGE_MS = 8_000
+# Recent seq outcomes kept per topic, and how long a repeat waits for one
+# still being sent (a send can wait 2 s for the lock and 1 s of settle).
+MAX_OUTCOMES = 64
+REPEAT_WAIT_SEC = 6.0
 
 _last_seq: dict[tuple[int, int, int], int] | None = None  # loaded on first use
 
@@ -87,7 +100,16 @@ def parse_keys_query(query: str) -> tuple[int, int, int, list[str]] | None:
     return int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4).split()
 
 
-async def _wait_change(binding: str, before: PaneScreen | None) -> PaneScreen | None:
+def _differs(a: PaneScreen | None, b: PaneScreen | None) -> bool:
+    if a is None or b is None:
+        return a is not b
+    return (a.text, a.cursor) != (b.text, b.cursor)
+
+
+async def _wait_change(
+    binding: str, before: PaneScreen | None
+) -> tuple[PaneScreen | None, bool]:
+    """The screen after the keys, and whether it changed within CHANGE_WAIT."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + CHANGE_WAIT
     latest = before
@@ -95,12 +117,36 @@ async def _wait_change(binding: str, before: PaneScreen | None) -> PaneScreen | 
         await asyncio.sleep(_POLL)
         cur = await session_manager.capture_screen(binding)
         if cur is None:
-            return latest
+            return latest, False
         latest = cur
-        if before is None or (cur.text, cur.cursor) != (before.text, before.cursor):
+        if _differs(cur, before):
             await asyncio.sleep(_SETTLE)
-            return await session_manager.capture_screen(binding) or cur
-    return latest
+            return await session_manager.capture_screen(binding) or cur, True
+    return latest, False
+
+
+@dataclass
+class _Outcome:
+    """What a seq's keys did; ``done`` is set once the send is over."""
+
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    sent: int = 0
+    error: str | None = None
+
+
+# Per topic, the outcomes of its recent seqs (in memory: a bot restart forgets
+# them, and a repeat of a seq from before it answers `stale`).
+_outcomes: dict[tuple[int, int, int], OrderedDict[int, _Outcome]] = {}
+
+
+def _parse_sent_at(raw_tokens: list[str]) -> tuple[int | None, list[str]]:
+    """Split an optional leading ``t=<unix ms>`` off the tokens."""
+    if raw_tokens and raw_tokens[0].lower().startswith("t="):
+        try:
+            return int(raw_tokens[0][2:]), raw_tokens[1:]
+        except ValueError:
+            raise KeysError("bad-key") from None
+    return None, raw_tokens
 
 
 async def run_keys(
@@ -111,13 +157,26 @@ async def run_keys(
     seq: int,
     raw_tokens: list[str],
 ) -> tuple[PaneScreen | None, dict[str, object]]:
-    """Check and send the keys; the screen after them and the meta extras."""
+    """Check and send the keys; the screen after them and the meta extras.
+
+    A repeat of a seq answers with what that seq's keys did (``repeat``),
+    waiting for them if they're still being sent: a client that gave up on
+    the first answer learns the truth instead of guessing. Keys that reach
+    the bot more than MAX_KEY_AGE_MS after the client sent them (``t=``) are
+    refused (``expired``): the user was already told they weren't sent.
+    """
+    topic = (user_id, chat_id, thread_id)
+    known = _outcomes.get(topic, OrderedDict()).get(seq)
+    if known is not None:
+        return await _repeat(binding, seq, known)
+
     from .agent_restart import is_restarting
 
     error: str | None = None
     tokens: list[KeyToken] = []
-    topic = (user_id, chat_id, thread_id)
-    if seq > time.time() * 1000 + MAX_SEQ_AHEAD_MS:
+    outcome: _Outcome | None = None
+    now_ms = time.time() * 1000
+    if seq > now_ms + MAX_SEQ_AHEAD_MS:
         # A seq this far ahead would leave every later query `stale` for
         # good; a client bug, refused without being recorded.
         error = "bad-key"
@@ -125,19 +184,36 @@ async def run_keys(
         error = "stale"
     else:
         _remember_seq(topic, seq)
+        outcome = _Outcome()
+        outs = _outcomes.setdefault(topic, OrderedDict())
+        outs[seq] = outcome
+        while len(outs) > MAX_OUTCOMES:
+            outs.popitem(last=False)
         try:
-            tokens = parse_tokens(raw_tokens)
+            sent_at, raw_tokens = _parse_sent_at(raw_tokens)
+            if sent_at is not None and now_ms - sent_at > MAX_KEY_AGE_MS:
+                error = "expired"
+            else:
+                tokens = parse_tokens(raw_tokens)
         except KeysError as e:
             error = e.code
     if error is None and is_restarting(binding):
         error = "not-running"
 
     t0 = time.perf_counter()
-    before = await session_manager.capture_screen(binding)
     sent = 0
-    if error is None:
-        sent, error = await session_manager.send_key_tokens(binding, tokens)
-    screen = await _wait_change(binding, before) if sent else before
+    try:
+        before = await session_manager.capture_screen(binding)
+        changed = False
+        if error is None:
+            sent, error = await session_manager.send_key_tokens(binding, tokens)
+        screen = before
+        if sent:
+            screen, changed = await _wait_change(binding, before)
+    finally:
+        if outcome is not None:
+            outcome.sent, outcome.error = sent, error
+            outcome.done.set()
     logger.info(
         "keys: %s seq=%d tokens=%d sent=%d error=%s %.0fms",
         binding,
@@ -147,7 +223,24 @@ async def run_keys(
         error,
         (time.perf_counter() - t0) * 1000,
     )
-    extra: dict[str, object] = {"seq": seq, "sent": sent}
+    extra: dict[str, object] = {"seq": seq, "sent": sent, "changed": changed}
     if error:
         extra["error"] = error
+    return screen, extra
+
+
+async def _repeat(
+    binding: str, seq: int, outcome: _Outcome
+) -> tuple[PaneScreen | None, dict[str, object]]:
+    """Answer a repeated seq with its keys' outcome and the current screen."""
+    try:
+        await asyncio.wait_for(outcome.done.wait(), REPEAT_WAIT_SEC)
+    except TimeoutError:
+        screen = await session_manager.capture_screen(binding)
+        return screen, {"seq": seq, "sent": 0, "repeat": True, "error": "in-progress"}
+    screen = await session_manager.capture_screen(binding)
+    extra: dict[str, object] = {"seq": seq, "sent": outcome.sent, "repeat": True}
+    if outcome.error:
+        extra["error"] = outcome.error
+    logger.info("keys: %s seq=%d repeat of sent=%d", binding, seq, outcome.sent)
     return screen, extra

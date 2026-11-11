@@ -48,7 +48,10 @@ from .inline_keys import parse_keys_query, run_keys
 logger = logging.getLogger(__name__)
 
 _TARGETED = re.compile(r"^\s*status\s+(-?\d+):(\d+)\s*$", re.IGNORECASE)
-_SCREEN = re.compile(r"^\s*screen\s+(-?\d+):(\d+)(?:\s+back=(\d+))?\s*$", re.IGNORECASE)
+_SCREEN = re.compile(
+    r"^\s*screen\s+(-?\d+):(\d+)((?:\s+(?:back=\d+|h=[0-9a-f]{6,40}))*)\s*$",
+    re.IGNORECASE,
+)
 MAX_CARDS = 20
 _STRANGER_CACHE_SEC = 3600
 _SCREEN_RETRY_PARTS = 12
@@ -61,16 +64,24 @@ def parse_target(query: str) -> tuple[int, int] | None:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
-def parse_screen_target(query: str) -> tuple[int, int, int] | None:
-    """(chat_id, thread_id, back) from ``screen <chat_id>:<thread_id> [back=N]``.
+def parse_screen_target(query: str) -> tuple[int, int, int, str | None] | None:
+    """(chat_id, thread_id, back, hash) from ``screen <chat>:<thread> [back=N] [h=…]``.
 
     ``back`` is clamped to ``MAX_BACK``; 0 means the visible screen only.
+    ``hash`` is the ``hash`` of the screen the client shows: an unchanged
+    visible screen is then answered with the meta alone.
     """
     m = _SCREEN.match(query)
     if not m:
         return None
-    back = min(int(m.group(3) or 0), MAX_BACK)
-    return int(m.group(1)), int(m.group(2)), back
+    back, digest = 0, None
+    for opt in m.group(3).split():
+        key, _, value = opt.partition("=")
+        if key.lower() == "back":
+            back = min(int(value), MAX_BACK)
+        else:
+            digest = value.lower()
+    return int(m.group(1)), int(m.group(2)), back, digest
 
 
 def _reserved_commands(app: Application | None) -> set[str]:
@@ -181,7 +192,12 @@ async def _answer_keys(
 
 
 async def _answer_screen(
-    query: InlineQuery, user_id: int, chat_id: int, thread_id: int, back: int
+    query: InlineQuery,
+    user_id: int,
+    chat_id: int,
+    thread_id: int,
+    back: int,
+    digest: str | None = None,
 ) -> None:
     """Answer ``screen``: meta, then the text chunks; [] for a foreign topic.
 
@@ -196,6 +212,11 @@ async def _answer_screen(
     screen = await session_manager.capture_screen(found[1], back=back)
     ts = int(time.time())
     panel = pane_cache.latest_panel(user_id, thread_id)
+    if digest and not back and screen is not None and screen.digest() == digest:
+        # The client already draws this capture: say so, send no parts.
+        same = screen_messages(screen, ts=ts, panel=panel, same=True)
+        await _answer(query, _articles(same), cache_time=0, is_personal=True)
+        return
 
     async def results(max_parts: int) -> list[InlineQueryResultArticle]:
         if back:

@@ -15,6 +15,7 @@ size, optionally with lines of history above the visible screen.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -64,6 +65,18 @@ class PaneScreen:
     cursor: tuple[int, int] | None  # None while the program hides it
     back: int  # history lines leading ``text``
     history: int  # history lines tmux holds above the screen
+    captured_at: float = 0.0  # unix seconds the capture was taken (0 = unknown)
+
+    def digest(self) -> str:
+        """Short hash of what a client draws: text, cursor and size.
+
+        A client that already shows this capture sends it back (``h=``) and
+        gets a meta-only answer instead of the same screen again.
+        """
+        h = hashlib.sha1(usedforsecurity=False)
+        h.update(f"{self.cols}x{self.rows}|{self.cursor}|{self.back}|".encode())
+        h.update(self.text.encode("utf-8", "replace"))
+        return h.hexdigest()[:12]
 
 
 def parse_screen_output(stdout: str) -> PaneScreen | None:
@@ -165,13 +178,18 @@ def screen_messages(
     panel: int | None,
     max_parts: int = MAX_PARTS,
     extra: dict[str, object] | None = None,
+    same: bool = False,
 ) -> list[tuple[str, str]]:
     """``(result id, message_text)`` pairs: ``screen``, then ``screen.1``…
 
     A screen that couldn't be captured (agent not running) answers with the
-    meta alone, ``parts`` 0 and ``error``. ``extra`` fields join the meta
-    (the ``keys`` query's ``seq``/``sent``/``error``) and win over its own.
+    meta alone, ``parts`` 0 and ``error``; so does one the client already
+    shows (``same``: its ``h=`` matched). ``tms`` is the capture time in unix
+    milliseconds, for ordering answers within a second. ``extra`` fields join
+    the meta (the ``keys`` query's ``seq``/``sent``/``error``…) and win over
+    its own.
     """
+    tms = int((screen.captured_at if screen and screen.captured_at else ts) * 1000)
     if screen is None:
         meta = {
             "v": 1,
@@ -179,9 +197,29 @@ def screen_messages(
             "rows": 0,
             "cursor": None,
             "ts": ts,
+            "tms": tms,
             "parts": 0,
             "panel": panel,
             "error": "unavailable",
+            **(extra or {}),
+        }
+        return [("screen", json.dumps(meta, separators=(",", ":")))]
+    base = {
+        "v": 1,
+        "cols": screen.cols,
+        "rows": screen.rows,
+        "cursor": list(screen.cursor) if screen.cursor else None,
+        "ts": ts,
+        "tms": tms,
+        "hash": screen.digest(),
+    }
+    if same:
+        meta = {
+            **base,
+            "parts": 0,
+            "panel": panel,
+            "same": True,
+            "history": screen.history,
             **(extra or {}),
         }
         return [("screen", json.dumps(meta, separators=(",", ":")))]
@@ -190,11 +228,7 @@ def screen_messages(
     truncated = len(parts) > max_parts
     parts = parts[:max_parts]
     meta = {
-        "v": 1,
-        "cols": screen.cols,
-        "rows": screen.rows,
-        "cursor": list(screen.cursor) if screen.cursor else None,
-        "ts": ts,
+        **base,
         "parts": len(parts),
         "panel": panel,
         "back": back,

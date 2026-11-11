@@ -25,7 +25,7 @@ import re
 import subprocess
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .config import config
@@ -639,11 +639,13 @@ class TmuxManager:
         if back > 0:
             args += ["-S", f"-{back}"]
         args += [";", "display-message", "-p", "-t", window_id, SCREEN_FORMAT]
+        taken = time.time()
         res = await self._tmux(*args)
         if not res.ok:
             logger.debug("screen capture of %s failed: %s", window_id, res.stderr)
             return None
-        return parse_screen_output(res.stdout)
+        screen = parse_screen_output(res.stdout)
+        return replace(screen, captured_at=taken) if screen else None
 
     async def send_key_batch(
         self, window_id: str, items: Iterable[tuple[str, bool]]

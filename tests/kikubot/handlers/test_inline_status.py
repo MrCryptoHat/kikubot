@@ -140,11 +140,23 @@ async def test_a_picked_card_is_not_sent_to_the_agent(monkeypatch):
 
 
 def test_parse_screen_target():
-    assert inline_status.parse_screen_target(f"screen {CHAT}:42") == (CHAT, 42, 0)
+    assert inline_status.parse_screen_target(f"screen {CHAT}:42") == (
+        CHAT,
+        42,
+        0,
+        None,
+    )
     assert inline_status.parse_screen_target(f"screen {CHAT}:42 back=300") == (
         CHAT,
         42,
         300,
+        None,
+    )
+    assert inline_status.parse_screen_target(f"screen {CHAT}:42 h=ab12cd34ef56") == (
+        CHAT,
+        42,
+        0,
+        "ab12cd34ef56",
     )
     assert inline_status.parse_screen_target(f"screen {CHAT}:42 back=999999")[2] == (
         inline_status.MAX_BACK
@@ -239,6 +251,7 @@ def keys_env(env, monkeypatch):
     from kikubot.pane_screen import PaneScreen
 
     monkeypatch.setattr(inline_keys, "_last_seq", {})
+    monkeypatch.setattr(inline_keys, "_outcomes", {})
     monkeypatch.setattr(inline_keys, "session_manager", env)
     monkeypatch.setattr(inline_keys, "CHANGE_WAIT", 0.05)
     monkeypatch.setattr(pane_cache, "_PANEL_BY_TOPIC", {})
@@ -283,13 +296,13 @@ async def test_keys_sends_and_answers_the_screen_after(keys_env, monkeypatch):
     assert chunk != "frame 0\n"  # the capture after the keys, not before
 
 
-async def test_keys_stale_or_repeated_seq_sends_nothing(keys_env, monkeypatch):
+async def test_keys_repeat_tells_the_outcome_and_types_nothing(keys_env, monkeypatch):
     await _keys(monkeypatch, f"keys {CHAT}:42 5 Up .")
     _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 5 Up .")
-    assert meta["error"] == "stale" and meta["sent"] == 0
+    assert meta["repeat"] is True and meta["sent"] == 1 and "error" not in meta
     _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 4 Up .")
-    assert meta["error"] == "stale"
-    assert len(keys_env) == 1
+    assert meta["error"] == "stale" and meta["sent"] == 0
+    assert len(keys_env) == 1  # typed once
 
 
 async def test_keys_bad_token_sends_nothing(keys_env, monkeypatch):
@@ -348,3 +361,87 @@ async def test_keys_seq_far_ahead_of_the_clock_is_refused(keys_env, monkeypatch)
     assert meta["error"] == "bad-key" and keys_env == []
     _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 5 Up .")
     assert "error" not in meta  # nothing was recorded
+
+
+async def test_keys_repeat_of_a_refused_seq_says_refused(keys_env, monkeypatch):
+    """A first try that came back busy after the client gave up must not read
+    as done on the resend: the repeat carries the busy."""
+    from kikubot.handlers import inline_keys
+
+    async def busy(binding, tokens):
+        return 0, "busy"
+
+    inline_keys.session_manager.send_key_tokens = busy
+    await _keys(monkeypatch, f"keys {CHAT}:42 9 =x .")
+    _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 9 =x .")
+    assert meta["repeat"] is True and meta["error"] == "busy" and meta["sent"] == 0
+
+
+async def test_keys_repeat_waits_for_a_send_in_progress(keys_env, monkeypatch):
+    import asyncio
+
+    from kikubot.handlers import inline_keys
+
+    gate = asyncio.Event()
+
+    async def slow(binding, tokens):
+        await gate.wait()
+        return len(tokens), None
+
+    inline_keys.session_manager.send_key_tokens = slow
+    first = asyncio.create_task(_keys(monkeypatch, f"keys {CHAT}:42 11 =ab Enter ."))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(_keys(monkeypatch, f"keys {CHAT}:42 11 =ab Enter ."))
+    await asyncio.sleep(0.01)
+    assert not second.done()  # waiting on the first, not answering `stale`
+    gate.set()
+    _, meta = await second
+    await first
+    assert meta["repeat"] is True and meta["sent"] == 2
+
+
+async def test_keys_that_arrive_late_are_expired_and_recorded(keys_env, monkeypatch):
+    import time as _time
+
+    old = int(_time.time() * 1000) - 20_000
+    _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 20 t={old} Enter .")
+    assert meta["error"] == "expired" and meta["sent"] == 0 and keys_env == []
+    _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 20 t={old} Enter .")
+    assert meta["repeat"] is True and meta["error"] == "expired"
+    fresh = int(_time.time() * 1000)
+    _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 21 t={fresh} Up .")
+    assert "error" not in meta and meta["sent"] == 1
+
+
+async def test_keys_answer_says_whether_the_screen_changed(keys_env, monkeypatch):
+    _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 30 Up .")
+    assert meta["changed"] is True  # the fake pane moves to a new frame
+    _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 31 =x Enter =y .")
+    assert meta["error"] == "bad-key" and meta["changed"] is False
+
+
+async def test_keys_take_raw_cyrillic_text(keys_env, monkeypatch):
+    from kikubot.terminal_keys import KeyToken
+
+    _, meta = await _keys(monkeypatch, f"keys {CHAT}:42 40 =привет%20мир .")
+    assert meta["sent"] == 1
+    assert keys_env[-1][1] == [KeyToken("привет мир", True)]
+
+
+async def test_screen_unchanged_since_the_clients_hash_sends_no_parts(env, monkeypatch):
+    from kikubot.pane_screen import PaneScreen
+
+    screen = PaneScreen("same\n", 80, 1, (0, 0), 0, 0, captured_at=1794330000.123)
+    _screen_env(env, monkeypatch, screen)
+    digest = screen.digest()
+    update, query = _update(monkeypatch, OWNER, f"screen {CHAT}:42 h={digest}")
+    await inline_status.inline_status_handler(update, _ctx())
+    results = query.answer.call_args.args[0]
+    meta = json.loads(results[0].input_message_content.message_text)
+    assert len(results) == 1 and meta["same"] is True and meta["parts"] == 0
+    assert meta["hash"] == digest and meta["tms"] == 1794330000123
+
+    update, query = _update(monkeypatch, OWNER, f"screen {CHAT}:42 h=000000000000")
+    await inline_status.inline_status_handler(update, _ctx())
+    results = query.answer.call_args.args[0]
+    assert len(results) == 2  # changed: the full screen

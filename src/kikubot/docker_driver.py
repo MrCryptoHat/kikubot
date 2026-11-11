@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from dataclasses import replace
 
 from .pane_screen import SCREEN_FORMAT, PaneScreen, parse_screen_output
 from .utils import is_valid_session_id, tmux_literal_args
@@ -545,6 +547,7 @@ class DockerDriver:
         if back > 0:
             argv += ["-S", f"-{back}"]
         argv += [";", "display-message", "-p", "-t", target, SCREEN_FORMAT]
+        taken = time.time()
         rc, stdout, stderr = await self._run(argv)
         if rc != 0:
             logger.debug(
@@ -553,7 +556,8 @@ class DockerDriver:
                 stderr.decode(errors="replace").strip(),
             )
             return None
-        return parse_screen_output(stdout.decode("utf-8", errors="replace"))
+        screen = parse_screen_output(stdout.decode("utf-8", errors="replace"))
+        return replace(screen, captured_at=taken) if screen else None
 
 
 docker_driver = DockerDriver()

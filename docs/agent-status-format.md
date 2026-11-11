@@ -177,8 +177,9 @@ Results, all `InlineQueryResultArticle` + `InputTextMessageContent` without
 
 - `screen`: the meta.
   ```json
-  {"v":1,"cols":100,"rows":50,"cursor":[2,42],"ts":1794316400,"parts":2,
-   "panel":12345,"back":0,"history":1995}
+  {"v":1,"cols":100,"rows":50,"cursor":[2,42],"ts":1794316400,
+   "tms":1794316400123,"hash":"3f9c0a1b2c4d","parts":2,"panel":12345,
+   "back":0,"history":1995}
   ```
 - `screen.1` … `screen.<parts>`: `{"d":"<chunk>"}`, each `message_text` at
   most 4096 characters. Join the `d` values in order.
@@ -194,13 +195,22 @@ and leading spaces intact through Telegram. Characters it might strip or alter
 |---|---|
 | `cols`, `rows` | the pane size; the visible screen is the last `rows` lines of the text |
 | `cursor` | `[x, y]`, 0-based, `y` counted from the top of the visible screen; `null` while the program hides the cursor |
-| `ts` | unix seconds of the capture |
+| `ts` | unix seconds of the answer |
+| `tms` | unix milliseconds of the capture: order answers by it (a poll captured before your keys can arrive after their answer) |
+| `hash` | 12 hex characters of what you draw (text, cursor, size); send it back as `h=` |
+| `same` | `true` only on a meta-only answer: the visible screen still matches your `h=` |
 | `parts` | how many `screen.N` results follow |
 | `panel` | message id of the topic's newest /agent panel, or `null` when the bot hasn't sent one since it started |
 | `back` | history lines that lead the text, above the visible screen |
 | `history` | history lines the terminal holds in all; `back` = `history` means the top is reached |
 | `error` | only when nothing was captured (agent not running): `"unavailable"`, with `parts` 0 |
 | `truncated` | `true` only when even the visible screen didn't fit the parts and its bottom was cut (a huge pane full of colour); otherwise absent |
+
+**Unchanged screens.** `screen <chat_id>:<thread_id> h=<hash>` with the
+`hash` of the screen you draw: while the visible screen is the same, the
+answer is the meta alone, `"same": true` and `parts` 0 (with a fresh `ts`
+and `tms`). Polling with `h=` costs a few hundred bytes a second while
+nothing moves instead of the whole screen. `h=` is ignored with `back`.
 
 **History.** `back=<N>` adds up to N lines from above the visible screen
 (at most 3000), followed by the visible screen itself, in one capture, so
@@ -216,30 +226,42 @@ screen itself uses `keys` instead.
 
 ## Keys
 
-`keys <chat_id>:<thread_id> <seq> <token> … .` presses keys in the topic's
+`keys <chat_id>:<thread_id> <seq> [t=<unix ms>] <token> … .` presses keys in the topic's
 terminal and answers with its screen right after, in one round trip. It is
 the only inline query that types into an agent. Same topic check,
 `ALLOWED_USERS`, `is_personal` and `cache_time=0` as `screen`; an inline query
 holds at most 256 characters, so split longer input over several queries.
 
-- `seq`: an integer that grows with every `keys` query for that topic. A
-  query whose `seq` isn't above the last one the bot saw sends nothing
-  (`stale`), so a query delivered twice or late never presses its keys again
-  or out of order. Start from a value that also grows across app restarts (a
-  millisecond timestamp); a `seq` more than a day ahead of the clock is
-  refused (`bad-key`) and not recorded. The bot keeps the last `seq` across
-  its own restarts, so resending an unanswered query with the same `seq` is
-  safe: if the first one got through, the resend is `stale`. Any other retry
-  takes a new `seq`. Keep one query in flight and coalesce taps made
-  meanwhile into the next.
+- `seq`: an integer that grows with every `keys` query for that topic. Start
+  from a value that also grows across app restarts (a millisecond
+  timestamp); a `seq` more than a day ahead of the clock is refused
+  (`bad-key`) and not recorded. Keep one query in flight and coalesce taps
+  made meanwhile into the next.
+  - A new `seq` is recorded before its keys are sent, and what they did is
+    kept. **Resending the same `seq` is always safe**: the answer carries
+    that `seq`'s outcome (`sent`, `error`) with `"repeat": true` and the
+    current screen, and nothing is typed again. While the first is still
+    being sent, the repeat waits for it (up to 6 s; past that it answers
+    `"error": "in-progress"`: resend the same `seq` again). So a resend that
+    says `busy` means the keys were NOT typed: send them under a new `seq`.
+  - A `seq` below the last one, or one the bot can't account for (it
+    restarted since), is `stale`: nothing typed, and whether it was typed
+    before is unknown. The last `seq` per topic survives a bot restart, so a
+    query that waited the restart out is never typed twice.
+- `t=<unix ms>`, optional, right after `seq`: when the client sent the
+  query. Keys that reach the bot more than 8 s later are refused
+  (`expired`), nothing sent, and the `seq` is recorded: the user was already
+  told they weren't sent, and typing them now would double what he presses
+  again. Keep the phone's clock synced.
 - Tokens, checked before anything is sent; one bad token sends nothing:
   - key names (tmux): `Up` `Down` `Left` `Right` `Enter` `Escape` `Tab`
     `BTab` (Shift+Tab) `BSpace` `DC` (Delete) `Space` `Home` `End` `PPage`
     `NPage` `F1`…`F12` `C-a`…`C-y` `C-Space` `M-a`…`M-z`. No `C-z`: it
     would suspend the agent back to the shell.
-  - text: `=` and the text percent-encoded as UTF-8 (`=yes%2C%20go`), typed
-    exactly (a trailing `;` included), no Enter implied. No control
-    characters (newline, ESC…).
+  - text: `=` and the text, typed exactly (a trailing `;` included), no
+    Enter implied. Percent-encode only `%`, space and control characters;
+    any other character, Cyrillic included, may go raw (`=привет%20мир`).
+    Control characters are refused after decoding (newline, ESC…).
   - `Clear`: empty the input box, every line of it, wherever the cursor is.
     The bot uses the CLI's own editing keys and checks the box afterwards;
     it never interrupts a running turn (no Esc, no Ctrl-C). An empty box
@@ -267,16 +289,22 @@ holds at most 256 characters, so split longer input over several queries.
   terminal check above is the rule that holds.
 
 The answer is the `screen` answer of the visible screen (`back` 0) after the
-keys, with `seq` and `sent` (tokens actually sent) in the meta. The bot waits
-for the screen to change, up to 0.3 s, and answers at that cap anyway; the
-next `screen` poll catches a slower redraw. The panel photo is not touched.
+keys, with `seq`, `sent` (tokens actually sent) and `changed` in the meta.
+The bot waits for the screen to change, up to 0.3 s, and answers at that cap
+anyway (`"changed": false`); the next `screen` poll catches a slower redraw.
+The panel photo is not touched.
+
+The bot doesn't limit a query's length; Telegram caps an inline query at 256
+characters. Count them as UTF-16 units to be safe (an emoji is 2).
 
 | `error` | Meaning | Sent |
 |---|---|---|
 | `bad-key` | a token not on the list, bad text, no `.`, a key after Enter/C-c/C-d/Clear, or a `seq` far ahead | nothing |
-| `stale` | `seq` not above the last one | nothing |
+| `stale` | `seq` below the last one, or one the bot can't account for since a restart | nothing |
+| `expired` | `t=` more than 8 s old | nothing |
+| `in-progress` | a repeat whose first send is still going after 6 s; resend the same `seq` | nothing yet |
 | `not-running` | no agent in the pane (it quit, or a restart is under way) | the keys before it, if it quit mid-query |
-| `busy` | the bot is typing a message into that pane; retry with a new `seq` | nothing |
+| `busy` | the bot is typing a message into that pane; send them under a new `seq` | nothing |
 | `would-exit` | the last key would end the agent | the keys before it |
 | `unsupported` | `Clear` on a CLI whose input box the bot can't read | the keys before it |
 | `unavailable` | the pane couldn't be read or written | `sent` says how many |

@@ -23,7 +23,9 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   The inline query `keys` presses keys there (or `Clear`s the input box) and
   answers with the screen after them, in one round trip; keys go only to a
   pane whose agent holds its terminal
-  ([format](docs/agent-status-format.md#keys)).
+  ([format](docs/agent-status-format.md#keys)). A resent query reports what
+  its keys did instead of typing them again, keys that arrive more than 8 s
+  late are refused, and an unchanged screen is answered with its meta alone.
 - **Session actions** in the status JSON (`commands`): new agent, worktree,
   compact, clear, rewind, resume, background, edit screenshots, restart, end,
   each a command the topic accepts, grouped and marked for confirmation, for

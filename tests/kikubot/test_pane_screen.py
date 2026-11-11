@@ -74,6 +74,8 @@ def test_round_trip_keeps_every_character():
         "rows": 4,
         "cursor": [0, 3],
         "ts": 7,
+        "tms": 7000,  # no capture time known: the answer's
+        "hash": screen.digest(),
         "parts": 1,
         "panel": 55,
         "back": 0,
@@ -155,3 +157,11 @@ def test_a_screen_too_big_for_the_parts_says_so():
     assert meta["parts"] == 1 and meta["truncated"] is True
     meta = json.loads(screen_messages(screen, ts=1, panel=None)[0][1])
     assert "truncated" not in meta
+
+
+def test_hash_follows_what_the_client_draws():
+    a = PaneScreen("x\n", 80, 1, (0, 0), 0, 0)
+    assert a.digest() == PaneScreen("x\n", 80, 1, (0, 0), 0, 0, captured_at=5).digest()
+    assert a.digest() != PaneScreen("y\n", 80, 1, (0, 0), 0, 0).digest()
+    assert a.digest() != PaneScreen("x\n", 80, 1, (1, 0), 0, 0).digest()  # cursor
+    assert len(a.digest()) == 12
