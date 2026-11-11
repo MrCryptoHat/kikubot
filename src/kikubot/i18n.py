@@ -191,7 +191,6 @@ STRINGS: dict[str, str] = {
     "role.cleared_told": "Role removed; the agent knows.",
     "role.cleared_later": "Role removed. The agent hears of it with its next start: /restart keeps the conversation.",
     "role.too_long": "That's {n} characters; a role fits in {max}. Keep what the agent must always remember.",
-    "role.docker": "A container agent takes its standing instructions from CLAUDE.md in its workspace: /role works for agents on this computer.",
     "role.no_hook": "{agent} won't get it again after a restart: only Claude agents do.",
 }
 

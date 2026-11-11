@@ -82,12 +82,15 @@ def tmux_literal_args(text: str) -> list[str]:
     return ([base] if base else []) + ["\\;"] * (len(text) - len(base))
 
 
-def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
+def atomic_write_json(
+    path: Path, data: Any, indent: int = 2, mode: int | None = None
+) -> None:
     """Write JSON data to a file atomically.
 
     Writes to a temporary file in the same directory, then renames it
     to the target path. This prevents data corruption if the process
-    is interrupted mid-write.
+    is interrupted mid-write. The file is private (0600) unless ``mode``
+    says otherwise.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(data, indent=indent)
@@ -97,6 +100,8 @@ def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
         dir=str(path.parent), suffix=".tmp", prefix=f".{path.name}."
     )
     try:
+        if mode is not None:
+            os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
             f.flush()
@@ -125,7 +130,9 @@ def _log_write_exception(future: concurrent.futures.Future) -> None:
         logger.error("Background JSON write failed: %s", exc)
 
 
-def schedule_async_json_write(path: Path, data: Any, indent: int = 2) -> None:
+def schedule_async_json_write(
+    path: Path, data: Any, indent: int = 2, mode: int | None = None
+) -> None:
     """Fire-and-forget JSON write that offloads the fsync.
 
     Serialises submission order through a single-thread executor so a later
@@ -140,9 +147,11 @@ def schedule_async_json_write(path: Path, data: Any, indent: int = 2) -> None:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        atomic_write_json(path, data, indent=indent)
+        atomic_write_json(path, data, indent=indent, mode=mode)
         return
-    future = _get_async_write_executor().submit(atomic_write_json, path, data, indent)
+    future = _get_async_write_executor().submit(
+        atomic_write_json, path, data, indent, mode
+    )
     future.add_done_callback(_log_write_exception)
 
 

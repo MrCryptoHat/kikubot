@@ -100,6 +100,25 @@ So the contract is small, but strict:
      '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'
    ```
 
+   A topic's role (`/role`) reaches a container the same way. The bot keeps
+   `topic-roles.json` beside the session map, in the directory the container
+   already mounts: one entry per binding of this container whose topic has a
+   role, `{"context": "<text to add>", "resume_only": <bool>}`. `resume_only`
+   marks a removed role, which only a resumed or compacted conversation needs
+   to hear about. The bot writes the file and never reads it back. To pass it
+   on, hold the briefing above in `$brief` and end the hook with:
+
+   ```sh
+   source=$(printf '%s' "$payload" | jq -r '.source // ""')
+   role=$(jq -r --arg k "docker:$name" --arg s "$source" \
+     '.[$k] // empty
+      | select((.resume_only | not) or $s == "resume" or $s == "compact")
+      | .context' "$(dirname "$map")/topic-roles.json" 2>/dev/null)
+   [ -n "$role" ] && brief=$(printf '%s\n\n%s' "$brief" "$role")
+   jq -n --arg ctx "$brief" \
+     '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'
+   ```
+
    registered in the container's `~/.claude/settings.json`:
 
    ```json

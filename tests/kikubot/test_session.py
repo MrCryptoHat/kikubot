@@ -2482,3 +2482,111 @@ class TestStopMarkClearedWhenRunning:
         assert "docker:ideas" in mgr.stopped_docker_agents
         mgr.note_docker_agent_running("docker:ideas", time.monotonic() + 1)
         assert "docker:ideas" not in mgr.stopped_docker_agents
+
+
+class TestDockerRoles:
+    """A container's hook gets its topics' roles from a file beside its map."""
+
+    def _agent(self, tmp_path, name):
+        from kikubot.config import DockerAgentConfig
+
+        return DockerAgentConfig(
+            name=name,
+            container=f"{name}-ctn",
+            workspace_host_path=tmp_path / name / "workspace",
+            claude_home_host_path=tmp_path / name / "claude-home",
+            ipc_dir=tmp_path / name / "ipc",
+            session_map_path=tmp_path / name / "hostmap" / "session-map.json",
+        )
+
+    @pytest.fixture
+    def env(self, mgr, tmp_path, monkeypatch):
+        from kikubot import session as session_mod
+
+        agents = [self._agent(tmp_path, "assistant"), self._agent(tmp_path, "other")]
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", True)
+        monkeypatch.setattr(session_mod.config, "docker_agents", agents)
+        monkeypatch.setattr(
+            session_mod.config,
+            "get_docker_agent",
+            lambda name: next((a for a in agents if a.name == name), None),
+        )
+        return mgr, {
+            a.name: a.session_map_path.parent / "topic-roles.json" for a in agents
+        }
+
+    def _read(self, path):
+        return json.loads(path.read_text())
+
+    def test_each_agent_gets_its_own_topics_roles(self, env) -> None:
+        from kikubot.hook import role_context
+
+        mgr, files = env
+        mgr.bind_thread(100, 42, "docker:assistant")
+        mgr.bind_thread(100, 43, "docker:assistant/notes")
+        mgr.bind_thread(100, 44, "docker:other")
+        mgr.bind_thread(100, 45, "@5")
+        mgr.topic_roles = {"100:42": "Log gym notes", "100:43": "", "100:45": "host"}
+        mgr._sync_docker_roles()
+        assert self._read(files["assistant"]) == {
+            "docker:assistant": {
+                "context": role_context("Log gym notes"),
+                "resume_only": False,
+            },
+            # Removed: only a resumed conversation still holds the old text.
+            "docker:assistant/notes": {
+                "context": role_context(""),
+                "resume_only": True,
+            },
+        }
+        # The container may run as another user; it must be able to read it.
+        assert files["assistant"].stat().st_mode & 0o777 == 0o644
+        # No role among its topics: no file, and no other agent's roles.
+        assert not files["other"].exists()
+
+    def test_written_only_on_change(self, env, monkeypatch) -> None:
+        from kikubot import session as session_mod
+
+        mgr, files = env
+        mgr.bind_thread(100, 42, "docker:assistant")
+        mgr.topic_roles = {"100:42": "r"}
+        writes = []
+        real = session_mod.schedule_async_json_write
+        monkeypatch.setattr(
+            session_mod,
+            "schedule_async_json_write",
+            lambda *a, **k: (writes.append(a[0]), real(*a, **k)),
+        )
+        mgr._sync_docker_roles()
+        mgr._sync_docker_roles()
+        assert writes == [files["assistant"]]
+        mgr.topic_roles["100:42"] = "r2"
+        mgr._sync_docker_roles()
+        assert writes == [files["assistant"]] * 2
+
+    def test_unbound_topic_leaves_the_file(self, env) -> None:
+        mgr, files = env
+        mgr.bind_thread(100, 42, "docker:assistant")
+        mgr.topic_roles = {"100:42": "r"}
+        mgr._sync_docker_roles()
+        mgr.unbind_thread(100, 42)
+        mgr._sync_docker_roles()
+        assert self._read(files["assistant"]) == {}
+
+    def test_a_past_runs_file_is_cleared(self, env) -> None:
+        # A role removed with its topic while the bot was down.
+        mgr, files = env
+        files["other"].parent.mkdir(parents=True)
+        files["other"].write_text('{"docker:other": {"context": "old"}}')
+        mgr._sync_docker_roles()
+        assert self._read(files["other"]) == {}
+
+    def test_flag_off_writes_nothing(self, env, monkeypatch) -> None:
+        from kikubot import session as session_mod
+
+        mgr, files = env
+        monkeypatch.setattr(session_mod.config, "docker_agents_enabled", False)
+        mgr.bind_thread(100, 42, "docker:assistant")
+        mgr.topic_roles = {"100:42": "r"}
+        mgr._sync_docker_roles()
+        assert not files["assistant"].exists()

@@ -1605,8 +1605,9 @@ async def _handle_dv_list(
 
 
 async def _adopt_topic_name(window_id: str, current: str) -> str:
-    """Rename a ➕/🌳 agent's window to its topic's name; return the name to use.
+    """Rename an agent's window to its topic's name; return the name to use.
 
+    For ➕/🌳 topics and any topic the user renamed (topic_window_name).
     Windows made before agents took their topic's name carry the folder name
     plus -2. A restart relaunches the CLI anyway, so its `--name` follows the
     window here. Anything that fails keeps the current name.

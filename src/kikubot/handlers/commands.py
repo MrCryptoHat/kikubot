@@ -85,6 +85,8 @@ from ..session import TOPIC_ROLE_MAX_CHARS, session_manager
 from ..terminal_parser import is_interactive_ui
 from ..tmux_manager import tmux_manager
 from ..transcript_parser import TranscriptParser
+from ..worktrees import TOPIC_MARK as WT_TOPIC_MARK
+from .siblings import SIBLING_TOPIC_MARK
 from ..voice import providers as voice_providers
 
 logger = logging.getLogger(__name__)
@@ -667,7 +669,8 @@ async def role_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ``/role`` shows them, ``/role <text>`` sets them, ``/role off`` removes
     them. They are kept per topic, not per session: the SessionStart hook
     hands them to every Claude session the topic starts, resumes, clears or
-    compacts (hook._topic_role). A live agent is told at once, as a message
+    compacts (hook._topic_role; a container's hook reads them from the file
+    session._sync_docker_roles writes). A live agent is told at once, as a message
     — the hook would reach it only at its next start — unless a dialog is
     open, where the message would become its answer.
     """
@@ -679,9 +682,6 @@ async def role_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_reply(update.message, tr("common.topics_only"))
         return
     wid = session_manager.resolve_window_for_thread(user.id, thread_id) or ""
-    if wid and session_manager._is_docker_binding(wid):
-        await safe_reply(update.message, tr("role.docker"))
-        return
 
     # The raw text, not context.args: those are split on whitespace and would
     # lose the line breaks of a role written as a list.
@@ -2344,6 +2344,15 @@ async def topic_edited_handler(
     if thread_id is None:
         return
 
+    # The new name is what the topic's agent goes by from now on: in this
+    # window and in every later one (topic_window_name), so a revive or a
+    # restart can't bring the old name back. Recorded unbound too, since
+    # the Bot API never tells us a topic's name again.
+    name = new_name.strip().removeprefix(SIBLING_TOPIC_MARK)
+    name = name.removeprefix(WT_TOPIC_MARK).strip()
+    if name:
+        session_manager.set_topic_agent_name(user.id, thread_id, name)
+
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if not wid:
         logger.debug(
@@ -2351,6 +2360,7 @@ async def topic_edited_handler(
         )
         return
 
+    new_name = session_manager.topic_window_name(user.id, thread_id) or new_name
     old_name = session_manager.get_display_name(wid)
     # Docker bindings don't have a tmux window on the host — only update
     # the display-name map. Tmux bindings get the tmux window rename too.

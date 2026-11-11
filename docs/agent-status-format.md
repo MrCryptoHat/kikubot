@@ -152,7 +152,7 @@ a bound topic.
 | `resume` | `/resume` | session | terminal: the CLI's list of past conversations |
 | `background` | `/bgtask` | session | sends the running tool to the background (Ctrl+B); refused while idle or in a dialog. Not the CLI's own `/background`, which detaches the whole session |
 | `diff` | `/diff` | session | turns the per-edit screenshots on or off for the topic |
-| `role` | `/role` | session | the topic's standing instructions for its agent; takes text (`input`). Not for a container agent |
+| `role` | `/role` | session | the topic's standing instructions for its agent; takes text (`input`) |
 | `restart` | `/restart` | danger | confirm; the same conversation continues |
 | `end` | `/kill` | danger | confirm |
 | `delete` | `/delete` | danger | only for an extra agent (a worktree agent or a sibling), as on the panel. No `confirm`: the bot answers in the topic with its own, which says what would be lost (uncommitted or unmerged work); its ✅ deletes the agent and the topic |
@@ -164,7 +164,7 @@ text, as one message (line breaks kept):
 
 | Field | Meaning |
 |---|---|
-| `prefill` | an inline query (`<prefill> <chat_id>:<thread_id>`) whose answer holds the current text: start the editor from it, so changing and adding to it are the same edit |
+| `prefill` | an inline query (`<prefill> <chat_id>:<thread_id>`) answered by one article `<prefill>.v1.json`, whose JSON holds the current text under the key `<prefill>`: start the editor from it, so changing and adding to it are the same edit |
 | `clear` | the message to send when the user empties the field |
 | `max` | the longest text the bot accepts, in characters |
 | `placeholder` | a hint for the empty field, ready to show |

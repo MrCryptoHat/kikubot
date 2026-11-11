@@ -349,11 +349,12 @@ class TestRoleCommand:
         assert str(TOPIC_ROLE_MAX_CHARS) in said
 
     @pytest.mark.asyncio
-    async def test_container_agent_is_refused(self, sm):
+    async def test_container_agent_gets_it_too(self, sm):
+        # Its own hook reads it from the file the bot keeps beside its map.
         said, deliver = await self._run(sm, "/role Log", wid="docker:assistant")
-        assert sm.get_topic_role(1, 42) == ""
-        assert said == tr("role.docker")
-        deliver.assert_not_awaited()
+        assert sm.get_topic_role(1, 42) == "Log"
+        assert deliver.await_args.args[0] == "docker:assistant"
+        assert said == tr("role.saved_told")
 
     @pytest.mark.asyncio
     async def test_hookless_agent_hears_it_wont_come_back(self, sm):
@@ -367,3 +368,60 @@ class TestRoleCommand:
         sm.record_thread_directory(1, 42, "/w", runtime="codex")
         said, _ = await self._run(sm, "/role Log")
         assert said == f"{tr('role.saved')}\n{tr('role.no_hook', agent='Codex')}"
+
+
+class TestTopicRenamed:
+    """A renamed topic's agent keeps the new name past its window."""
+
+    @pytest.fixture
+    def sm(self, monkeypatch):
+        from kikubot.session import SessionManager
+
+        monkeypatch.setattr(SessionManager, "_load_state", lambda self: None)
+        monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+        return SessionManager()
+
+    async def _rename(self, sm, name: str) -> AsyncMock:
+        from kikubot.handlers.commands import topic_edited_handler
+
+        update = MagicMock()
+        update.effective_user.id = 1
+        update.message.forum_topic_edited.name = name
+        rename = AsyncMock(return_value=True)
+        with (
+            patch("kikubot.handlers.commands.is_user_allowed", return_value=True),
+            patch("kikubot.handlers.commands.get_thread_id", return_value=42),
+            patch("kikubot.handlers.commands.session_manager", sm),
+            patch("kikubot.handlers.commands.tmux_manager.rename_window", new=rename),
+        ):
+            await topic_edited_handler(update, MagicMock())
+        return rename
+
+    @pytest.mark.asyncio
+    async def test_unbound_topic_remembers_the_name(self, sm):
+        # The next window (a revive, a picker launch) takes it.
+        sm.set_topic_agent_name(1, 42, "old")
+        rename = await self._rename(sm, "➕  gym  notes")
+        assert sm.topic_window_name(1, 42) == "gym notes"
+        rename.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_window_takes_the_name_without_the_mark(self, sm):
+        sm.bind_thread(1, 42, "@5", window_name="project")
+        rename = await self._rename(sm, "🌳 project: fix login")
+        rename.assert_awaited_once_with("@5", "project: fix login")
+        assert sm.get_display_name("@5") == "project: fix login"
+        assert sm.topic_window_name(1, 42) == "project: fix login"
+
+    @pytest.mark.asyncio
+    async def test_a_bare_mark_keeps_the_old_name(self, sm):
+        sm.set_topic_agent_name(1, 42, "gym")
+        await self._rename(sm, "➕")
+        assert sm.topic_window_name(1, 42) == "gym"
+
+    @pytest.mark.asyncio
+    async def test_docker_binding_renames_no_tmux_window(self, sm):
+        sm.bind_thread(1, 42, "docker:assistant", window_name="assistant")
+        rename = await self._rename(sm, "Helper")
+        rename.assert_not_awaited()
+        assert sm.get_display_name("docker:assistant") == "Helper"

@@ -66,6 +66,10 @@ TOPIC_SESSIONS_MAX = 20
 # A topic's role (/role) is context every one of its sessions carries from
 # its first token: room for a page of instructions, not for a document.
 TOPIC_ROLE_MAX_CHARS = 2000
+# Beside a docker agent's session map, in the directory its container mounts:
+# the roles of the topics its sessions serve, for its own SessionStart hook
+# (docs/docker-agents.md). Keyed by binding, {"context", "resume_only"}.
+DOCKER_ROLES_FILE = "topic-roles.json"
 
 _T = TypeVar("_T")
 
@@ -279,7 +283,8 @@ class SessionManager:
     # ("user_id:thread_id" keys). Its tmux window and its Claude session carry
     # it (topic_window_name), so the terminal and the chat name one agent the
     # same way; otherwise its window would be the folder name plus -2. The Bot
-    # API can't read a topic's title back, so it is recorded at creation.
+    # API can't read a topic's title back, so it is recorded at creation and
+    # on every rename (any topic: a renamed main topic keeps its new name too).
     topic_agent_names: dict[str, str] = field(default_factory=dict)
     # The conversations each topic has run ("user_id:thread_id" → session
     # ids, newest first, at most TOPIC_SESSIONS_MAX), kept after its window
@@ -337,6 +342,11 @@ class SessionManager:
     # and keys typed meanwhile wait in the tty for the shell; the next writer
     # waits FINAL_SETTLE_SEC out before its agent-running check.
     _final_key_at: dict[str, float] = field(default_factory=dict)
+    # DOCKER_ROLES_FILE path -> what was last written there (None until the
+    # first save looks). Runtime-only: a restart writes each file once more.
+    _docker_roles_written: dict[Path, dict[str, Any] | None] = field(
+        default_factory=dict
+    )
     # binding -> monotonic time of its deliberate stop mark, this process only
     # (see note_docker_agent_running).
     _stopped_at: dict[str, float] = field(default_factory=dict)
@@ -440,6 +450,7 @@ class SessionManager:
         Drain on shutdown via ``shutdown_async_writer``.
         """
         self._note_topic_sessions()
+        self._sync_docker_roles()
         state: dict[str, Any] = {
             "window_states": {k: v.to_dict() for k, v in self.window_states.items()},
             "user_window_offsets": {
@@ -1191,9 +1202,10 @@ class SessionManager:
     def topic_window_name(self, user_id: int, thread_id: int | None) -> str | None:
         """The window name for this topic's agent: its title without the mark.
 
-        Only for topics kikubot created — a ➕ sibling (recorded name) or a 🌳
-        worktree (built from its meta). None for a main topic: its window takes
-        the folder name. Whitespace is collapsed, so a title can't put a newline
+        The recorded name — a ➕ sibling's from its creation, any topic's from
+        its last rename — else a 🌳 worktree's built from its meta. None for a
+        main topic never renamed: its window takes the folder name. Whitespace
+        is collapsed, so a title can't put a newline
         into a tmux listing; the cap mirrors Telegram's 128 minus «🌳 ».
         """
         if thread_id is None:
@@ -1232,6 +1244,51 @@ class SessionManager:
                 self.topic_sessions[key] = [state.session_id, *rest][
                     :TOPIC_SESSIONS_MAX
                 ]
+
+    def _sync_docker_roles(self) -> None:
+        """Hand each docker agent the roles of the topics it serves.
+
+        A container's SessionStart hook can't read state.json, so the roles
+        of the topics bound to an agent (its main session and ➕ siblings)
+        go into DOCKER_ROLES_FILE beside its session map — the directory its
+        container already mounts — as the text the host hook would say
+        (hook.role_context). Written only on change, readable (0644) because
+        the container may run as another user. A container sees only its own
+        agents' roles; the bot never reads the file back.
+        """
+        if not config.docker_agents_enabled:
+            return
+        from .hook import role_context
+
+        if not self._docker_roles_written:
+            # First look: a file a past run left (a role since removed with
+            # its topic) is rewritten too, not just the ones with roles now.
+            for agent in config.docker_agents:
+                path = agent.session_map_path.parent / DOCKER_ROLES_FILE
+                self._docker_roles_written[path] = None
+        wanted: dict[Path, dict[str, Any]] = {}
+        for user_id, thread_id, binding in self.iter_thread_bindings():
+            if not self._is_docker_binding(binding):
+                continue
+            target = self.resolve_docker_target(binding)
+            if target is None:
+                continue
+            path = target.agent.session_map_path.parent / DOCKER_ROLES_FILE
+            entries = wanted.setdefault(path, {})
+            role = self.topic_roles.get(f"{user_id}:{thread_id}")
+            if role is not None:
+                entries[binding] = {
+                    "context": role_context(role),
+                    "resume_only": not role,
+                }
+        for path in set(wanted) | set(self._docker_roles_written):
+            data = wanted.get(path, {})
+            if self._docker_roles_written.get(path) == data:
+                continue
+            self._docker_roles_written[path] = data
+            # An agent whose topics never had a role gets no file at all.
+            if data or path.exists():
+                schedule_async_json_write(path, data, mode=0o644)
 
     def get_topic_sessions(self, user_id: int, thread_id: int | None) -> list[str]:
         """The conversations this topic has run, newest first (topic_sessions)."""

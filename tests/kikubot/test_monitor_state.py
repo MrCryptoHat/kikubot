@@ -66,7 +66,7 @@ class TestMonitorStateSave:
         )
         calls: list[tuple] = []
 
-        def fake_write(path, data, indent=2):
+        def fake_write(path, data, indent=2, mode=None):
             calls.append((path, data))
 
         monkeypatch.setattr("kikubot.utils.atomic_write_json", fake_write)

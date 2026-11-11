@@ -871,21 +871,19 @@ def session_actions(binding: str, runtime: str, reserved: Iterable[str]) -> list
         add("diff", "/diff", "session", icon="diff")
     # The topic's standing instructions (/role). Text in, so the item says how
     # to ask for it; the current text comes from the inline ``role`` query,
-    # not from here (no message text in this JSON). A container agent keeps
-    # its CLAUDE.md, and /role refuses it.
-    if binding.startswith("@"):
-        add(
-            "role",
-            "/role",
-            "session",
-            icon="role",
-            input={
-                "prefill": "role",
-                "clear": "/role off",
-                "max": TOPIC_ROLE_MAX_CHARS,
-                "placeholder": tr("astatus.role.placeholder"),
-            },
-        )
+    # not from here (no message text in this JSON).
+    add(
+        "role",
+        "/role",
+        "session",
+        icon="role",
+        input={
+            "prefill": "role",
+            "clear": "/role off",
+            "max": TOPIC_ROLE_MAX_CHARS,
+            "placeholder": tr("astatus.role.placeholder"),
+        },
+    )
     add(
         "restart",
         "/restart",

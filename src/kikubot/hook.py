@@ -93,6 +93,17 @@ _ROLE_REMOVED = (
 )
 
 
+def role_context(role: str) -> str:
+    """What a session is told of its topic's role: the text under its header,
+    or for a removed one ("") the note that it no longer applies — said only
+    where the old text may linger (a resumed or compacted conversation).
+
+    The bot hands docker agents the same text in a file (session.py,
+    DOCKER_ROLES_FILE), so a container hook says what this one says.
+    """
+    return f"{_ROLE_HEADER}\n\n{role}" if role else _ROLE_REMOVED
+
+
 def _topic_role(window_id: str) -> str | None:
     """The /role text of the topic this window serves; "" if it was removed,
     None if it never had one.
@@ -145,10 +156,8 @@ def _emit_agent_brief(role: str | None = None, source: str = "") -> None:
         "no",
     ):
         parts.append(_AGENT_BRIEF)
-    if role:
-        parts.append(f"{_ROLE_HEADER}\n\n{role}")
-    elif role == "" and source in ("resume", "compact"):
-        parts.append(_ROLE_REMOVED)
+    if role or (role == "" and source in ("resume", "compact")):
+        parts.append(role_context(role))
     if not parts:
         return
     print(

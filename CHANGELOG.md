@@ -43,8 +43,9 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   topic a role that outlives every session in it: each Claude session the
   topic starts, resumes, clears or compacts gets it from the SessionStart
   hook, and a running agent is told at once. `/role` shows it, `/role off`
-  removes it. Host agents only; a container agent keeps its CLAUDE.md. Apps
-  get it as the session action `role` (it takes text: `input`) and its
+  removes it. A container agent gets it once its own SessionStart hook reads
+  the file the bot keeps beside its session map
+  ([docker-agents.md](docs/docker-agents.md)). Apps get it as the session action `role` (it takes text: `input`) and its
   current text from the inline query `role <chat_id>:<thread_id>`
   ([format](docs/agent-status-format.md#role)).
 
@@ -71,6 +72,10 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   was often another topic's; it now takes the topic's own last one. The
   session picker lists the topic's conversations first, marked ⭐, and the
   ones other topics ran last.
+- A renamed topic keeps its new name. Its agent's window and session took the
+  name only while that window lived: the next one (🔄 on a dead window, a
+  reboot, a new session) came back with the folder name, or a ➕/🌳 topic's
+  old name, and 🔄 even renamed a live ➕/🌳 window back.
 - A busy agent's status JSON over Telegram's size cap no longer loses its
   session actions: the edited-file list and other long lists go first.
 - A Codex prompt with its newer key-hint footer («enter continue · esc skip»,
