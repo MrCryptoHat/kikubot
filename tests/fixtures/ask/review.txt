@@ -1,0 +1,14 @@
+⏺ Two quick questions before I start.
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Color  ☒ Pets  ✔ Submit  →
+
+Review your answers
+
+ ● Which color?
+   → Green
+ ● Which pets?
+   → Cat
+
+❯ 1. Submit answers
+  2. Cancel

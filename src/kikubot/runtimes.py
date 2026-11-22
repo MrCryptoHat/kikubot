@@ -957,12 +957,11 @@ class ClaudeRuntime(AgentRuntime):
 
     def _claude_invocation(self) -> str:
         """The ``claude`` command line that ``launch_command`` extends."""
-        if config.usage_limits_enabled:
-            from .agent_status import write_statusline_settings
+        from .agent_status import write_agent_settings
 
-            path = write_statusline_settings()
-            if path is not None:
-                return f"{config.claude_command} --settings {shlex.quote(str(path))}"
+        path = write_agent_settings(statusline=config.usage_limits_enabled)
+        if path is not None:
+            return f"{config.claude_command} --settings {shlex.quote(str(path))}"
         return config.claude_command
 
     def launch_command(

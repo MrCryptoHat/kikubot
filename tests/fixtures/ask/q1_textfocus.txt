@@ -1,0 +1,18 @@
+⏺ Two quick questions before I start.
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Color  ☐ Pets  ✔ Submit  →
+
+Which color?
+
+  1. Red
+     warm
+  2. Green
+     calm
+  3. Blue
+     cool
+❯ 4. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in nano · Esc to cancel

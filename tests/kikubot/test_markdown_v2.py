@@ -305,3 +305,19 @@ class TestFenceBareBoxArt:
         fenced = fence_bare_box_art(text)
         assert fenced.split("\n")[1] == "```"
         assert fenced.count("```") == 2
+
+
+class TestParenNumberedList:
+    """«1) …» keeps its numbers (telegramify turned them into ⦁ bullets)."""
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("1) Первый\n2) Второй", "1\\) Первый\n2\\) Второй\n"),
+            ("2) Второй\n3) Третий", "2\\) Второй\n3\\) Третий\n"),
+            ("1. Первый\n2. Второй", "1\\. Первый\n2\\. Второй\n"),
+            ("- a\n- b", "⦁ a\n⦁ b\n"),
+        ],
+    )
+    def test_numbers_survive(self, text, expected):
+        assert convert_markdown(text) == expected

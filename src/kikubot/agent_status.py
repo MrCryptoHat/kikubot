@@ -28,6 +28,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .ask_state import Ask, WidgetView, ask_pointer, current_ask
 from .config import config
 from .i18n import tr
 from .runtimes import AgentUsage, UsageLimit, get_runtime, limit_id
@@ -190,6 +191,8 @@ class AgentStatus:
     # Session actions (session_actions): dicts with id, label, cmd, group and
     # the optional confirm / terminal / icon.
     commands: list[dict] = field(default_factory=list)
+    # The question the agent waits on (ask_state.current_ask), while on screen.
+    ask: tuple[Ask, WidgetView] | None = None
 
     def sections(self) -> list[dict]:
         """The server-driven sheet: ordered sections a client renders by type."""
@@ -323,6 +326,8 @@ class AgentStatus:
             out["context"] = ctx
         if self.limits:
             out["limits"] = [_limit_json(lim) for lim in self.limits]
+        if self.ask is not None:
+            out["ask"] = ask_pointer(*self.ask)
         sections = self.sections()
         while True:
             if sections:
@@ -621,43 +626,50 @@ def account_limits(now: float | None = None) -> list[UsageLimit]:
     return sorted(best.values(), key=lambda lim: (lim.window_minutes or 0, lim.id))
 
 
-def write_statusline_settings() -> Path | None:
-    """Write the --settings file that makes Claude run our status-line tap.
+def write_agent_settings(*, statusline: bool) -> Path | None:
+    """Write the --settings file the bot launches its Claude windows with.
 
-    Rewritten on every launch, so a moved install heals itself. Keeps the
-    user's own statusLine display options (padding); the command it chains to
-    is resolved by the tap at run time. None if it can't be written.
+    It always carries the AskUserQuestion hooks that keep a pending question
+    as data (ask_state.py); with ``statusline`` also our status-line tap
+    (usage limits), which keeps the user's own statusLine display options
+    (padding) and chains to the user's command, resolved by the tap at run
+    time. Rewritten on every launch, so a moved install heals itself. A
+    running window keeps what it started with. None if it can't be written.
     """
     import shlex
 
-    from .hook import _claude_settings_file, _find_kikubot_path
+    from .hook import _claude_settings_file, _find_kikubot_path, ask_hooks
 
-    try:
-        user = json.loads(_claude_settings_file().read_text(encoding="utf-8"))
-        user_sl = user.get("statusLine") if isinstance(user, dict) else None
-    except (OSError, ValueError):
-        user_sl = None
-    command = " ".join(
-        shlex.quote(p)
-        for p in (
-            _find_kikubot_path(),
-            "statusline",
-            str(config.agent_status_dir),
-            config.tmux_session_name,
+    kikubot = _find_kikubot_path()
+    settings: dict = {"hooks": ask_hooks(f"{shlex.quote(kikubot)} hook")}
+    if statusline:
+        try:
+            user = json.loads(_claude_settings_file().read_text(encoding="utf-8"))
+            user_sl = user.get("statusLine") if isinstance(user, dict) else None
+        except (OSError, ValueError):
+            user_sl = None
+        command = " ".join(
+            shlex.quote(p)
+            for p in (
+                kikubot,
+                "statusline",
+                str(config.agent_status_dir),
+                config.tmux_session_name,
+            )
         )
-    )
-    sl: dict = {"type": "command", "command": command}
-    if isinstance(user_sl, dict) and isinstance(user_sl.get("padding"), int):
-        sl["padding"] = user_sl["padding"]
+        sl: dict = {"type": "command", "command": command}
+        if isinstance(user_sl, dict) and isinstance(user_sl.get("padding"), int):
+            sl["padding"] = user_sl["padding"]
+        settings["statusLine"] = sl
     path = config.config_dir / "agent-settings.json"
     try:
         tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"statusLine": sl}, fh)
+            json.dump(settings, fh)
         os.replace(tmp, path)
     except OSError as e:
-        logger.warning("Cannot write %s, launching without usage limits: %s", path, e)
+        logger.warning("Cannot write %s, launching without it: %s", path, e)
         return None
     return path
 
@@ -814,6 +826,14 @@ def _state(binding: str, runtime: str) -> tuple[str | None, str | None]:
     if session_manager.is_agent_working(binding, pane):
         return "working", pane
     return "idle", pane
+
+
+def pending_ask(binding: str) -> tuple[Ask, WidgetView] | None:
+    """The question the agent waits on, judged by the poll's last capture."""
+    from .session import session_manager
+
+    state, pane = _state(binding, session_manager.window_runtime(binding))
+    return current_ask(binding, pane) if state == "waiting" else None
 
 
 def session_actions(binding: str, runtime: str, reserved: Iterable[str]) -> list[dict]:
@@ -1001,6 +1021,8 @@ def build_status(
 
     if pane and rt.permission_modes and state != "waiting":
         st.mode = rt.permission_mode(pane)
+    if state == "waiting":
+        st.ask = current_ask(binding, pane)  # = pending_ask, from this capture
 
     src = Sources(binding, runtime, snap, usage, pane)
     for provider in ITEM_PROVIDERS:

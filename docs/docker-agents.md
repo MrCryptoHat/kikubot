@@ -127,6 +127,43 @@ So the contract is small, but strict:
    ] } ] } }
    ```
 
+   **The agent's questions as data** (optional): a second hook, on
+   PreToolUse and PostToolUse of `AskUserQuestion`, keeps the pending
+   question in `asks/<session_id>.json` beside the session map, so the
+   topic's question gets answer buttons and a client gets it as data
+   ([agent-status-format.md](agent-status-format.md#ask)). The bot reads the
+   file as untrusted input (size and shape checked) and only while the
+   question is on the agent's screen. With `$map` the session map path, as
+   above:
+
+   ```sh
+   payload=$(cat)
+   dir="$(dirname "$map")/asks"
+   sid=$(printf '%s' "$payload" | jq -r '.session_id // empty')
+   id=$(printf '%s' "$payload" | jq -r '.tool_use_id // empty')
+   case "$sid" in ""|*[!0-9A-Fa-f-]*) exit 0 ;; esac
+   case "$id" in ""|*[!A-Za-z0-9_-]*) exit 0 ;; esac
+   if [ "$(printf '%s' "$payload" | jq -r '.hook_event_name')" = PreToolUse ]; then
+     mkdir -p "$dir" &&
+       printf '%s' "$payload" | jq -c '{id: .tool_use_id, questions: .tool_input.questions}' \
+         > "$dir/.$sid.tmp" && mv "$dir/.$sid.tmp" "$dir/$sid.json"
+   elif [ "$(jq -r '.id' "$dir/$sid.json" 2>/dev/null)" = "$id" ]; then
+     rm -f "$dir/$sid.json"
+   fi
+   ```
+
+   registered next to the SessionStart one (it prints nothing: a PreToolUse
+   hook's output is its answer to Claude Code):
+
+   ```json
+   { "hooks": {
+     "PreToolUse": [ { "matcher": "AskUserQuestion", "hooks": [
+       { "type": "command", "command": "/usr/local/bin/kikubot-ask-hook", "timeout": 5 } ] } ],
+     "PostToolUse": [ { "matcher": "AskUserQuestion", "hooks": [
+       { "type": "command", "command": "/usr/local/bin/kikubot-ask-hook", "timeout": 5 } ] } ]
+   } }
+   ```
+
 ## Host-side configuration
 
 ```ini

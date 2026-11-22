@@ -50,7 +50,9 @@ from ..terminal_parser import (
     parse_login_url,
     strip_osc,
 )
+from ..ask_state import current_ask
 from . import pane_cache
+from .ask_answer import ask_buttons
 from .askquestion_parser import parse_ask_question
 from .plan_parser import extract_plan_file_name
 from .callback_data import (
@@ -405,7 +407,9 @@ def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | 
     return _interactive_msgs.get((user_id, thread_id or 0))
 
 
-def _build_interactive_keyboard(window_id: str) -> InlineKeyboardMarkup:
+def _build_interactive_keyboard(
+    window_id: str, answer_rows: list[list[InlineKeyboardButton]] | None = None
+) -> InlineKeyboardMarkup:
     """Compact nav keyboard attached to the photo of Claude awaiting an answer.
 
     Row 1 is the navigation in reading order — ← → ↑ ↓ (left, right, up, down) —
@@ -417,9 +421,14 @@ def _build_interactive_keyboard(window_id: str) -> InlineKeyboardMarkup:
     options — whitespace can't be sent as a text message). Replaces the old
     option-by-option button list which required fragile text-parsing from the
     terminal output.
+
+    ``answer_rows`` go on top: an AskUserQuestion the hook recorded
+    (ask_state.py) gets its options as buttons (ask_answer.ask_buttons), and
+    the keys stay below as the way out when a step doesn't go through.
     """
     return InlineKeyboardMarkup(
         [
+            *(answer_rows or []),
             [
                 InlineKeyboardButton(
                     "←", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
@@ -817,7 +826,13 @@ async def _handle_interactive_ui_locked(
         return True
 
     caption = tr("iui.caption_login" if iui.is_login else "iui.caption_waiting")
-    keyboard = _build_interactive_keyboard(window_id)
+    answer_rows = None
+    if iui.name == "AskUserQuestion":
+        found = current_ask(window_id, pane_plain)
+        if found is not None:
+            answer_rows = ask_buttons(*found)
+            caption = tr("iui.caption_ask")
+    keyboard = _build_interactive_keyboard(window_id, answer_rows)
 
     # file_id reuse: if we've uploaded this exact pane before in this
     # bot's lifetime, skip render+upload entirely and let Telegram

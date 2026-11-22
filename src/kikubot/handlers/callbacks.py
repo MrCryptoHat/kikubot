@@ -45,9 +45,12 @@ from .callback_data import (
     CB_ASK_ENTER,
     CB_ASK_ESC,
     CB_ASK_LEFT,
+    CB_ASK_NEXT,
+    CB_ASK_PICK,
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
+    CB_ASK_SUBMIT,
     CB_ASK_TAB,
     CB_ASK_UP,
     CB_CMD_CANCEL,
@@ -123,7 +126,7 @@ from .directory_browser import (
     clear_window_picker_state,
     sessions_for_topic,
 )
-from . import pane_cache
+from . import ask_answer, pane_cache
 from .codex_status_parser import (
     STATUS_MARKER as CODEX_STATUS_MARKER,
     format_status_message as format_codex_status,
@@ -974,6 +977,33 @@ async def _handle_interactive_key(
         (t_ui - t_wait) * 1000,
         (t_ui - t0) * 1000,
     )
+
+
+async def _handle_ask_button(
+    query: CallbackQuery,
+    data: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User,
+) -> None:
+    """An answer button under the agent's question (ask_answer.ask_buttons).
+
+    Acts on the topic's current binding; the button's token must still match
+    the pending question, so a tap on an old photo presses nothing. The photo
+    is repainted from the pane the step left behind (the next question, the
+    review, or gone — then the status poll removes it).
+    """
+    thread_id = get_thread_id(update)
+    binding = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not binding:
+        await query.answer(ask_answer.error_text("no-question"), show_alert=True)
+        return
+    error = await ask_answer.press_button(binding, data)
+    if error:
+        await query.answer(ask_answer.error_text(error), show_alert=True)
+    else:
+        await query.answer(tr("ask.done"))
+    await handle_interactive_ui(context.bot, user.id, binding, thread_id)
 
 
 async def _handle_interactive_refresh(
@@ -2116,6 +2146,9 @@ _PREFIX_DISPATCH: list[tuple[str, Any]] = [
     (CB_ASK_SPACE, _handle_interactive_key),
     (CB_ASK_TAB, _handle_interactive_key),
     (CB_ASK_REFRESH, _handle_interactive_refresh),
+    (CB_ASK_PICK, _handle_ask_button),
+    (CB_ASK_NEXT, _handle_ask_button),
+    (CB_ASK_SUBMIT, _handle_ask_button),
     # Screenshot quick keys
     (CB_KEYS_PREFIX, _handle_screenshot_keys),
     # Agent panel. Slash-command buttons share _handle_cmd_slash (it

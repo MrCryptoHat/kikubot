@@ -87,6 +87,17 @@ async def try_route_to_text_option(wid: str, text: str) -> tuple[bool, str | Non
         name = content.name if content and content.name else "unknown"
         return False, f"blocking_widget:{name}"
 
+    # A question the hook recorded (ask_state.py) is answered by the engine,
+    # which also handles multi-choice questions and checks every step. The
+    # digit route below stays for windows launched without the hook.
+    from .ask_answer import AnswerError, type_answer
+
+    try:
+        if await type_answer(wid, text):
+            return True, None
+    except AnswerError as e:
+        return False, f"blocking_widget:ask:{e.code}"
+
     match = _TYPE_SOMETHING_RE.search(pane)
     if not match:
         return False, "no_text_option"

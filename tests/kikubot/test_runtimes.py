@@ -238,9 +238,18 @@ class TestGlmRuntime:
             f"--name proj --resume {self._SID}"
         )
 
-    def test_claude_launch_untouched(self, monkeypatch):
+    def test_claude_launch_keeps_its_own_settings(self, monkeypatch):
+        from pathlib import Path
+
+        import kikubot.agent_status as ast
+
         self._cfg(monkeypatch)
-        assert CLAUDE.launch_command("proj") == "claude --name proj"
+        monkeypatch.setattr(
+            ast, "write_agent_settings", lambda **_: Path("/k/agent-settings.json")
+        )
+        assert CLAUDE.launch_command("proj") == (
+            "claude --settings /k/agent-settings.json --name proj"
+        )
 
     async def test_no_second_transcript_pass(self):
         # Claude's pass already delivers GLM sessions (same hook/session_map);
@@ -1002,12 +1011,17 @@ class TestStatuslineLaunch:
                 glm_settings_path=Path("/cfg/glm.json"),
             ),
         )
-        monkeypatch.setattr(
-            ast, "write_statusline_settings", lambda: Path("/k/agent-settings.json")
-        )
+        seen: list[bool] = []
+
+        def write(*, statusline: bool) -> Path:
+            seen.append(statusline)
+            return Path("/k/agent-settings.json")
+
+        monkeypatch.setattr(ast, "write_agent_settings", write)
         assert CLAUDE.launch_command("proj") == (
             "claude --settings /k/agent-settings.json --name proj"
         )
+        assert seen == [True]
         # GLM keeps its own --settings (z.ai env) and no Claude limits.
         assert (
             GLM.launch_command("proj") == "claude --settings /cfg/glm.json --name proj"

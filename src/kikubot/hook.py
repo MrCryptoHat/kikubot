@@ -3,7 +3,9 @@
 Called by Claude Code's SessionStart hook to maintain a window↔session
 mapping in <KIKUBOT_DIR>/session_map.json, and to hand the starting session
 kikubot's agent briefing (the `(send file: …)` protocol) as SessionStart
-context. Also provides `--install` to auto-configure the hook in Claude
+context. On PreToolUse/PostToolUse of AskUserQuestion (registered only in the
+--settings file of the bot's own windows) it keeps the pending question in
+<KIKUBOT_DIR>/asks/<session_id>.json (see ask_state.py). Also provides `--install` to auto-configure the hook in Claude
 Code's settings.json (honours CLAUDE_CONFIG_DIR, default ~/.claude).
 
 This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
@@ -171,6 +173,63 @@ def _emit_agent_brief(role: str | None = None, source: str = "") -> None:
             ensure_ascii=False,
         )
     )
+
+
+_ASK_TOOL = "AskUserQuestion"
+_ASK_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
+_TOOL_USE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+
+
+def _note_ask(payload: dict, session_id: str, event: str) -> None:
+    """Keep ``asks/<session>.json`` while the session's AskUserQuestion waits.
+
+    PreToolUse writes the tool's input under its tool_use_id; PostToolUse
+    (answered) removes it. Esc fires neither, which is why the bot shows a
+    record only while the widget is on screen (ask_state.current_ask).
+    Registered only in the --settings file the bot launches its windows with,
+    matcher AskUserQuestion. Prints nothing: stdout from a PreToolUse hook is
+    the hook's answer to Claude Code.
+    """
+    if payload.get("tool_name") != _ASK_TOOL:
+        return
+    tool_use_id = payload.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not _TOOL_USE_ID_RE.match(tool_use_id):
+        return
+    from .utils import atomic_write_json, kikubot_dir
+
+    path = kikubot_dir() / "asks" / f"{session_id}.json"
+    try:
+        if event == "PreToolUse":
+            tool_input = payload.get("tool_input")
+            questions = (
+                tool_input.get("questions") if isinstance(tool_input, dict) else None
+            )
+            if not isinstance(questions, list):
+                return
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            atomic_write_json(
+                path, {"id": tool_use_id, "questions": questions}, mode=0o600
+            )
+            return
+        try:
+            held = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(held, dict) and held.get("id") == tool_use_id:
+            path.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning("Cannot update %s: %s", path, e)
+
+
+def ask_hooks(command: str) -> dict:
+    """The ``hooks`` block that keeps the ask records, for a --settings file."""
+    entry = [
+        {
+            "matcher": _ASK_TOOL,
+            "hooks": [{"type": "command", "command": command, "timeout": 5}],
+        }
+    ]
+    return {event: entry for event in sorted(_ASK_EVENTS)}
 
 
 def _claude_settings_file() -> Path:
@@ -634,6 +693,10 @@ def hook_main() -> None:
     # Validate session_id format
     if not _UUID_RE.match(session_id):
         logger.warning("Invalid session_id format: %s", session_id)
+        return
+
+    if event in _ASK_EVENTS:
+        _note_ask(payload, session_id, event)
         return
 
     # Validate cwd is an absolute path (if provided)

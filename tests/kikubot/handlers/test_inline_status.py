@@ -504,3 +504,51 @@ async def test_role_of_a_foreign_topic_or_stranger_is_empty(
     update, query = _update(monkeypatch, uid, text)
     await inline_status.inline_status_handler(update, _ctx())
     assert query.answer.call_args.args[0] == []
+
+
+def test_parse_ask_target():
+    assert inline_status.parse_ask_target(f"ask {CHAT}:42") == (CHAT, 42)
+    assert inline_status.parse_ask_target(f"ask {CHAT}") is None
+
+
+async def test_ask_answers_the_pending_question(env, monkeypatch):
+    from kikubot.ask_state import parse_record, parse_view
+
+    ask = parse_record(
+        {
+            "id": "toolu_01Abc",
+            "questions": [
+                {
+                    "question": "Which size?",
+                    "header": "Size",
+                    "options": [{"label": "S"}],
+                }
+            ],
+        }
+    )
+    view = parse_view(" ☐ Size\n\nWhich size?\n\n❯ 1. S\n  2. Type something.\n")
+    assert ask is not None and view is not None
+    monkeypatch.setattr(inline_status, "pending_ask", lambda binding: (ask, view))
+    update, query = _update(monkeypatch, OWNER, f"ask {CHAT}:42")
+    await inline_status.inline_status_handler(update, _ctx())
+    results = query.answer.call_args.args[0]
+    assert [r.id for r in results] == ["ask.v1.json"]
+    data = json.loads(results[0].input_message_content.message_text)
+    assert data["v"] == 1 and data["ask"]["id"] == "toolu_01Abc"
+    assert data["ask"]["questions"][0]["question"] == "Which size?"
+
+
+async def test_ask_with_nothing_pending_is_null(env, monkeypatch):
+    monkeypatch.setattr(inline_status, "pending_ask", lambda binding: None)
+    update, query = _update(monkeypatch, OWNER, f"ask {CHAT}:42")
+    await inline_status.inline_status_handler(update, _ctx())
+    data = json.loads(
+        query.answer.call_args.args[0][0].input_message_content.message_text
+    )
+    assert data == {"v": 1, "ask": None}
+
+
+async def test_ask_of_a_foreign_topic_is_empty(env, monkeypatch):
+    update, query = _update(monkeypatch, OWNER, "ask -100999:42")
+    await inline_status.inline_status_handler(update, _ctx())
+    assert query.answer.call_args.args[0] == []

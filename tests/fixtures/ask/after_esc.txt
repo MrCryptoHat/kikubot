@@ -1,0 +1,10 @@
+⏺ Two quick questions before I start.
+
+⏺ Declined to answer Claude's questions:
+  ⎿  · Which color? (Red / Green / Blue)
+     · Which pets? (Cat / Dog / Fish)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent

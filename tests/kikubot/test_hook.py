@@ -696,3 +696,64 @@ class TestTopicRole:
         monkeypatch.delenv("KIKUBOT_TOPIC", raising=False)
         self._state(tmp_path, bindings={"5": {"42": "@3"}}, roles={"5:42": ""})
         assert "/role" not in self._ctx(monkeypatch, tmp_path, source)
+
+
+class TestAskRecord:
+    """PreToolUse/PostToolUse on AskUserQuestion keep asks/<session>.json."""
+
+    SID = "11111111-2222-3333-4444-555555555555"
+    QUESTIONS = [
+        {
+            "question": "Which color?",
+            "header": "Color",
+            "options": [{"label": "Red", "description": "warm"}],
+            "multiSelect": False,
+        }
+    ]
+
+    def _run(self, monkeypatch, tmp_path, payload: dict, capsys=None) -> Path:
+        monkeypatch.setenv("KIKUBOT_DIR", str(tmp_path))
+        monkeypatch.setattr(sys, "argv", ["kikubot", "hook"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        hook_main()
+        return tmp_path / "asks" / f"{self.SID}.json"
+
+    def _payload(self, event: str, tool_use_id: str = "toolu_01Abc", **extra) -> dict:
+        return {
+            "session_id": self.SID,
+            "hook_event_name": event,
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": tool_use_id,
+            "tool_input": {"questions": self.QUESTIONS},
+            **extra,
+        }
+
+    def test_pre_writes_and_post_removes(self, monkeypatch, tmp_path, capsys) -> None:
+        path = self._run(monkeypatch, tmp_path, self._payload("PreToolUse"))
+        assert json.loads(path.read_text()) == {
+            "id": "toolu_01Abc",
+            "questions": self.QUESTIONS,
+        }
+        assert path.stat().st_mode & 0o777 == 0o600
+        # Prints nothing: a PreToolUse hook's stdout is its answer.
+        assert capsys.readouterr().out == ""
+        self._run(monkeypatch, tmp_path, self._payload("PostToolUse"))
+        assert not path.exists()
+
+    def test_post_of_another_call_keeps_the_record(self, monkeypatch, tmp_path) -> None:
+        path = self._run(monkeypatch, tmp_path, self._payload("PreToolUse"))
+        self._run(monkeypatch, tmp_path, self._payload("PostToolUse", "toolu_old"))
+        assert path.exists()
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"tool_name": "Bash"},
+            {"tool_use_id": "../../etc"},
+            {"tool_input": {"questions": "nope"}},
+        ],
+    )
+    def test_ignores_what_isnt_a_question(self, monkeypatch, tmp_path, change) -> None:
+        payload = {**self._payload("PreToolUse"), **change}
+        path = self._run(monkeypatch, tmp_path, payload)
+        assert not path.exists()

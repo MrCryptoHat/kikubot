@@ -192,6 +192,19 @@ STRINGS: dict[str, str] = {
     "role.cleared_later": "Role removed. The agent hears of it with its next start: /restart keeps the conversation.",
     "role.too_long": "That's {n} characters; a role fits in {max}. Keep what the agent must always remember.",
     "role.no_hook": "{agent} won't get it again after a restart: only Claude agents do.",
+    # -- The agent's question (AskUserQuestion): buttons, /answer ---------
+    "ask.btn.next": "➡️ Next",
+    "ask.btn.submit": "✅ Submit answers",
+    "ask.done": "✓",
+    "ask.err.bad-answer": 'Couldn\'t read that answer. Format: /answer <id> 1:2 2:1,3 3:"own text" — question and option numbers count from 1; a question with one answer takes one number or one text.',
+    "ask.err.unanswered": "Answer every question: the agent gets them all at once.",
+    "ask.err.no-question": "The agent isn't waiting on that question any more, so nothing was pressed.",
+    "ask.err.moved": "The agent's question didn't react the way it should, so I stopped there. Look at the photo and finish with the buttons under it.",
+    "ask.err.draft": "The own-answer field already holds some text. Finish or clear it with the buttons under the photo.",
+    "ask.err.review": "Every question is answered: send them with ✅ Submit answers under the photo, or go back with ←.",
+    "ask.err.busy": "The agent's screen is busy with another message right now. Try again in a moment.",
+    "ask.err.not-running": "The agent isn't running, so there's nothing to answer.",
+    "ask.err.unavailable": "Couldn't reach the agent's screen. Try again, or use the buttons under the photo.",
 }
 
 
@@ -452,6 +465,7 @@ STRINGS.update(
         "iui.btn_open_login": "🔗 Open sign-in",
         "iui.btn_refresh": "🔄 Refresh",
         "iui.caption_waiting": "❓ *Agent is waiting for a reply*",
+        "iui.caption_ask": "❓ *Agent is asking* — tap an answer, or send your own as a message",
         "iui.caption_login": "🔐 *Agent needs you to sign in* — use the link above",
         "iui.login_prompt": "🔐 *Sign in*\n\nOpen the link and sign in to your account.\n\n`{url}`",
         "iui.login_code": "One-time code (enter it where prompted):\n`{code}`",

@@ -106,6 +106,7 @@ class TestRestartBusyGuard:
             # launch_command / exit_command read config from kikubot.runtimes.
             patch("kikubot.runtimes.config") as rcfg,
             patch("kikubot.handlers.callbacks._cmd_refresh_photo", new=AsyncMock()),
+            patch("kikubot.agent_status.write_agent_settings", return_value=None),
         ):
             rcfg.claude_command = "claude"
             rcfg.usage_limits_enabled = False
@@ -157,6 +158,7 @@ class TestRestartBusyGuard:
             patch("kikubot.handlers.callbacks.tmux_manager") as tm,
             patch("kikubot.runtimes.config") as rcfg,
             patch("kikubot.handlers.callbacks._cmd_refresh_photo", new=AsyncMock()),
+            patch("kikubot.agent_status.write_agent_settings", return_value=None),
         ):
             rcfg.claude_command = "claude"
             rcfg.usage_limits_enabled = False

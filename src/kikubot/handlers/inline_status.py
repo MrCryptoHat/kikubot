@@ -1,4 +1,4 @@
-"""Inline queries ``status``, ``screen``, ``keys``, ``role`` — an agent's status and terminal.
+"""Inline queries ``status``, ``screen``, ``keys``, ``role``, ``ask`` — an agent's status and terminal.
 
 Inert until the bot owner enables inline mode in @BotFather (/setinline):
 Telegram sends no inline queries before that. Shapes:
@@ -14,6 +14,9 @@ Telegram sends no inline queries before that. Shapes:
   terminal and answer with its screen (inline_keys.py); same topic check.
 - ``role <chat_id>:<thread_id>`` — that topic's /role text, for a client's
   role editor to start from; same topic check.
+- ``ask <chat_id>:<thread_id>`` — the question the agent waits on
+  (AskUserQuestion), whole, for a client's answer sheet; same topic check.
+  Answered with ``/answer`` in the topic (handlers/ask_answer.py).
 - anything else (``@bot``, ``@bot status``, ``@bot <name>``) — one card per
   agent of the user, filtered by name, for official Telegram.
 
@@ -41,7 +44,8 @@ from telegram import (
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from ..agent_status import AgentStatus, build_status
+from ..agent_status import MAX_JSON_CHARS, AgentStatus, build_status, pending_ask
+from ..ask_state import ask_json
 from ..i18n import tr
 from ..pane_screen import MAX_BACK, MAX_PARTS, screen_messages
 from ..session import TOPIC_ROLE_MAX_CHARS, session_manager
@@ -52,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 _TARGETED = re.compile(r"^\s*status\s+(-?\d+):(\d+)\s*$", re.IGNORECASE)
 _ROLE = re.compile(r"^\s*role\s+(-?\d+):(\d+)\s*$", re.IGNORECASE)
+_ASK = re.compile(r"^\s*ask\s+(-?\d+):(\d+)\s*$", re.IGNORECASE)
 _SCREEN = re.compile(
     r"^\s*screen\s+(-?\d+):(\d+)((?:\s+(?:back=\d+|h=[0-9a-f]{6,40}))*)\s*$",
     re.IGNORECASE,
@@ -99,6 +104,48 @@ async def _answer_role(
                 input_message_content=InputTextMessageContent(
                     json.dumps(payload, ensure_ascii=False)
                 ),
+            )
+        ],
+        cache_time=0,
+        is_personal=True,
+    )
+
+
+def parse_ask_target(query: str) -> tuple[int, int] | None:
+    """(chat_id, thread_id) from ``ask <chat_id>:<thread_id>``, else None."""
+    m = _ASK.match(query)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+async def _answer_ask(
+    query: InlineQuery, user_id: int, chat_id: int, thread_id: int
+) -> None:
+    """Answer ``ask``: one ``ask.v1.json`` article; [] for a foreign topic.
+
+    The question the agent waits on, whole, the moment its photo is in the
+    topic — the status carries it too, shrunk when the status is full. From
+    the poll's last capture, like status: the widget must be on screen.
+    """
+    found = resolve_topic_binding(user_id, chat_id, thread_id)
+    if found is None:
+        await query.answer([], cache_time=0, is_personal=True)
+        return
+    pending = pending_ask(found[1])
+    payload: dict = {"v": 1, "ask": None}
+    text = json.dumps(payload)
+    if pending is not None:
+        for level in range(4):
+            payload["ask"] = ask_json(*pending, level=level)
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if len(text) <= MAX_JSON_CHARS:
+                break
+    await _answer(
+        query,
+        [
+            InlineQueryResultArticle(
+                id="ask.v1.json",
+                title="ask.v1.json",
+                input_message_content=InputTextMessageContent(text),
             )
         ],
         cache_time=0,
@@ -313,6 +360,11 @@ async def inline_status_handler(
     role_target = parse_role_target(query.query)
     if role_target is not None:
         await _answer_role(query, user.id, *role_target)
+        return
+    ask_target = parse_ask_target(query.query)
+    if ask_target is not None:
+        await _answer_ask(query, user.id, *ask_target)
+        _note_slow("ask", t0)
         return
     keys_target = parse_keys_query(query.query)
     if keys_target is not None:

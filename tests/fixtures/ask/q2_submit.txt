@@ -1,0 +1,19 @@
+⏺ Two quick questions before I start.
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Color  ☒ Pets  ✔ Submit  →
+
+Which pets?
+
+  1. [✔] Cat
+         Cat
+  2. [ ] Dog
+         Dog
+  3. [ ] Fish
+         Fish
+  4. [ ] Type something
+❯    Submit
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in nano · Esc to cancel

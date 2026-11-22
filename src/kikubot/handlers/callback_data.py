@@ -41,6 +41,12 @@ CB_ASK_ENTER = "aq:enter:"  # aq:enter:<window>
 CB_ASK_SPACE = "aq:spc:"  # aq:spc:<window>
 CB_ASK_TAB = "aq:tab:"  # aq:tab:<window>
 CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
+# The agent's question as buttons (ask_answer.ask_buttons). No window id: they
+# act on the topic's current binding, and <tok> (the end of the question's
+# tool_use_id) refuses a tap on an earlier question's photo.
+CB_ASK_PICK = "ak:p:"  # ak:p:<question>:<option>:<tok>
+CB_ASK_NEXT = "ak:n:"  # ak:n:<question>:<tok>
+CB_ASK_SUBMIT = "ak:s:"  # ak:s:<tok>
 
 # Session picker — runtime-tabbed. Top row = runtime tabs (Claude / Codex / …);
 # the active runtime's resumable sessions list below, with a "new session"

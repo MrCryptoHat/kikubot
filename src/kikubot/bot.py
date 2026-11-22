@@ -56,6 +56,8 @@ from .handlers.delivery import (
     report_delivery_failure,
 )
 from .handlers.callbacks import callback_handler
+from .handlers.ask_answer import answer_command
+from .handlers.ask_answer import error_text as ask_error_text
 from .handlers.inline_status import inline_status_handler
 from .handlers.mode_command import mode_command
 from .handlers.commands import (
@@ -555,6 +557,10 @@ async def _forward_text_to_agent(
         )
         return
     if status == "blocked_widget":
+        if detail.startswith("ask:"):
+            # The agent's recorded question took the text but couldn't use it.
+            await safe_reply(update.message, ask_error_text(detail[4:]))
+            return
         await safe_reply(
             update.message,
             i18n.tr("bot.agent_waiting_in_dialog"),
@@ -1361,6 +1367,10 @@ async def post_init(application: Application) -> None:
     # Sweep worktree_meta rows whose worktree is gone and thread is now unbound
     # (leftovers from manual teardown / lost state) — after stale-id resolution.
     session_manager.reconcile_worktree_meta()
+    # Questions answered by Esc leave their hook record behind (no hook fires).
+    from .ask_state import prune_records
+
+    prune_records(config.config_dir)
 
     # Pin tmux pane size so /screenshot doesn't wrap Claude Code's footer.
     # Detached tmux sessions otherwise default to 80x24, which clips the
@@ -1576,6 +1586,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("bgtask", bgtask_command))
     application.add_handler(CommandHandler("delete", delete_command))
     application.add_handler(CommandHandler("role", role_command))
+    application.add_handler(CommandHandler("answer", answer_command))
     application.add_handler(CommandHandler("pin", pin_command))
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("bind", bind_command))

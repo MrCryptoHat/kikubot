@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import mistletoe
 from mistletoe.block_token import BlockCode, remove_token
 from telegramify_markdown import _update_block, escape_latex
+from telegramify_markdown import markdown as tg_markdown
 from telegramify_markdown.render import TelegramMarkdownRenderer
 
 from .transcript_parser import TranscriptParser
@@ -525,6 +526,27 @@ def _render_expandable_quote(m: re.Match[str]) -> str:
     return "\n".join(built) + "||"
 
 
+class _Renderer(TelegramMarkdownRenderer):
+    """telegramify's renderer, keeping the numbers of a «1)» list.
+
+    It keeps «1.» numbers but turns any other leader into a «⦁» bullet, so
+    «1) … 2) …» — a common way to number questions — arrived as bullets and
+    a reader (or a client parsing the reply) couldn't tell 2) from 1).
+    """
+
+    def render_list_item(self, token, max_line_length):  # type: ignore[no-untyped-def]
+        origin = str(token.leader).strip()
+        if origin.endswith(")") and origin[:-1].isdigit():
+            if not token.leader.endswith(" "):
+                token.leader += " "
+            token.leader = tg_markdown.escape(token.leader)
+            # Past telegramify's override, to mistletoe's own list item.
+            return super(TelegramMarkdownRenderer, self).render_list_item(
+                token, max_line_length
+            )
+        return super().render_list_item(token, max_line_length)
+
+
 def _markdownify(text: str) -> str:
     """Custom markdownify with our rendering rules.
 
@@ -536,7 +558,7 @@ def _markdownify(text: str) -> str:
     Custom rules:
       - Disable indented code blocks (only fenced ``` blocks are code).
     """
-    with TelegramMarkdownRenderer(normalize_whitespace=False) as renderer:
+    with _Renderer(normalize_whitespace=False) as renderer:
         remove_token(BlockCode)
         content = escape_latex(text)
         document = mistletoe.Document(content)

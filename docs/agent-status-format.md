@@ -79,6 +79,7 @@ Rules:
 | `model_running` | present only when the model that answered last differs from `model` (e.g. after an automatic switch) |
 | `context` | `pct` of the window used, `used` tokens, `window` size |
 | `limits[]` | `id` (`5h`, `7d`, `7d_<model>`, or the CLI's own name), `label`, `pct_used`, `resets_at` (unix), `window_minutes` |
+| `ask` | present while the agent waits on a question it asked (Claude's AskUserQuestion): `id`, `kind` (`widget`), `step` (the question on screen, from 1; 0 = the review before submitting), `count` (questions). No text: fetch it with the [`ask` query](#ask) |
 
 A limit whose window already reset is left out rather than shown stale.
 
@@ -347,6 +348,62 @@ the meta comes alone with `parts` 0.
 `role` is `""` when the topic has none. Same topic check as `status`; a
 topic without an agent gets no results. The text is the user's own, which is
 why it is not in the status JSON.
+
+## Ask
+
+When the agent asks a question with options (Claude Code's AskUserQuestion),
+the bot has it as data: a hook records the question the moment it is asked.
+The status JSON then carries `ask` (id and position, no text), and
+`ask <chat_id>:<thread_id>` answers one article, `ask.v1.json`:
+
+```json
+{"v": 1, "ask": {
+  "id": "toolu_01ExampleQuestionId0000", "kind": "widget", "step": 1,
+  "questions": [
+    {"question": "Which color?", "header": "Color", "multi": false,
+     "options": [{"label": "Red", "description": "warm"}, {"label": "Green"}]},
+    {"question": "Which pets?", "header": "Pets", "multi": true,
+     "options": [{"label": "Cat"}, {"label": "Dog"}, {"label": "Fish"}]}
+  ]}}
+```
+
+- `ask` is `null` when nothing waits. It is there only while the question is
+  on the agent's screen: answered, cancelled (Esc) or gone, it disappears
+  within the bot's 1 s poll. A client shows its answer sheet while `ask` is
+  present and hides it when `ask` goes or its `id` changes.
+- `multi`: several options may be chosen. Every question also takes the
+  person's own text instead of (or, with `multi`, besides) the options.
+- `step`: which question the agent's screen shows now (from 1), 0 for the
+  review screen. The person may answer part of it in the terminal or with the
+  bot's buttons; `/answer` copes with any step.
+- Same topic check as `status`. Over Telegram's size cap, option descriptions
+  go first, then long question texts are cut.
+- Only Claude agents launched by the bot (and containers whose hook writes the
+  record, [docker-agents.md](docker-agents.md)) have it; an agent started
+  before the bot learned this has it from its next start.
+
+**Answering** is an ordinary message in the topic:
+
+```
+/answer <id> 1:2 2:1,3,"own text"
+```
+
+Question numbers and option numbers count from 1; a question takes option
+numbers and at most one quoted text, comma-separated (quotes: `"…"`, `“…”`,
+`«…»`; `\"` inside straight quotes). A one-question ask may drop the
+question number: `/answer <id> 2`. Every question must be answered; a
+single-choice question takes one option or one text. The bot walks the
+agent's screen, checks the review against the answer and submits it, then
+the agent carries on. Nothing is pressed when `id` is not the pending
+question. On a refusal the bot answers in the topic (one line, the bot's
+language): a malformed answer, a question no longer pending, a screen that
+didn't react as expected (the walk stops there). A successful `/answer`
+gets no reply: `ask` goes away and the agent's reply follows.
+
+In Telegram without a custom client the same question comes as the photo of
+the agent's screen with one button per option (single choice: tap to answer;
+several: tick, then «Next»; «Submit answers» on the review), and a plain
+message in the topic is the own-text answer to the question on screen.
 
 ## Planned (same version, new sections)
 

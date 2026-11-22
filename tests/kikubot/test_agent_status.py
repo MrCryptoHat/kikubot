@@ -288,7 +288,7 @@ def test_a_failing_provider_does_not_sink_the_card(env, monkeypatch):
     assert st.items == [] and st.name == "proj"
 
 
-def test_write_statusline_settings(tmp_path, monkeypatch):
+def test_write_agent_settings(tmp_path, monkeypatch):
     from kikubot import hook
 
     user = tmp_path / "settings.json"
@@ -300,12 +300,31 @@ def test_write_statusline_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "config_dir", tmp_path)
     monkeypatch.setattr(config, "agent_status_dir", tmp_path / "agent_status")
 
-    path = agent_status.write_statusline_settings()
+    path = agent_status.write_agent_settings(statusline=True)
     assert path is not None
-    sl = json.loads(path.read_text())["statusLine"]
+    settings = json.loads(path.read_text())
+    sl = settings["statusLine"]
     assert sl["padding"] == 2
     assert sl["command"].startswith("/venv/bin/kikubot statusline ")
     assert sl["command"].endswith(f" {config.tmux_session_name}")
+    for event in ("PreToolUse", "PostToolUse"):
+        (group,) = settings["hooks"][event]
+        assert group["matcher"] == "AskUserQuestion"
+        assert group["hooks"][0]["command"] == "/venv/bin/kikubot hook"
+
+
+def test_agent_settings_without_statusline(tmp_path, monkeypatch):
+    from kikubot import hook
+
+    monkeypatch.setattr(hook, "_find_kikubot_path", lambda: "/venv/bin/kikubot")
+    monkeypatch.setattr(config, "config_dir", tmp_path)
+    path = agent_status.write_agent_settings(statusline=False)
+    assert path is not None
+    settings = json.loads(path.read_text())
+    assert "statusLine" not in settings and set(settings["hooks"]) == {
+        "PreToolUse",
+        "PostToolUse",
+    }
 
 
 def test_per_model_weekly_limit(env):
@@ -738,3 +757,62 @@ def test_delete_is_offered_only_for_an_extra_agent(env):
 def test_docker_topic_offers_no_worktree(env):
     st = agent_status.build_status("docker:assistant", now=NOW)
     assert "worktree" not in {c["id"] for c in st.commands}
+
+
+_ASK_SID = "11111111-2222-3333-4444-555555555555"
+_ASK_FIXTURES = Path(__file__).parent.parent / "fixtures" / "ask"
+
+
+def _ask_record(description: str = "warm") -> dict:
+    return {
+        "id": "toolu_01ExampleQuestionId0000",
+        "questions": [
+            {
+                "question": "Which color?",
+                "header": "Color",
+                "options": [
+                    {"label": label, "description": description}
+                    for label in ("Red", "Green", "Blue")
+                ],
+            },
+            {
+                "question": "Which pets?",
+                "header": "Pets",
+                "options": [{"label": "Cat"}, {"label": "Dog"}, {"label": "Fish"}],
+                "multiSelect": True,
+            },
+        ],
+    }
+
+
+@pytest.fixture
+def asking(env, monkeypatch):
+    env.sm.window_states["@5"] = SimpleNamespace(session_id=_ASK_SID)
+    monkeypatch.setattr(config, "config_dir", env.dir)
+    (env.dir / "asks").mkdir()
+
+    def put(record: dict, pane: str) -> None:
+        (env.dir / "asks" / f"{_ASK_SID}.json").write_text(json.dumps(record))
+        agent_status.note_pane("@5", (_ASK_FIXTURES / f"{pane}.txt").read_text())
+
+    return put
+
+
+def test_status_says_a_question_waits_but_not_what(asking):
+    asking(_ask_record(), "q1")
+    data = json.loads(agent_status.build_status("@5", now=NOW).to_json())
+    assert data["state"] == "waiting"
+    # No message text in the status: the question comes from inline `ask`.
+    assert data["ask"] == {
+        "id": "toolu_01ExampleQuestionId0000",
+        "kind": "widget",
+        "step": 1,
+        "count": 2,
+    }
+    assert agent_status.pending_ask("@5") is not None
+
+
+def test_no_question_once_it_left_the_screen(asking):
+    asking(_ask_record(), "after_esc")
+    assert "ask" not in json.loads(agent_status.build_status("@5", now=NOW).to_json())
+    assert agent_status.pending_ask("@5") is None

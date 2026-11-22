@@ -209,6 +209,14 @@ class _KeyWriter:
 
 
 @dataclass
+class KeyDriver:
+    """A pane held for one ``drive_keys`` script: read it, press keys in it."""
+
+    capture: Callable[[], Awaitable[str | None]]  # plain text, None if unreadable
+    press: Callable[[list[KeyToken]], Awaitable[tuple[int, str | None]]]
+
+
+@dataclass
 class SessionManager:
     """Manages session state for Claude Code.
 
@@ -2784,6 +2792,47 @@ class SessionManager:
             return 0, "busy"
         try:
             return await self._send_key_tokens_locked(binding_value, tokens)
+        finally:
+            lock.release()
+
+    async def drive_keys(
+        self,
+        binding_value: str,
+        script: Callable[[KeyDriver], Awaitable[_T]],
+        *,
+        lock_wait: float = 2.0,
+    ) -> _T:
+        """Run a read-then-press ``script`` with the pane to itself.
+
+        For a sequence that must look at the screen between keys (answering
+        an AskUserQuestion: check which question is up, press, check it
+        moved on). The send lock is held for the whole script, so no message
+        or other key lands in between; every ``press`` goes through the same
+        guards as ``send_key_tokens``. Raises ``KeysError("busy")`` when the
+        lock stays held past ``lock_wait``, ``KeysError("not-running")`` when
+        there is no pane.
+        """
+        from .terminal_keys import KeysError
+        from .terminal_parser import strip_escapes
+
+        lock = self.send_lock(binding_value)
+        try:
+            await asyncio.wait_for(lock.acquire(), lock_wait)
+        except TimeoutError as e:
+            raise KeysError("busy") from e
+        try:
+            writer = await self._key_writer(binding_value)
+            if writer is None:
+                raise KeysError("not-running")
+
+            async def capture() -> str | None:
+                pane = await writer.capture()
+                return strip_escapes(pane) if pane is not None else None
+
+            async def press(tokens: list[KeyToken]) -> tuple[int, str | None]:
+                return await self._send_key_tokens_locked(binding_value, tokens)
+
+            return await script(KeyDriver(capture, press))
         finally:
             lock.release()
 

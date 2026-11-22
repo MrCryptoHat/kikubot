@@ -48,6 +48,19 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   ([docker-agents.md](docs/docker-agents.md)). Apps get it as the session action `role` (it takes text: `input`) and its
   current text from the inline query `role <chat_id>:<thread_id>`
   ([format](docs/agent-status-format.md#role)).
+- **The agent's questions as buttons.** When a Claude agent asks a question
+  with options (AskUserQuestion), its photo in the topic gets one button per
+  option: tap to answer, tick several and «Next», «Submit answers» on the
+  review; a plain message is your own answer to the question on screen (now
+  for multi-choice questions too). The bot gets the question as data from a
+  hook in the settings it launches its agents with, so this needs the agent
+  started (or restarted) by this version; a container needs its own hook
+  ([docker-agents.md](docs/docker-agents.md)). Apps see `ask` in the status,
+  fetch the question with the inline query `ask <chat_id>:<thread_id>` and
+  answer every question at once with `/answer <id> 1:2 2:1,3`
+  ([format](docs/agent-status-format.md#ask)). Each key is checked against
+  the agent's screen before and after it is pressed; an answer for another
+  question presses nothing.
 
 ### Changed
 
