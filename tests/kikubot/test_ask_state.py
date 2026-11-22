@@ -196,3 +196,41 @@ class TestAskJson:
             "step": 0,
             "count": 2,
         }
+
+
+def _finishes(fn, timeout: float = 3.0):
+    """Run ``fn`` in a daemon thread; (finished, result). A hang can't stall pytest."""
+    import threading
+
+    out: list = []
+    t = threading.Thread(target=lambda: out.append(fn()), daemon=True)
+    t.start()
+    t.join(timeout)
+    return (not t.is_alive()), (out[0] if out else None)
+
+
+class TestPlantedFiles:
+    """A container writes the asks/ directory: nothing there may hang the bot."""
+
+    def test_a_fifo_is_no_record_and_no_hang(self, tmp_path):
+        import os
+
+        fifo = tmp_path / "asks.json"
+        os.mkfifo(fifo)
+        finished, result = _finishes(lambda: load_record(fifo))
+        assert finished and result is None
+
+    def test_a_symlink_is_no_record(self, tmp_path):
+        real = tmp_path / "real.json"
+        real.write_text(json.dumps(RECORD))
+        link = tmp_path / "link.json"
+        link.symlink_to(real)
+        assert load_record(real) is not None
+        assert load_record(link) is None
+
+    def test_a_symlinked_asks_dir_is_no_record(self, tmp_path):
+        (tmp_path / "elsewhere").mkdir()
+        (tmp_path / "elsewhere" / f"{SID}.json").write_text(json.dumps(RECORD))
+        (tmp_path / "asks").symlink_to(tmp_path / "elsewhere")
+        path = ask_state.record_path(tmp_path, SID)
+        assert path is not None and load_record(path) is None

@@ -12,10 +12,12 @@ Provides:
 
 import asyncio
 import concurrent.futures
+import errno
 import json
 import logging
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -80,6 +82,39 @@ def tmux_literal_args(text: str) -> list[str]:
     """
     base = text.rstrip(";")
     return ([base] if base else []) + ["\\;"] * (len(text) - len(base))
+
+
+def open_regular(path: str | os.PathLike, flags: int, *, follow: bool = True) -> int:
+    """``os.open`` for a file someone else may have put there: a regular file only.
+
+    A container writes into the directories the bot reads from (its session
+    map, its transcripts, its question records). A FIFO there would block a
+    plain ``open`` for good: on the event loop that froze every topic, in an
+    executor thread it held that thread, one more per poll. ``O_NONBLOCK``
+    makes the open return at once (it changes nothing for a regular file);
+    anything that isn't a regular file — FIFO, device, directory — is then
+    refused with ``OSError``. ``follow=False`` also refuses a symlink as the
+    last path component (``ELOOP``). Use as ``open(…, opener=…)``, see
+    ``regular_opener`` / ``regular_nofollow_opener``.
+    """
+    fd = os.open(path, flags | os.O_NONBLOCK | (0 if follow else os.O_NOFOLLOW))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def regular_opener(path: str | os.PathLike, flags: int) -> int:
+    """``opener=`` for ``open``/``aiofiles.open``: regular files only, never a hang."""
+    return open_regular(path, flags)
+
+
+def regular_nofollow_opener(path: str | os.PathLike, flags: int) -> int:
+    """``regular_opener`` that also refuses a symlink as the file itself."""
+    return open_regular(path, flags, follow=False)
 
 
 def atomic_write_json(

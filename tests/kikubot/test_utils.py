@@ -113,3 +113,59 @@ class TestReadCwdFromJsonl:
 
     def test_missing_file_returns_empty(self, tmp_path: Path):
         assert read_cwd_from_jsonl(tmp_path / "nonexistent.jsonl") == ""
+
+
+class TestRegularOpener:
+    def test_reads_a_regular_file(self, tmp_path):
+        from kikubot.utils import regular_nofollow_opener
+
+        f = tmp_path / "a.json"
+        f.write_text("{}")
+        with open(f, opener=regular_nofollow_opener) as fh:
+            assert fh.read() == "{}"
+
+    def test_refuses_a_fifo_at_once(self, tmp_path):
+        import os
+        import threading
+
+        from kikubot.utils import regular_opener
+
+        fifo = tmp_path / "map.json"
+        os.mkfifo(fifo)
+        errors: list[Exception] = []
+
+        def attempt() -> None:
+            try:
+                open(fifo, opener=regular_opener)
+            except OSError as e:
+                errors.append(e)
+
+        t = threading.Thread(target=attempt, daemon=True)
+        t.start()
+        t.join(3)
+        assert not t.is_alive() and errors
+
+    async def test_aiofiles_takes_it(self, tmp_path):
+        import os
+
+        import aiofiles
+
+        from kikubot.utils import regular_opener
+
+        fifo = tmp_path / "map.json"
+        os.mkfifo(fifo)
+        with pytest.raises(OSError):
+            async with aiofiles.open(fifo, "r", opener=regular_opener) as f:
+                await f.read()
+
+    def test_nofollow_refuses_a_symlink(self, tmp_path):
+        from kikubot.utils import regular_nofollow_opener, regular_opener
+
+        real = tmp_path / "real"
+        real.write_text("x")
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        with open(link, opener=regular_opener) as fh:
+            assert fh.read() == "x"
+        with pytest.raises(OSError):
+            open(link, opener=regular_nofollow_opener)

@@ -25,6 +25,7 @@ from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .runtimes import monitored_runtimes
 from .transcript_parser import TranscriptParser
+from .utils import regular_opener
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,9 @@ class SessionMonitor:
 
             if index_file.exists():
                 try:
-                    async with aiofiles.open(index_file, "r") as f:
+                    async with aiofiles.open(
+                        index_file, "r", opener=regular_opener
+                    ) as f:
                         content = await f.read()
                     index_data = json.loads(content)
                     entries = index_data.get("entries", [])
@@ -253,7 +256,11 @@ class SessionMonitor:
         """
         new_entries = []
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            # A container writes its transcripts: regular files only, or a
+            # FIFO would hold an executor thread per poll.
+            async with aiofiles.open(
+                file_path, "r", encoding="utf-8", opener=regular_opener
+            ) as f:
                 # Get file size to detect truncation
                 await f.seek(0, 2)  # Seek to end
                 file_size = await f.tell()
@@ -544,7 +551,7 @@ class SessionMonitor:
         """
         try:
             size = file_path.stat().st_size
-            async with aiofiles.open(file_path, "rb") as fh:
+            async with aiofiles.open(file_path, "rb", opener=regular_opener) as fh:
                 await fh.seek(max(0, size - STATUS_TAIL_BYTES))
                 data = await fh.read()
             lines = data.split(b"\n")

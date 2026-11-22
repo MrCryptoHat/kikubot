@@ -21,6 +21,7 @@ worktree-agents.md.
 - **`codex_transcript_parser` / `grok_transcript_parser` must emit the SAME `ParsedEntry` as `transcript_parser`** — everything downstream (queue, rendering, voice, diff) is runtime-agnostic because of that. A parser that invents a field forks the pipeline.
 - **`docker_driver` mirrors `tmux_manager`'s chunking and pacing** (200-char chunks, 0.5–1.5 s post-text delay, 1 s gap after `!`). The numbers are tuned against the TUI's input handling, not arbitrary — changing one transport without the other makes docker agents drop characters. The in-container tmux session name is hard-coded `claude`.
 - **`session_monitor` holds no per-runtime branch** — it iterates `runtimes.monitored_runtimes()` and calls the interface. A new CLI is one `AgentRuntime` subclass, never an `if` here.
+- **A file a container can write is opened with `opener=utils.regular_opener`** (session map, transcripts, `asks/` records; `regular_nofollow_opener` where a symlink has no business) — a FIFO planted there blocks a plain `open` for good: on the event loop every topic froze, in an executor thread one more hangs per poll. Cap what you read from it too.
 - **Busy/queue checks go through `session_manager.is_agent_working` / `agent_has_queued_input`**, never `terminal_parser.is_claude_working` directly — the wrappers dispatch on `WindowState.runtime`, and codex/grok have no `─` chrome to anchor on.
 
 ## Agent panel — decisions that look arbitrary

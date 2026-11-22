@@ -163,9 +163,18 @@ def record_path(directory: Path, session_id: str) -> Path | None:
 
 
 def load_record(path: Path) -> Ask | None:
-    """Read and check one record; None when absent, oversized or malformed."""
+    """Read and check one record; None when absent, oversized or malformed.
+
+    A container writes this directory, so only a regular file is read — no
+    FIFO (a plain open would block the event loop, and every topic with it),
+    no device, no symlink, neither for the file nor for ``asks/`` itself.
+    """
+    from .utils import regular_nofollow_opener
+
+    if path.parent.is_symlink():
+        return None
     try:
-        with path.open("rb") as fh:
+        with open(path, "rb", opener=regular_nofollow_opener) as fh:
             raw = fh.read(MAX_RECORD_BYTES + 1)
     except OSError:
         return None

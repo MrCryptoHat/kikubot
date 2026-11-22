@@ -52,6 +52,7 @@ from .utils import (
     TOPIC_ENV,
     atomic_write_json,
     is_valid_session_id,
+    regular_opener,
     same_dir,
     schedule_async_json_write,
 )
@@ -194,6 +195,8 @@ def _is_machine_user_text(text: str) -> bool:
 
 # Settle after a key that can end the CLI, before the next pane write.
 FINAL_SETTLE_SEC = 1.0
+# A container's session map read is capped: it writes that file.
+MAX_SESSION_MAP_CHARS = 4 * 1024 * 1024
 _TEXT_ENTER_GAP = 0.06
 CLEAR_PASSES = 3
 _CLEAR_REDRAW_SEC = 0.12
@@ -1546,8 +1549,10 @@ class SessionManager:
         while asyncio.get_event_loop().time() < deadline:
             try:
                 if map_path.exists():
-                    async with aiofiles.open(map_path, "r") as f:
-                        content = await f.read()
+                    # A container writes its map: regular files only (a FIFO
+                    # would hold an executor thread per poll), and capped.
+                    async with aiofiles.open(map_path, "r", opener=regular_opener) as f:
+                        content = await f.read(MAX_SESSION_MAP_CHARS)
                     session_map = json.loads(content)
                     info = session_map.get(key, {})
                     if info.get("session_id"):
@@ -1710,8 +1715,10 @@ class SessionManager:
             if not path.exists():
                 continue
             try:
-                async with aiofiles.open(path, "r") as f:
-                    content = await f.read()
+                # Written inside the container: regular files only (a FIFO
+                # would hold an executor thread per poll), and capped.
+                async with aiofiles.open(path, "r", opener=regular_opener) as f:
+                    content = await f.read(MAX_SESSION_MAP_CHARS)
                 agent_map = json.loads(content)
                 any_source_readable = True
             except (json.JSONDecodeError, OSError):
@@ -2152,7 +2159,9 @@ class SessionManager:
         last_human_msg = ""
         message_count = 0
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(
+                file_path, "r", encoding="utf-8", opener=regular_opener
+            ) as f:
                 async for line in f:
                     line = line.strip()
                     if not line:
@@ -3361,7 +3370,9 @@ class SessionManager:
         # Read JSONL entries (optionally filtered by byte range)
         entries: list[dict] = []
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(
+                file_path, "r", encoding="utf-8", opener=regular_opener
+            ) as f:
                 if start_byte > 0:
                     await f.seek(start_byte)
 
