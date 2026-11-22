@@ -92,34 +92,46 @@ class TestParse:
         assert parse(text) is None
 
 
+def _rows(poll) -> list[list[str]]:
+    return [[b.text for b in row] for row in keyboard(poll).inline_keyboard]
+
+
 class TestKeyboard:
-    def test_rows_and_advice(self):
+    def test_a_short_row_per_question(self):
         poll = parse(POLL)
         assert poll is not None
-        labels = [row[0].text for row in keyboard(poll).inline_keyboard]
-        assert labels[:5] == [
-            "⭐ 1А · TestFlight",
-            "1Б · Только локально",
-            "⭐ 2А · Вход",
-            "2Б · Оплату",
-            "2В · push-уведомления",
+        assert _rows(poll) == [
+            ["⭐1А", "1Б"],
+            ["⭐2А", "2Б", "2В"],
+            ["залей"],
+            ["👍 As advised", "📨 Send"],
         ]
-        assert labels[-2:] == ["залей", "📨 Send"]
 
     def test_ticks_compose_the_answer(self):
         poll = parse(POLL)
         assert poll is not None
-        poll.picked = {0: ["А"], 1: ["В", "А"]}
-        assert poll.answer() == "1А, 2АВ"
-        labels = [row[0].text for row in keyboard(poll).inline_keyboard]
-        assert labels[0] == "✅ 1А · TestFlight"
-        assert labels[-1] == "📨 Send: 1А, 2АВ"
+        poll.picked = {0: ["Б"], 1: ["В", "А"]}
+        assert poll.answer() == "1Б, 2АВ"
+        assert _rows(poll)[:2] == [["⭐1А", "✅1Б"], ["✅2А", "2Б", "✅2В"]]
+        assert _rows(poll)[-1] == ["👍 As advised", "📨 Send: 1Б, 2АВ"]
 
-    def test_lone_question_has_no_send(self):
+    def test_as_advised_is_every_first_option(self):
+        poll = parse(POLL)
+        assert poll is not None and poll.advised_answer() == "1А, 2А"
+        unadvised = parse("1. Which?\n- A. One\n- B. Two\n2. And?\n- A. X\n- B. Y")
+        assert unadvised is not None and unadvised.advised_answer() == ""
+        assert _rows(unadvised)[-1] == ["📨 Send"]
+
+    def test_lone_question_is_its_letters(self):
         poll = parse("1. Deploy now?\n- A. Yes\n- B. Later")
         assert poll is not None and poll.one_tap
-        labels = [row[0].text for row in keyboard(poll).inline_keyboard]
-        assert labels == ["A · Yes", "B · Later"]
+        assert _rows(poll) == [["A", "B"]]
+
+    def test_many_options_wrap(self):
+        opts = "\n".join(f"- {c}. option {c}" for c in "ABCDEFG")
+        poll = parse(f"1. Which?\n{opts}\n2. And?\n- A. X\n- B. Y")
+        assert poll is not None
+        assert [len(r) for r in _rows(poll)[:3]] == [5, 2, 2]
 
     def test_callback_data_fits(self):
         poll = parse(POLL)
@@ -194,6 +206,11 @@ class TestTaps:
         assert poll_buttons.open_poll(1, 42) is None
         final = live.bot.edit_message_reply_markup.await_args.kwargs["reply_markup"]
         assert final.inline_keyboard[0][0].text == "✓ 1Б, 2АВ"
+
+    async def test_as_advised_in_one_tap(self, live):
+        await poll_buttons.attach(live.bot, 1, 42, -1, 100, parse(POLL))
+        await poll_buttons.handle_tap(_tap("pl:a"), live.bot, 1, 42)
+        assert live.sent == ["1А, 2А"]
 
     async def test_lone_question_answers_on_one_tap(self, live):
         await poll_buttons.attach(

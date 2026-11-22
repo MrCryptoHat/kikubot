@@ -17,8 +17,9 @@ Letters may be Latin or Cyrillic (А, Б, В…); the multi-choice mark is
 for is written ``Say «word»`` (or ``Скажи «слово»``).
 
 The bot leaves the text as it is (another client may read it too) and hangs
-buttons under the reply: a lone single-choice question answers on one tap;
-otherwise taps tick options and «Send» delivers the composed line. A question
+short buttons under the reply, a row per question («⭐1A» «1B»): a lone
+single-choice question answers on one tap; otherwise «As advised» sends the
+agent's advice whole, or taps tick options and «Send» delivers the line. A question
 without options is answered by a message. The reply reaches the agent through
 ``delivery.deliver_user_text`` like a typed one.
 
@@ -37,7 +38,7 @@ from dataclasses import dataclass, field
 from telegram import Bot, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..i18n import tr
-from .callback_data import CB_POLL_SEND, CB_POLL_TICK, CB_POLL_WORD
+from .callback_data import CB_POLL_ADVISED, CB_POLL_SEND, CB_POLL_TICK, CB_POLL_WORD
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,14 @@ class Poll:
             len(self.questions) == 1
             and not self.questions[0].multi
             and bool(self.questions[0].options)
+        )
+
+    def advised_answer(self) -> str:
+        """The line «As advised» sends: the advised option of each question."""
+        if not self.advised:
+            return ""
+        return ", ".join(
+            f"{q.number}{q.options[0][0]}" for q in self.questions if q.options
         )
 
     def answer(self) -> str:
@@ -248,27 +257,37 @@ def _label(text: str) -> str:
     return text if len(text) <= _LABEL_CHARS else text[: _LABEL_CHARS - 1] + "…"
 
 
+_PER_ROW = 5
+
+
 def keyboard(poll: Poll) -> InlineKeyboardMarkup:
-    """One row per option (ticked ones marked), the go-ahead words, «Send»."""
+    """Short buttons, a row per question: «⭐1A» «1B» «1C», then the actions.
+
+    The options' text is in the message right above, so a button carries only
+    its number and letter: «⭐» marks the advice, «✅» a tick. Below: the
+    go-ahead words, then «As advised» (every advised option in one tap) and
+    «Send» with the line it would send. A lone single-choice question needs
+    neither: its letter is the answer.
+    """
     rows: list[list[InlineKeyboardButton]] = []
     lone = len(poll.questions) == 1
     for qi, q in enumerate(poll.questions):
         picked = poll.picked.get(qi, [])
-        for oi, (letter, text) in enumerate(q.options):
+        row: list[InlineKeyboardButton] = []
+        for oi, (letter, _) in enumerate(q.options):
             head = letter if lone else f"{q.number}{letter}"
-            mark = (
-                "✅ "
-                if letter in picked
-                else ("⭐ " if poll.advised and oi == 0 else "")
+            if letter in picked:
+                head = f"✅{head}"
+            elif poll.advised and oi == 0:
+                head = f"⭐{head}"
+            row.append(
+                InlineKeyboardButton(head, callback_data=f"{CB_POLL_TICK}{qi}:{oi}")
             )
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        _label(f"{mark}{head} · {text}"),
-                        callback_data=f"{CB_POLL_TICK}{qi}:{oi}",
-                    )
-                ]
-            )
+            if len(row) == _PER_ROW:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
     if poll.words:
         rows.append(
             [
@@ -276,20 +295,23 @@ def keyboard(poll: Poll) -> InlineKeyboardMarkup:
                 for i, w in enumerate(poll.words)
             ]
         )
+    actions: list[InlineKeyboardButton] = []
+    if poll.advised and poll.advised_answer() and not poll.one_tap:
+        actions.append(
+            InlineKeyboardButton(tr("poll.advised"), callback_data=CB_POLL_ADVISED)
+        )
     if poll.questions and not poll.one_tap:
         answer = poll.answer()
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    _label(
-                        tr("poll.send", answer=answer)
-                        if answer
-                        else tr("poll.send_empty")
-                    ),
-                    callback_data=CB_POLL_SEND,
-                )
-            ]
+        actions.append(
+            InlineKeyboardButton(
+                _label(
+                    tr("poll.send", answer=answer) if answer else tr("poll.send_empty")
+                ),
+                callback_data=CB_POLL_SEND,
+            )
         )
+    if actions:
+        rows.append(actions)
     return InlineKeyboardMarkup(rows)
 
 
@@ -465,6 +487,12 @@ async def handle_tap(
             await query.answer()
             return
         await _send(query, bot, user_id, thread_id, held, poll.words[int(idx)])
+        return
+    if data == CB_POLL_ADVISED:
+        if poll.advised_answer():
+            await _send(query, bot, user_id, thread_id, held, poll.advised_answer())
+        else:
+            await query.answer()
         return
     if data == CB_POLL_SEND:
         answer = poll.answer()

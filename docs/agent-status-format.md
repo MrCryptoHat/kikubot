@@ -451,9 +451,12 @@ gives), and `ask` gives the parsed poll while it is open:
   again, or a newer poll replaces it; then `ask` goes. The bot forgets open
   polls when it restarts.
 - A widget question wins: while one is on screen, `ask` gives that.
-- In Telegram without a custom client the buttons do the same: a lone
-  single-choice question answers on one tap; otherwise taps tick options and
-  «Send» delivers the line. They carry `pl:t:<q>:<o>`, `pl:w:<i>`, `pl:s`.
+- In Telegram without a custom client the buttons do the same, short and a
+  row per question («⭐1A» «1B»; ⭐ = advice, ✅ = ticked): a lone
+  single-choice question answers on one tap; otherwise «As advised» sends
+  every advised option at once, or taps tick options and «Send» delivers the
+  line. They carry `pl:t:<q>:<o>`, `pl:w:<i>`, `pl:a`, `pl:s`; a client
+  that draws the poll itself should hide them.
 
 ## Planned (same version, new sections)
 

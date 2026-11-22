@@ -63,8 +63,9 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   question presses nothing.
 - **Buttons for a poll the agent writes.** A reply that asks in the shape
   «1. Question?» / «- A. option» (several questions, «(several)» for
-  multi-choice, Say «word» for a go-ahead) gets buttons under it: one tap for
-  a lone question, otherwise tick and «Send», which replies «1A, 2BC». The
+  multi-choice, Say «word» for a go-ahead) gets short buttons under it, a row
+  per question («⭐1A» «1B»): one tap for a lone question, «As advised» for
+  the agent's advice whole, or tick and «Send», which replies «1A, 2BC». The
   text stays as written; apps get the parsed poll from the inline `ask`
   query as kind `text`. Off with `KIKUBOT_POLL_BUTTONS=false`.
 

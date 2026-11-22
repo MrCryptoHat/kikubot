@@ -52,6 +52,7 @@ CB_ASK_SUBMIT = "ak:s:"  # ak:s:<tok>
 CB_POLL_TICK = "pl:t:"  # pl:t:<question>:<option>
 CB_POLL_WORD = "pl:w:"  # pl:w:<word index>
 CB_POLL_SEND = "pl:s"
+CB_POLL_ADVISED = "pl:a"
 
 # Session picker — runtime-tabbed. Top row = runtime tabs (Claude / Codex / …);
 # the active runtime's resumable sessions list below, with a "new session"

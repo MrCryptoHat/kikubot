@@ -207,6 +207,7 @@ STRINGS: dict[str, str] = {
     "ask.err.unavailable": "Couldn't reach the agent's screen. Try again, or use the buttons under the photo.",
     "poll.send": "📨 Send: {answer}",
     "poll.send_empty": "📨 Send",
+    "poll.advised": "👍 As advised",
     "poll.nothing": "Tick an answer first. A question without options takes a message.",
     "poll.pick": "Your answer:",
     "poll.stale": "That poll is past: the conversation moved on. Write to the agent instead.",

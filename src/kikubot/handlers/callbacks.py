@@ -53,6 +53,7 @@ from .callback_data import (
     CB_ASK_SUBMIT,
     CB_ASK_TAB,
     CB_ASK_UP,
+    CB_POLL_ADVISED,
     CB_POLL_SEND,
     CB_POLL_TICK,
     CB_POLL_WORD,
@@ -2167,6 +2168,7 @@ _PREFIX_DISPATCH: list[tuple[str, Any]] = [
     (CB_POLL_TICK, _handle_poll_button),
     (CB_POLL_WORD, _handle_poll_button),
     (CB_POLL_SEND, _handle_poll_button),
+    (CB_POLL_ADVISED, _handle_poll_button),
     # Screenshot quick keys
     (CB_KEYS_PREFIX, _handle_screenshot_keys),
     # Agent panel. Slash-command buttons share _handle_cmd_slash (it
