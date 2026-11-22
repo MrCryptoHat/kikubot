@@ -205,6 +205,12 @@ STRINGS: dict[str, str] = {
     "ask.err.busy": "The agent's screen is busy with another message right now. Try again in a moment.",
     "ask.err.not-running": "The agent isn't running, so there's nothing to answer.",
     "ask.err.unavailable": "Couldn't reach the agent's screen. Try again, or use the buttons under the photo.",
+    "poll.send": "📨 Send: {answer}",
+    "poll.send_empty": "📨 Send",
+    "poll.nothing": "Tick an answer first. A question without options takes a message.",
+    "poll.pick": "Your answer:",
+    "poll.stale": "That poll is past: the conversation moved on. Write to the agent instead.",
+    "poll.not_sent": "Couldn't pass that to the agent right now. Write it as a message.",
 }
 
 

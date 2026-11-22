@@ -18,7 +18,14 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
-from . import album, effective_user, get_thread_id, is_user_allowed, not_authorized_text
+from . import (
+    album,
+    effective_user,
+    get_thread_id,
+    is_user_allowed,
+    not_authorized_text,
+    poll_buttons,
+)
 from .delivery import deliver_user_text, report_delivery_failure
 from .siblings import cancel_pending_naming
 from .message_sender import safe_reply, send_photo
@@ -555,6 +562,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ack_message_id=update.message.message_id if update.message else None,
     )
     if status in ("routed", "sent"):
+        await poll_buttons.close(context.bot, user.id, thread_id)
         transcript_msg = await safe_reply(update.message, f'🎤 "{text}"')
         if status == "sent" and pin_candidate:
             await pin_task_message(

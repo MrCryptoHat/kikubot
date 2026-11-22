@@ -552,3 +552,22 @@ async def test_ask_of_a_foreign_topic_is_empty(env, monkeypatch):
     update, query = _update(monkeypatch, OWNER, "ask -100999:42")
     await inline_status.inline_status_handler(update, _ctx())
     assert query.answer.call_args.args[0] == []
+
+
+async def test_ask_gives_an_open_text_poll(env, monkeypatch):
+    from kikubot.handlers.poll_buttons import parse
+
+    poll = parse("1. Which?\n- A. One\n- B. Two")
+    monkeypatch.setattr(inline_status, "pending_ask", lambda binding: None)
+    monkeypatch.setattr(
+        inline_status,
+        "open_poll",
+        lambda user, thread: (100, poll) if thread == 42 else None,
+    )
+    update, query = _update(monkeypatch, OWNER, f"ask {CHAT}:42")
+    await inline_status.inline_status_handler(update, _ctx())
+    data = json.loads(
+        query.answer.call_args.args[0][0].input_message_content.message_text
+    )
+    assert data["ask"]["kind"] == "text" and data["ask"]["id"] == "m100"
+    assert data["ask"]["questions"][0]["options"][1] == {"letter": "B", "label": "Two"}

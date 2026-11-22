@@ -152,6 +152,13 @@ class TestCanMergeTasks:
         b = self._task(voice_mode=False)
         assert _can_merge_tasks(a, b) is False
 
+    def test_a_poll_keeps_its_own_message(self):
+        from kikubot.handlers.poll_buttons import parse
+
+        poll = parse("1. Which?\n- A. One\n- B. Two")
+        assert _can_merge_tasks(self._task(poll=poll), self._task()) is False
+        assert _can_merge_tasks(self._task(), self._task(poll=poll)) is False
+
     def test_refuses_to_merge_across_windows(self):
         a = self._task(window_id="@0")
         b = self._task(window_id="@1")

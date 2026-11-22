@@ -79,7 +79,7 @@ Rules:
 | `model_running` | present only when the model that answered last differs from `model` (e.g. after an automatic switch) |
 | `context` | `pct` of the window used, `used` tokens, `window` size |
 | `limits[]` | `id` (`5h`, `7d`, `7d_<model>`, or the CLI's own name), `label`, `pct_used`, `resets_at` (unix), `window_minutes` |
-| `ask` | present while the agent waits on a question it asked (Claude's AskUserQuestion): `id`, `kind` (`widget`), `step` (the question on screen, from 1; 0 = the review before submitting), `count` (questions). No text: fetch it with the [`ask` query](#ask) |
+| `ask` | present while the agent waits on a question: `id`, `kind`, `count` (questions); `kind` `widget` (Claude's AskUserQuestion) adds `step` (the question on screen, from 1; 0 = the review before submitting), `kind` `text` (a poll it wrote) adds `message_id`. No text: fetch it with the [`ask` query](#ask) |
 
 A limit whose window already reset is left out rather than shown stale.
 
@@ -404,6 +404,56 @@ In Telegram without a custom client the same question comes as the photo of
 the agent's screen with one button per option (single choice: tap to answer;
 several: tick, then «Next»; «Submit answers» on the review), and a plain
 message in the topic is the own-text answer to the question on screen.
+
+### Kind `text`: a poll the agent wrote
+
+An agent can also ask in its reply, in one fixed shape (an operator can make
+it a rule for their agents):
+
+```
+First in each item is my advice.
+1. Which color?
+- A. Red
+- B. Green
+2. Which pets? (several)
+- A. Cat
+- B. Dog
+3. Anything else?
+Say «go» when it's fine.
+```
+
+Letters may be Cyrillic (А, Б, В…); «(можно несколько)» marks multi-choice
+too, «Первым в каждом пункте — мой совет» the advice, and «Скажи», «Жду»,
+«Напиши», «Reply» introduce go-ahead words. The bot leaves the text as
+written, hangs buttons under the reply (the message whose id the pointer
+gives), and `ask` gives the parsed poll while it is open:
+
+```json
+{"v": 1, "ask": {
+  "id": "m4512", "kind": "text", "message_id": 4512, "count": 3,
+  "questions": [
+    {"number": 1, "question": "Which color?", "multi": false, "advised": 0,
+     "options": [{"letter": "A", "label": "Red"}, {"letter": "B", "label": "Green"}]},
+    {"number": 2, "question": "Which pets?", "multi": true, "advised": 0,
+     "options": [{"letter": "A", "label": "Cat"}, {"letter": "B", "label": "Dog"}]},
+    {"number": 3, "question": "Anything else?", "multi": false, "advised": null, "options": []}
+  ],
+  "replies": ["go"]}}
+```
+
+- `advised`: index of the option the agent advises (the first, when it said
+  so), else `null`. `replies`: the go-ahead words, each a complete reply.
+- **Answer it with an ordinary message** in the topic: one line,
+  `1A, 2AB, 3: own words` (questions in order, letters run together, a
+  question without options as `N: text`), or a go-ahead word alone. No
+  `/answer` here: the agent reads the reply as the person's own words.
+- It is open until the person writes anything in the topic, the agent writes
+  again, or a newer poll replaces it; then `ask` goes. The bot forgets open
+  polls when it restarts.
+- A widget question wins: while one is on screen, `ask` gives that.
+- In Telegram without a custom client the buttons do the same: a lone
+  single-choice question answers on one tap; otherwise taps tick options and
+  «Send» delivers the line. They carry `pl:t:<q>:<o>`, `pl:w:<i>`, `pl:s`.
 
 ## Planned (same version, new sections)
 

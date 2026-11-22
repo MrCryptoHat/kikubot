@@ -56,6 +56,7 @@ from .handlers.delivery import (
     report_delivery_failure,
 )
 from .handlers.callbacks import callback_handler
+from .handlers import poll_buttons
 from .handlers.ask_answer import answer_command
 from .handlers.ask_answer import error_text as ask_error_text
 from .handlers.inline_status import inline_status_handler
@@ -542,6 +543,9 @@ async def _forward_text_to_agent(
         ack_chat_id=update.message.chat.id,
         ack_message_id=update.message.message_id,
     )
+    if status in ("routed", "sent"):
+        # A poll the agent left open has its reply now.
+        await poll_buttons.close(context.bot, user_id, thread_id)
     if status == "routed":
         try:
             await update.message.chat.send_action(
@@ -1215,6 +1219,16 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 if not msg.text:
                     continue
 
+        # A poll the agent wrote (numbered questions, lettered options):
+        # buttons under the reply; the text itself stays as written.
+        poll = (
+            poll_buttons.parse(msg.text)
+            if config.poll_buttons_enabled
+            and msg.content_type == "text"
+            and msg.role == "assistant"
+            else None
+        )
+
         parts, table_texts, code_files = build_response_parts(
             msg.text,
             msg.is_complete,
@@ -1279,6 +1293,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 table_texts=table_texts,
                 code_files=code_files,
                 rich_markdown=rich_markdown,
+                poll=poll,
             )
 
             # Final assistant text → turn done. Typing heartbeat stops; the

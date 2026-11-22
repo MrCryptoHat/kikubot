@@ -193,6 +193,9 @@ class AgentStatus:
     commands: list[dict] = field(default_factory=list)
     # The question the agent waits on (ask_state.current_ask), while on screen.
     ask: tuple[Ask, WidgetView] | None = None
+    # Else a poll the agent wrote as text, still open: its pointer, set by
+    # the caller that knows the topic (handlers/poll_buttons.poll_pointer).
+    text_ask: dict | None = None
 
     def sections(self) -> list[dict]:
         """The server-driven sheet: ordered sections a client renders by type."""
@@ -328,6 +331,8 @@ class AgentStatus:
             out["limits"] = [_limit_json(lim) for lim in self.limits]
         if self.ask is not None:
             out["ask"] = ask_pointer(*self.ask)
+        elif self.text_ask is not None:
+            out["ask"] = self.text_ask
         sections = self.sections()
         while True:
             if sections:

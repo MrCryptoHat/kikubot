@@ -66,6 +66,8 @@ from .message_sender import (
     send_with_fallback,
     strip_sentinels,
 )
+from . import poll_buttons
+from .poll_buttons import Poll
 from .reaction_confirm import note_topic_message
 
 logger = logging.getLogger(__name__)
@@ -117,6 +119,9 @@ class MessageTask:
     # ``parts`` whose send hit RetryAfter/NetworkError — the requeued task
     # sends it instead of paying for the same text again. Never merged.
     voice_audio_cache: bytes | None = None
+    # A poll the agent wrote (poll_buttons.parse): its buttons go under the
+    # reply once it's delivered. Never merged.
+    poll: Poll | None = None
 
 
 # Per-topic message queues and worker tasks, keyed by (user_id, thread_id_or_0).
@@ -209,6 +214,9 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     # Rich-first tasks aren't merged — the merged task would drop
     # rich_markdown (or deliver one task's rich text and lose the other's).
     if base.rich_markdown or candidate.rich_markdown:
+        return False
+    # A poll's buttons go under ITS message: nothing joins it.
+    if base.poll is not None or candidate.poll is not None:
         return False
     # Tasks carrying out-of-band blocks (table/box-art images, code files)
     # aren't merged: the merged task would drop those lists (not copied in
@@ -936,10 +944,32 @@ async def _emit_links(
         note_topic_message(chat_id, sent.message_id, user_id, tid)
 
 
+async def _hang_poll(
+    bot: Bot, chat_id: int, user_id: int, task: MessageTask, message_id: int | None
+) -> None:
+    """Buttons for the poll the reply carries (poll_buttons), else nothing.
+
+    A text reply takes them under its last message; a voiced one (no text to
+    hang them on, ``message_id`` None) gets them on a message of their own.
+    """
+    poll, task.poll = task.poll, None
+    if poll is None or task.content_type != "text":
+        return
+    if message_id is None:
+        await poll_buttons.send_with_poll(bot, user_id, task.thread_id, chat_id, poll)
+    else:
+        await poll_buttons.attach(
+            bot, user_id, task.thread_id, chat_id, message_id, poll
+        )
+
+
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     """Process a content message task."""
     tid = task.thread_id or 0
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    if task.content_type == "text" and poll_buttons.is_open(user_id, task.thread_id):
+        # The agent wrote again: its earlier poll's moment has passed.
+        await poll_buttons.close(bot, user_id, task.thread_id)
 
     # Capture the link source before parts are stripped/cleared below — the
     # agent's links are re-surfaced as a separate tappable list after the reply
@@ -1111,6 +1141,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             task.parts = []
             await _send_task_images(bot, chat_id, task)
             await _emit_links(bot, chat_id, task, link_source, user_id, tid)
+            await _hang_poll(bot, chat_id, user_id, task, None)
             return
         # Empty after split (e.g. all-whitespace) — fall through defensively.
 
@@ -1157,6 +1188,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             task.rich_markdown = ""
             await _send_task_images(bot, chat_id, task)
             await _emit_links(bot, chat_id, task, link_source, user_id, tid)
+            await _hang_poll(bot, chat_id, user_id, task, rich_id)
             return
         task.rich_markdown = ""  # don't retry rich on a requeue
 
@@ -1207,6 +1239,9 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 5. Surface the reply's links as a separate tappable list (text only).
     await _emit_links(bot, chat_id, task, link_source, user_id, tid)
 
+    # 6. A poll the agent wrote: its buttons under the reply.
+    await _hang_poll(bot, chat_id, user_id, task, last_msg_id)
+
     # Status will be picked up by the 1s polling loop if Claude is still working
 
 
@@ -1223,6 +1258,7 @@ async def enqueue_content_message(
     table_texts: list[str] | None = None,
     code_files: list[tuple[str, str]] | None = None,
     rich_markdown: str = "",
+    poll: Poll | None = None,
 ) -> None:
     """Enqueue a content message task.
 
@@ -1273,6 +1309,7 @@ async def enqueue_content_message(
         table_texts=table_texts or [],
         code_files=code_files or [],
         rich_markdown=rich_markdown,
+        poll=poll,
     )
     queue.put_nowait(task)
 

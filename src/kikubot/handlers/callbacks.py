@@ -53,6 +53,9 @@ from .callback_data import (
     CB_ASK_SUBMIT,
     CB_ASK_TAB,
     CB_ASK_UP,
+    CB_POLL_SEND,
+    CB_POLL_TICK,
+    CB_POLL_WORD,
     CB_CMD_CANCEL,
     CB_CMD_CLEAR,
     CB_CMD_COMPACT,
@@ -126,7 +129,7 @@ from .directory_browser import (
     clear_window_picker_state,
     sessions_for_topic,
 )
-from . import ask_answer, pane_cache
+from . import ask_answer, pane_cache, poll_buttons
 from .codex_status_parser import (
     STATUS_MARKER as CODEX_STATUS_MARKER,
     format_status_message as format_codex_status,
@@ -1004,6 +1007,18 @@ async def _handle_ask_button(
     else:
         await query.answer(tr("ask.done"))
     await handle_interactive_ui(context.bot, user.id, binding, thread_id)
+
+
+async def _handle_poll_button(
+    query: CallbackQuery,
+    data: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: User,
+) -> None:
+    """A button under a poll the agent wrote (poll_buttons)."""
+    del data
+    await poll_buttons.handle_tap(query, context.bot, user.id, get_thread_id(update))
 
 
 async def _handle_interactive_refresh(
@@ -2149,6 +2164,9 @@ _PREFIX_DISPATCH: list[tuple[str, Any]] = [
     (CB_ASK_PICK, _handle_ask_button),
     (CB_ASK_NEXT, _handle_ask_button),
     (CB_ASK_SUBMIT, _handle_ask_button),
+    (CB_POLL_TICK, _handle_poll_button),
+    (CB_POLL_WORD, _handle_poll_button),
+    (CB_POLL_SEND, _handle_poll_button),
     # Screenshot quick keys
     (CB_KEYS_PREFIX, _handle_screenshot_keys),
     # Agent panel. Slash-command buttons share _handle_cmd_slash (it

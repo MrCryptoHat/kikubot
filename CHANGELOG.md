@@ -61,6 +61,12 @@ Notable changes to Kiku Bot (ccbot until 2026-11). Format loosely follows
   ([format](docs/agent-status-format.md#ask)). Each key is checked against
   the agent's screen before and after it is pressed; an answer for another
   question presses nothing.
+- **Buttons for a poll the agent writes.** A reply that asks in the shape
+  «1. Question?» / «- A. option» (several questions, «(several)» for
+  multi-choice, Say «word» for a go-ahead) gets buttons under it: one tap for
+  a lone question, otherwise tick and «Send», which replies «1A, 2BC». The
+  text stays as written; apps get the parsed poll from the inline `ask`
+  query as kind `text`. Off with `KIKUBOT_POLL_BUTTONS=false`.
 
 ### Changed
 

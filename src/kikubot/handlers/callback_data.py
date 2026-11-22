@@ -47,6 +47,11 @@ CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
 CB_ASK_PICK = "ak:p:"  # ak:p:<question>:<option>:<tok>
 CB_ASK_NEXT = "ak:n:"  # ak:n:<question>:<tok>
 CB_ASK_SUBMIT = "ak:s:"  # ak:s:<tok>
+# A poll the agent wrote as text (poll_buttons). The poll is the message the
+# buttons sit on, held in memory: no ids in the payload.
+CB_POLL_TICK = "pl:t:"  # pl:t:<question>:<option>
+CB_POLL_WORD = "pl:w:"  # pl:w:<word index>
+CB_POLL_SEND = "pl:s"
 
 # Session picker — runtime-tabbed. Top row = runtime tabs (Claude / Codex / …);
 # the active runtime's resumable sessions list below, with a "new session"

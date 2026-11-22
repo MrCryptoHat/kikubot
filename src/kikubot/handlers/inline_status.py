@@ -14,9 +14,10 @@ Telegram sends no inline queries before that. Shapes:
   terminal and answer with its screen (inline_keys.py); same topic check.
 - ``role <chat_id>:<thread_id>`` — that topic's /role text, for a client's
   role editor to start from; same topic check.
-- ``ask <chat_id>:<thread_id>`` — the question the agent waits on
-  (AskUserQuestion), whole, for a client's answer sheet; same topic check.
-  Answered with ``/answer`` in the topic (handlers/ask_answer.py).
+- ``ask <chat_id>:<thread_id>`` — the question the agent waits on, whole,
+  for a client's answer sheet; same topic check. Kind ``widget`` (its
+  AskUserQuestion, answered with ``/answer``, handlers/ask_answer.py) or
+  ``text`` (a poll it wrote, answered by a message, handlers/poll_buttons.py).
 - anything else (``@bot``, ``@bot status``, ``@bot <name>``) — one card per
   agent of the user, filtered by name, for official Telegram.
 
@@ -51,6 +52,7 @@ from ..pane_screen import MAX_BACK, MAX_PARTS, screen_messages
 from ..session import TOPIC_ROLE_MAX_CHARS, session_manager
 from . import effective_user, is_user_allowed, pane_cache
 from .inline_keys import parse_keys_query, run_keys
+from .poll_buttons import open_poll, poll_json, poll_pointer
 
 logger = logging.getLogger(__name__)
 
@@ -131,11 +133,15 @@ async def _answer_ask(
         await query.answer([], cache_time=0, is_personal=True)
         return
     pending = pending_ask(found[1])
+    poll = open_poll(user_id, thread_id) if pending is None else None
     payload: dict = {"v": 1, "ask": None}
     text = json.dumps(payload)
-    if pending is not None:
-        for level in range(4):
-            payload["ask"] = ask_json(*pending, level=level)
+    if pending is not None or poll is not None:
+        for level in range(3):
+            if pending is not None:
+                payload["ask"] = ask_json(*pending, level=level)
+            elif poll is not None:
+                payload["ask"] = poll_json(*poll, level=min(level, 1))
             text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             if len(text) <= MAX_JSON_CHARS:
                 break
@@ -380,6 +386,10 @@ async def inline_status_handler(
         found = resolve_topic_binding(user.id, *target)
         if found is not None:
             st = build_status(found[1], reserved)
+            if st.ask is None:
+                held = open_poll(found[0], target[1])
+                if held is not None:
+                    st.text_ask = poll_pointer(*held)
             results = [
                 _card_article("status", st),
                 InlineQueryResultArticle(

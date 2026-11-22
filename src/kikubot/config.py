@@ -359,6 +359,11 @@ class Config:
         # tables/headings/highlighted code, 32k char limit — falling back to
         # the proven MarkdownV2 pipeline on any failure. Kill-switch, default
         # on.
+        # Buttons under a poll an agent writes as text (numbered questions,
+        # lettered options — handlers/poll_buttons.py). Kill-switch, default on.
+        self.poll_buttons_enabled = (
+            os.getenv("KIKUBOT_POLL_BUTTONS", "true").lower() == "true"
+        )
         self.rich_messages_enabled = (
             os.getenv("KIKUBOT_RICH_MESSAGES", "true").lower() == "true"
         )
