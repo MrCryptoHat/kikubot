@@ -929,6 +929,23 @@ async def _handle_interactive_ui_locked(
     return False
 
 
+async def refresh_after_answer(
+    bot: Bot, user_id: int, window_id: str, thread_id: int | None
+) -> None:
+    """Repaint the question's photo after a typed or dictated answer went in.
+
+    The status poll leaves a live widget's photo alone (a re-upload per tick
+    would be churn), and an answer moves an AskUserQuestion on without
+    changing what it is — the next question, the review — so without this
+    the photo kept showing the question just answered.
+    """
+    msg_id = get_interactive_msg_id(user_id, thread_id)
+    prior = pane_cache.get_hash(msg_id) if msg_id is not None else None
+    text, _ = await pane_cache.wait_pane_change(window_id, prior)
+    if text:
+        await handle_interactive_ui(bot, user_id, window_id, thread_id, pane_ansi=text)
+
+
 async def clear_interactive_msg(
     user_id: int,
     bot: Bot | None = None,

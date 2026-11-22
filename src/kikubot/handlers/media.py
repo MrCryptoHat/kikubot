@@ -27,6 +27,7 @@ from . import (
     poll_buttons,
 )
 from .delivery import deliver_user_text, report_delivery_failure
+from .interactive_ui import refresh_after_answer
 from .siblings import cancel_pending_naming
 from .message_sender import safe_reply, send_photo
 from .provisioning import wait_for_topic
@@ -564,6 +565,9 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if status in ("routed", "sent"):
         await poll_buttons.close(context.bot, user.id, thread_id)
         transcript_msg = await safe_reply(update.message, f'🎤 "{text}"')
+        if status == "routed":
+            # Dictated into the agent's question: the photo must follow it.
+            await refresh_after_answer(context.bot, user.id, wid, thread_id)
         if status == "sent" and pin_candidate:
             await pin_task_message(
                 context.bot, transcript_msg.chat_id, transcript_msg.message_id

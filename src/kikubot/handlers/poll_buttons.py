@@ -401,6 +401,13 @@ async def attach(
     await close(bot, user_id, thread_id)
     if await _set_markup(bot, chat_id, message_id, keyboard(poll)):
         _open[(user_id, thread_id or 0)] = (chat_id, message_id, poll)
+        logger.info(
+            "Poll buttons on msg %s (thread %s): %d question(s), %d word(s)",
+            message_id,
+            thread_id,
+            len(poll.questions),
+            len(poll.words),
+        )
 
 
 async def send_with_poll(
@@ -426,7 +433,13 @@ async def close(bot: Bot, user_id: int, thread_id: int | None) -> None:
     """Take the live poll's buttons off: the conversation moved on."""
     held = _open.pop((user_id, thread_id or 0), None)
     if held is not None:
-        await _set_markup(bot, held[0], held[1], None)
+        removed = await _set_markup(bot, held[0], held[1], None)
+        logger.info(
+            "Poll buttons off msg %s (thread %s)%s",
+            held[1],
+            thread_id,
+            "" if removed else ": the edit failed",
+        )
 
 
 def is_open(user_id: int, thread_id: int | None) -> bool:
@@ -453,6 +466,7 @@ async def _send(
         await query.answer(tr("poll.not_sent"), show_alert=True)
         return
     _open.pop((user_id, thread_id or 0), None)
+    logger.info("Poll answered by button on msg %s (thread %s)", held[1], thread_id)
     await query.answer(tr("ask.done"))
     await _set_markup(
         bot,

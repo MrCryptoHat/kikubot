@@ -37,6 +37,7 @@ from telegram import InlineKeyboardButton, Update
 from telegram.ext import ContextTypes
 
 from ..ask_state import (
+    CHAT_ROW,
     SUBMIT_ROW,
     Ask,
     AskQuestion,
@@ -252,12 +253,34 @@ async def _start(drv: KeyDriver, binding: str, ask_id: str) -> tuple[Ask, Widget
     return ask, _ours(ask, await _view(drv))
 
 
+def _view_pos(view: WidgetView, row: int) -> int:
+    """Top-to-bottom position of a row on screen: options, free text, then
+    «Submit»/«Next» (multi-choice), then «Chat about this»."""
+    text_row = view.options[-1].n
+    if row == SUBMIT_ROW:
+        return text_row + 1
+    if row == CHAT_ROW:
+        return text_row + (2 if view.has_submit else 1)
+    return row
+
+
 async def _unfocus(drv: KeyDriver, view: WidgetView) -> WidgetView:
-    """Off the free-text row: there a digit is text, ←/→ move the text cursor."""
-    if not view.text_focus:
+    """The cursor onto an option row, where digits pick and ←/→ switch questions.
+
+    On the free-text row a digit is typed as text and ←/→ move the text
+    cursor; on «Next»/«Submit» or «Chat about this» ←/→ do nothing at all
+    (Claude Code 2.1.329). Either way, a walk would stall there.
+    """
+    if view.review or not view.options:
         return view
-    await _press(drv, [_key("Up")])
-    moved = await _await_view(drv, lambda w: w is not None and not w.text_focus)
+    if view.cursor is None:
+        raise AnswerError("moved")
+    target = view.options[-1].n - 1  # the last real option
+    ups = _view_pos(view, view.cursor) - target
+    if ups <= 0:
+        return view
+    await _press(drv, [_key("Up")] * ups)
+    moved = await _await_view(drv, lambda w: w is not None and w.cursor == target)
     assert moved is not None
     return moved
 
@@ -281,8 +304,13 @@ async def _goto(drv: KeyDriver, ask: Ask, index: int) -> WidgetView:
 
 
 def _row_pos(question: AskQuestion, row: int) -> int:
-    """Top-to-bottom position of a row: options, free text, then «Submit»."""
-    return question.text_row + 1 if row == SUBMIT_ROW else row
+    """Top-to-bottom position of a row: options, free text, «Submit»/«Next»,
+    «Chat about this»."""
+    if row == SUBMIT_ROW:
+        return question.text_row + 1
+    if row == CHAT_ROW:
+        return question.text_row + (2 if question.multi else 1)
+    return row
 
 
 async def _move_cursor(

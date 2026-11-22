@@ -127,6 +127,18 @@ class TestParseView:
         assert view.answers == [("Which color?", "Green"), ("Which pets?", "Cat")]
         assert view.option(1) is not None and view.option(1).label == "Submit answers"
 
+    def test_a_question_behind_a_quote_bar(self):
+        view = parse_view(_pane("q3_barred"))
+        assert view is not None
+        assert view.question == (
+            "Шаг 3: не жми кнопки, напиши свой ответ обычным сообщением. "
+            "Потом «Submit answers»."
+        )
+        assert [o.n for o in view.options] == [1, 2, 3] and view.cursor == 1
+
+    def test_emoji_variation_selectors_dont_count(self):
+        assert same_text("отметь (⬜ станет ☑️)", "отметь (⬜ станет ☑)")
+
     def test_gone_after_esc(self):
         assert parse_view(_pane("after_esc")) is None
 

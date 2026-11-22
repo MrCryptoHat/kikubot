@@ -117,6 +117,7 @@ from .handlers.interactive_ui import (
     get_interactive_window,
     handle_interactive_ui,
     set_interactive_mode,
+    refresh_after_answer,
 )
 from .handlers.media import (
     document_handler,
@@ -547,6 +548,8 @@ async def _forward_text_to_agent(
         # A poll the agent left open has its reply now.
         await poll_buttons.close(context.bot, user_id, thread_id)
     if status == "routed":
+        # The text went into the agent's question: the photo must follow it.
+        await refresh_after_answer(context.bot, user_id, wid, thread_id)
         try:
             await update.message.chat.send_action(
                 action=ChatAction.TYPING, message_thread_id=thread_id

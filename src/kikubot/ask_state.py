@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -187,9 +188,20 @@ def load_record(path: Path) -> Ask | None:
         return None
 
 
+# Emoji variation selectors and joiners: the pane draws «☑️» as «☑».
+_INVISIBLE_RE = re.compile("[\ufe0e\ufe0f\u200d]")
+
+
+def _norm(text: str) -> str:
+    return " ".join(_INVISIBLE_RE.sub("", unicodedata.normalize("NFC", text)).split())
+
+
 def same_text(a: str, b: str) -> bool:
-    """Whether two question texts match once the pane's wrapping is undone."""
-    na, nb = " ".join(a.split()), " ".join(b.split())
+    """Whether two question texts match once the pane's drawing is undone.
+
+    The pane wraps long lines and drops emoji variation selectors.
+    """
+    na, nb = _norm(a), _norm(b)
     if not na or not nb:
         return False
     if na == nb:
@@ -201,17 +213,19 @@ def same_text(a: str, b: str) -> bool:
 
 # --- the widget on screen ----------------------------------------------------
 
-SUBMIT_ROW = 0  # the cursor sits on a multi-choice question's «Submit» row
+SUBMIT_ROW = 0  # the cursor sits on a multi-choice question's «Submit»/«Next» row
+CHAT_ROW = -1  # …on «Chat about this», below the separator
 
 _TAB_BAR_RE = re.compile(r"^\s*(?:←\s+)?[☐☒✔]\s+\S")
 _SEPARATOR_RE = re.compile(r"^\s*[─━]{6,}\s*$")
 _OPTION_RE = re.compile(r"^(\s*)(❯)?\s*(\d+)\.\s+(?:\[([ ✔✓xX])\]\s*)?(.*?)\s*$")
-_SUBMIT_RE = re.compile(r"^\s*(❯)?\s+Submit\s*$")
+_SUBMIT_RE = re.compile(r"^\s*(❯)?\s+(?:Submit|Next)\s*$")
 _FOOTER_RE = re.compile(r"^\s*Enter to (?:select|confirm)\b")
 _REVIEW_RE = re.compile(r"^\s*Review your answers\s*$")
-_REVIEW_Q_RE = re.compile(r"^\s*●\s+(.*?)\s*$")
+_REVIEW_Q_RE = re.compile(r"^\s*(?:[│┃▌▎]\s*)?●\s+(.*?)\s*$")
 _REVIEW_A_RE = re.compile(r"^\s*→\s+(.*?)\s*$")
 _CHAT_ABOUT_RE = re.compile(r"Chat about this\s*$")
+_QUOTE_BAR_RE = re.compile(r"^\s*[│┃▌▎]\s?")
 
 
 @dataclass(frozen=True)
@@ -230,6 +244,7 @@ class WidgetView:
     options: list[ViewOption] = field(default_factory=list)
     cursor: int | None = None  # option number, SUBMIT_ROW, or None
     text_focus: bool = False  # the cursor is on the free-text row
+    has_submit: bool = False  # a multi-choice question's «Submit»/«Next» row
     # Review screen: (question, answer) pairs as listed.
     answers: list[tuple[str, str]] = field(default_factory=list)
 
@@ -279,10 +294,18 @@ def parse_view(pane_text: str) -> WidgetView | None:
     question_lines: list[str] = []
     in_options = False
     for ln in body:
-        if _SEPARATOR_RE.match(ln) or _FOOTER_RE.match(ln) or _CHAT_ABOUT_RE.search(ln):
+        if _CHAT_ABOUT_RE.search(ln):
+            if in_options and ln.lstrip().startswith("❯"):
+                view.cursor = CHAT_ROW
             if in_options:
                 break
             continue
+        if _FOOTER_RE.match(ln):
+            if in_options:
+                break
+            continue
+        if _SEPARATOR_RE.match(ln):
+            continue  # «Chat about this» sits below it
         m = _OPTION_RE.match(ln)
         if m:
             in_options = True
@@ -295,11 +318,13 @@ def parse_view(pane_text: str) -> WidgetView | None:
             continue
         sm = _SUBMIT_RE.match(ln)
         if sm and in_options:
+            view.has_submit = True
             if sm.group(1):
                 view.cursor = SUBMIT_ROW
             continue
         if not in_options and ln.strip():
-            question_lines.append(ln.strip())
+            # Some questions are drawn with a quote bar («│ Step 3: …»).
+            question_lines.append(_QUOTE_BAR_RE.sub("", ln).strip())
     view.question = " ".join(question_lines)
     if not view.options or not view.question:
         return None

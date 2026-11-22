@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from kikubot.ask_state import SUBMIT_ROW, parse_record, parse_view
+from kikubot.ask_state import CHAT_ROW, SUBMIT_ROW, parse_record, parse_view
 from kikubot.handlers import ask_answer
 from kikubot.handlers.ask_answer import (
     AnswerError,
@@ -53,7 +53,7 @@ SIZE = ("Size", "Which size?", ["Small", "Medium", "Large"], False)
 class FakeWidget:
     """Claude Code's AskUserQuestion widget, as far as the engine can tell."""
 
-    def __init__(self, ask, deaf: set[str] | None = None):
+    def __init__(self, ask, deaf: set[str] | None = None, barred: bool = False):
         self.ask = ask
         self.qs = ask.questions
         self.tabs = len(self.qs) > 1 or any(q.multi for q in self.qs)
@@ -67,6 +67,8 @@ class FakeWidget:
         self.result: dict[str, str] | None = None  # set once submitted
         self.declined = False
         self.deaf = deaf or set()
+        # Claude Code draws some questions behind a quote bar: «│ Step 3: …».
+        self.barred = barred
         self.pressed: list[str] = []
 
     # -- state --
@@ -122,7 +124,15 @@ class FakeWidget:
             return
         i, q = self.tab, self.qs[self.tab]
         focused = self.cursor[i] == q.text_row
-        rows = list(range(1, q.text_row + 1)) + ([SUBMIT_ROW] if q.multi else [])
+        rows = (
+            list(range(1, q.text_row + 1))
+            + ([SUBMIT_ROW] if q.multi else [])
+            + [CHAT_ROW]
+        )
+        # ←/→ switch questions only from an option row: on the free-text row
+        # they move the text cursor, on «Next»/«Submit» and «Chat about this»
+        # nothing happens (as Claude Code 2.1.329 does).
+        on_option = 1 <= self.cursor[i] < q.text_row
         if tok.literal:
             if focused:
                 self.text[i] += tok.key
@@ -146,7 +156,7 @@ class FakeWidget:
         if key in ("Up", "Down"):
             pos = rows.index(self.cursor[i]) + (1 if key == "Down" else -1)
             self.cursor[i] = rows[max(0, min(pos, len(rows) - 1))]
-        elif key in ("Left", "Right") and not focused and self.tabs:
+        elif key in ("Left", "Right") and on_option and self.tabs:
             self.tab = max(
                 0, min(self.tab + (1 if key == "Right" else -1), len(self.qs))
             )
@@ -185,7 +195,9 @@ class FakeWidget:
         if self.tab >= len(self.qs):
             lines += ["Review your answers", ""]
             for i, q in enumerate(self.qs):
-                lines += [f" ● {q.question}", f"   → {self._answer(i)}"]
+                bar = "│ " if self.barred else ""
+                drawn = q.question.replace("\ufe0f", "")
+                lines += [f" {bar}● {drawn}", f"   → {self._answer(i)}"]
             lines += [
                 "",
                 f"{'❯' if self.review_cursor == 1 else ' '} 1. Submit answers",
@@ -193,7 +205,9 @@ class FakeWidget:
             lines += [f"{'❯' if self.review_cursor == 2 else ' '} 2. Cancel"]
             return "\n".join(lines)
         i, q = self.tab, self.qs[self.tab]
-        lines += [q.question, ""]
+        # The pane drops emoji variation selectors: «☑️» is drawn «☑».
+        drawn = q.question.replace("\ufe0f", "")
+        lines += [f"│ {drawn}" if self.barred else drawn, ""]
         for n in range(1, q.text_row + 1):
             cur = "❯" if self.cursor[i] == n else " "
             if n == q.text_row:
@@ -213,8 +227,11 @@ class FakeWidget:
                 if desc:
                     lines.append(f"     {desc}")
         if q.multi:
-            lines.append(f"{'❯' if self.cursor[i] == SUBMIT_ROW else ' '}    Submit")
-        lines += [SEP, f"  {q.text_row + 1}. Chat about this", ""]
+            # «Next» while a question follows, «Submit» on the last one.
+            label = "Next" if i < len(self.qs) - 1 else "Submit"
+            lines.append(f"{'❯' if self.cursor[i] == SUBMIT_ROW else ' '}    {label}")
+        chat = "❯" if self.cursor[i] == CHAT_ROW else " "
+        lines += [SEP, f"{chat} {q.text_row + 1}. Chat about this", ""]
         lines.append("Enter to select · Tab/Arrow keys to navigate · Esc to cancel")
         return "\n".join(lines)
 
@@ -225,9 +242,9 @@ def widget(monkeypatch):
     monkeypatch.setattr(ask_answer, "STEP_TIMEOUT", 0.2)
     monkeypatch.setattr(ask_answer, "_POLL", 0)
 
-    def make(*questions, deaf=None, ask_id="toolu_01Abcdefghij"):
+    def make(*questions, deaf=None, ask_id="toolu_01Abcdefghij", barred=False):
         ask = _record(*questions, ask_id=ask_id)
-        w = FakeWidget(ask, deaf)
+        w = FakeWidget(ask, deaf, barred)
 
         async def capture():
             return w.render()
@@ -273,6 +290,37 @@ class TestAnswerAll:
         _, raw = parse_answer("toolu_01Abcdefghij 1:1 2:3")
         await ask_answer.answer_all("@5", "toolu_01Abcdefghij", raw)
         assert w.result == {"Which color?": "Red", "Which pets?": "Fish"}
+
+    @pytest.mark.parametrize("downs", [4, 5], ids=["cursor-on-next", "cursor-on-chat"])
+    async def test_from_a_row_where_arrows_do_nothing(self, widget, downs):
+        w = widget(COLOR, PETS, SIZE)
+        # Question 2, then the cursor down past its options: on «Next» and on
+        # «Chat about this» ←/→ don't switch questions.
+        w.press([KeyToken("1", True)] + [KeyToken("Down", False)] * downs)
+        assert w.tab == 1 and w.cursor[1] == (SUBMIT_ROW if downs == 4 else CHAT_ROW)
+        _, raw = parse_answer("toolu_01Abcdefghij 1:2 2:3 3:1")
+        await ask_answer.answer_all("@5", "toolu_01Abcdefghij", raw)
+        assert w.result == {
+            "Which color?": "Green",
+            "Which pets?": "Fish",
+            "Which size?": "Small",
+        }
+
+    async def test_barred_questions_with_emoji(self, widget):
+        ticks = (
+            "Ticks",
+            "Tick two (⬜ becomes ☑️), then «Next».",
+            ["Tea", "Coffee"],
+            True,
+        )
+        w = widget(COLOR, ticks, SIZE, barred=True)
+        _, raw = parse_answer('toolu_01Abcdefghij 1:1 2:1,2 3:"mine"')
+        await ask_answer.answer_all("@5", "toolu_01Abcdefghij", raw)
+        assert w.result == {
+            "Which color?": "Red",
+            ticks[1]: "Tea, Coffee",
+            "Which size?": "mine",
+        }
 
     async def test_lone_question_by_number(self, widget):
         w = widget(SIZE)
