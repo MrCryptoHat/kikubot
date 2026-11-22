@@ -32,6 +32,11 @@ CB_WIN_CANCEL = "wb:cancel"
 CB_SCREENSHOT_REFRESH = "ss:ref:"
 
 # Interactive UI nav keys (sent when Claude shows an interactive prompt)
+# The question keyboards' prefixes — aq: (widget keys), ak: (widget answer
+# buttons), pl: (text poll) — are a client contract (docs/agent-status-format.md
+# «Question keyboards a client may hide»): a client hides keyboards by them.
+# Renaming one brings its keyboard back there; a new question keyboard needs a
+# new documented prefix.
 CB_ASK_UP = "aq:up:"  # aq:up:<window>
 CB_ASK_DOWN = "aq:down:"  # aq:down:<window>
 CB_ASK_LEFT = "aq:left:"  # aq:left:<window>

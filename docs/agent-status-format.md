@@ -458,6 +458,21 @@ gives), and `ask` gives the parsed poll while it is open:
   line. They carry `pl:t:<q>:<o>`, `pl:w:<i>`, `pl:a`, `pl:s`; a client
   that draws the poll itself should hide them.
 
+### Question keyboards a client may hide
+
+A client that answers questions its own way can leave out the bot's keyboard
+under them. These callback-data prefixes are part of this contract and stay
+fixed; a new kind of question keyboard gets a new prefix here first:
+
+| Prefix | Keyboard |
+|---|---|
+| `aq:` | the keys under a widget's photo (←→↑↓⏎, Esc, Space, refresh) |
+| `ak:` | the answer buttons under a widget's photo (`ak:p:` pick, `ak:n:` next, `ak:s:` submit) |
+| `pl:` | the buttons under a text poll (`pl:t:` tick, `pl:w:` word, `pl:a` as advised, `pl:s` send) |
+
+Every other keyboard of the bot (agent panel, pickers, confirmations) uses
+other prefixes.
+
 ## Planned (same version, new sections)
 
 - `context` breakdown (messages, tools, memory files, skills, MCP…): needs a
